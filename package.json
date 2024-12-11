@@ -1,0 +1,26 @@
+{
+  "name": "backlccomp",
+  "version": "1.0.0",
+  "description": "backend lcComp",
+  "main": "index.js",
+  "scripts": {
+    "start": "node --watch ./src/app.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "angel borrego",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "cross-env": "^7.0.3",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-handlebars": "^8.0.1",
+    "express-routemap": "^1.6.0"
+  },
+  "devDependencies": {
+    "standard": "^17.1.2"
+  },
+  "eslintConfig": {
+    "extends": "./node_modules/standard/eslintrc.json"
+  }
+}

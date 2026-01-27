@@ -27,7 +27,8 @@ export const loginUser = async (req, res, next) => {
 
     return res.status(result.status).json({
       status: result.status === 200 ? 'success' : 'error',
-      message: result.message
+      message: result.message,
+      user: result.user
     })
   } catch (err) {
     logError('❌ controller.sessions.loginUser error:', err)

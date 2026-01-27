@@ -39,7 +39,8 @@ class SessionsService {
 
       return {
         status: 200,
-        message: 'Usuario autenticado correctamente'
+        message: 'Usuario autenticado correctamente',
+        user: payload
       }
     } catch (err) {
       logError('❌ SessionsService.generateAuthResponse error:', err)

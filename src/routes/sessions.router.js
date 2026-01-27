@@ -37,7 +37,7 @@ export default class SessionsRouter extends MyOwnRouter {
     })
 
     this.get('/failLogin', ['PUBLIC'], failLogin)
-    this.get('/current', ['USER', 'ADMIN'], currentUser)
-    this.post('/logout', ['USER', 'ADMIN'], logoutUser)
+    this.get('/current', ['USER', 'ADMIN', 'PREMIUM'], currentUser)
+    this.post('/logout', ['USER', 'ADMIN', 'PREMIUM'], logoutUser)
   }
 }

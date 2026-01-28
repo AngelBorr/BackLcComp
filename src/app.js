@@ -42,24 +42,35 @@ const app = express()
 app.set('trust proxy', 1)
 
 // --------------------------------------------------------------
-// ✅ CORS
+// ✅ CORS (FIX: incluir www + localhost + permitir preflight con mismas opciones)
 // --------------------------------------------------------------
-const allowedOrigins = ['https://lccomp.com.ar', 'http://localhost:5173']
+const allowedOrigins = [
+  'https://www.lccomp.com.ar',
+  'https://lccomp.com.ar',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173'
+]
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true)
-      if (allowedOrigins.includes(origin)) return cb(null, true)
-      return cb(new Error(`CORS blocked for origin: ${origin}`))
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-  })
-)
+// ✅ Config CORS única (la reutilizamos también en app.options)
+const corsOptions = {
+  origin: (origin, cb) => {
+    // Requests sin Origin (Postman, server-to-server, healthchecks)
+    if (!origin) return cb(null, true)
 
-app.options('*', cors())
+    if (allowedOrigins.includes(origin)) return cb(null, true)
+
+    return cb(new Error(`CORS blocked for origin: ${origin}`))
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['Set-Cookie']
+}
+
+app.use(cors(corsOptions))
+
+// ✅ Preflight para TODO (usa las mismas opciones)
+app.options('*', cors(corsOptions))
 
 // --------------------------------------------------------------
 // ✅ Parsers

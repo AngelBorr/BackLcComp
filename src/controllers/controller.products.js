@@ -8,7 +8,6 @@ export const getProducts = async (req, res, next) => {
   try {
     req.logger?.debug?.('[products.controller] getProducts')
     const products = await productsService.getProducts()
-    console.log('controller', products)
     return res.status(200).json({
       status: 'success',
       message: products.length

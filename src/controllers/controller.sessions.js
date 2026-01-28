@@ -81,12 +81,14 @@ export const logoutUser = async (req, res, next) => {
   try {
     const result = await sessionsService.logoutUser(req.user)
 
+    const isProd = process.env.NODE_ENV === 'production'
+
     res.clearCookie(env.cookie.name, {
       httpOnly: true,
-      secure: env.cookie.secure,
-      sameSite: env.cookie.sameSite,
+      secure: isProd,
+      sameSite: isProd ? 'none' : 'lax',
       path: '/', // ✅ CLAVE
-      ...(env.cookie.domain ? { domain: env.cookie.domain } : {})
+      ...(env.cookie.domain ? { domain: env.cookie.domain } : {}) // ✅ opcional
     })
 
     log('🔵 Cookie JWT eliminada correctamente')

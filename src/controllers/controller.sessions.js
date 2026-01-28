@@ -81,10 +81,14 @@ export const logoutUser = async (req, res, next) => {
   try {
     const result = await sessionsService.logoutUser(req.user)
 
+    // ⚠️ IMPORTANTE: path debe coincidir con la cookie original
+    // (si tu cookie se seteó con domain, también debe ir acá)
     res.clearCookie(env.cookie.name, {
       httpOnly: true,
       secure: env.cookie.secure,
-      sameSite: env.cookie.sameSite
+      sameSite: env.cookie.sameSite,
+      path: '/', // ✅ CLAVE
+      ...(env.cookie.domain ? { domain: '.lccomp.com.ar' } : {}) // ✅ opcional
     })
 
     log('🔵 Cookie JWT eliminada correctamente')

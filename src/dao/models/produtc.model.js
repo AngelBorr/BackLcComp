@@ -23,7 +23,6 @@ const gridFsImageSchema = new mongoose.Schema(
       default: ''
     },
     length: {
-      // bytes en GridFS
       type: Number,
       min: 0,
       default: 0
@@ -115,6 +114,16 @@ const productSchema = new mongoose.Schema(
     prodFuente: { type: String, trim: true, default: '' },
     prodTecladoMouse: { type: String, trim: true, default: '' },
 
+    // ⭐ Flags de marketing / home
+    prodDestacado: {
+      type: Boolean,
+      default: false
+    },
+    prodNovedad: {
+      type: Boolean,
+      default: false
+    },
+
     // Stock / estado
     prodStock: {
       type: Number,
@@ -129,11 +138,15 @@ const productSchema = new mongoose.Schema(
   { timestamps: true }
 )
 
+// -------------------------
 // Índices útiles
+// -------------------------
 productSchema.index({ prodName: 1 })
 productSchema.index({ prodCategoria: 1 })
 productSchema.index({ prodMarca: 1 })
 productSchema.index({ isActive: 1 })
+productSchema.index({ prodDestacado: 1 }) // 🔥 útil para sliders
+productSchema.index({ prodNovedad: 1 }) // 🔥 útil para sliders
 productSchema.index({ createdAt: -1 })
 
 const productModel = mongoose.model(productCollection, productSchema)

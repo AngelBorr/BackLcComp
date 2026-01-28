@@ -43,7 +43,7 @@ const extractImageIds = (payload) => {
   // Caso 1: prodImgs viene como array
   if (Array.isArray(rawProdImgs)) {
     const ids = rawProdImgs
-      .map((x) => (x && typeof x === 'object' ? x.fileId ?? x._id ?? x.id : x))
+      .map((x) => (x && typeof x === 'object' ? (x.fileId ?? x._id ?? x.id) : x))
       .map((x) => toObjectIdOrNull(x))
       .filter(Boolean)
     return ids
@@ -169,7 +169,7 @@ class ProductsService {
   }
 
   async createProduct(body, files = []) {
-    let uploadedFileIds = [] // ✅ para rollback si falla el create
+    let uploadedFileIds = [] // ✅ rollback si falla el create
 
     try {
       logger.debug('[ProductsService] createProduct')
@@ -180,6 +180,18 @@ class ProductsService {
           'INVALID_PRODUCT_PAYLOAD',
           400
         )
+      }
+
+      // ✅ helpers locales (por si llegan como "true"/"false" desde multipart)
+      const toBool = (v, fallback = false) => {
+        if (typeof v === 'boolean') return v
+        if (typeof v === 'string') {
+          const s = v.trim().toLowerCase()
+          if (s === 'true') return true
+          if (s === 'false') return false
+        }
+        if (typeof v === 'number') return v === 1
+        return fallback
       }
 
       const base = pick(body, [
@@ -198,7 +210,11 @@ class ProductsService {
         'prodFuente',
         'prodTecladoMouse',
         'prodStock',
-        'isActive'
+        'isActive',
+
+        // ✅ NUEVO (viene del front)
+        'prodDestacado',
+        'prodNovedad' // (si en el model lo vas a llamar prodNovedades, cambiá este key)
       ])
 
       base.prodName = normalizeString(base.prodName)
@@ -210,6 +226,13 @@ class ProductsService {
       if (!base.prodCategoria)
         throw new ServiceError('prodCategoria es requerido', 'MISSING_PROD_CATEGORIA', 400)
 
+      // ✅ isActive boolean real (multipart lo manda string)
+      base.isActive = toBool(base.isActive, true)
+
+      // ✅ NUEVO: flags booleanos (default false si no llegan)
+      base.prodDestacado = toBool(base.prodDestacado, false)
+      base.prodNovedad = toBool(base.prodNovedad, false)
+
       // precios
       if (base.prodPrecioMinorista === undefined || base.prodPrecioMinorista === null) {
         throw new ServiceError('prodPrecioMinorista es requerido', 'MISSING_PRICE_MINORISTA', 400)
@@ -220,10 +243,13 @@ class ProductsService {
 
       const minorista = Number(base.prodPrecioMinorista)
       const mayorista = Number(base.prodPrecioMayorista)
+
       if (Number.isNaN(minorista) || minorista < 0)
         throw new ServiceError('prodPrecioMinorista inválido', 'INVALID_PRICE_MINORISTA', 400)
+
       if (Number.isNaN(mayorista) || mayorista < 0)
         throw new ServiceError('prodPrecioMayorista inválido', 'INVALID_PRICE_MAYORISTA', 400)
+
       if (mayorista > minorista) {
         throw new ServiceError(
           'El precio mayorista no puede ser mayor al minorista',
@@ -260,7 +286,6 @@ class ProductsService {
             })
           }
 
-          // 🔥 sube a GridFS
           logger.debug(`[ProductsService] uploading ${f.originalname} (${f.size}) `)
 
           const uploadResult = await FileService.uploadFile(f.buffer, f.originalname, {
@@ -277,7 +302,6 @@ class ProductsService {
 
           uploadedFileIds.push(String(uploadResult.fileId))
 
-          // Construimos el objeto que espera tu schema prodImgs
           prodImgs.push({
             fileId: uploadResult.fileId,
             filename: uploadResult.filename || f.originalname,
@@ -290,7 +314,6 @@ class ProductsService {
           if (prodImgs.length) prodImgs[0].isCover = true
         }
       } else {
-        // ✅ fallback: aceptar IDs en body (si algún día mandás ids)
         const imageIds = extractImageIds(body)
         prodImgs = Array.isArray(imageIds) ? await this.#buildProdImgsFromFileIds(imageIds) : []
       }

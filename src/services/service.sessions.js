@@ -26,13 +26,15 @@ class SessionsService {
         expiresIn: env.jwt.expiresIn
       })
 
-      const isProd = process.env.NODE_ENV === 'production'
-
+      // ✅ NO dependas de NODE_ENV si no existe
+      // ✅ Usá SIEMPRE la config centralizada de env.cookie
       res.cookie(env.cookie.name, token, {
         httpOnly: true,
-        secure: isProd,
-        sameSite: isProd ? 'none' : 'lax',
-        maxAge: env.cookie.maxAge
+        secure: env.cookie.secure, // ✅ true en prod si usás HTTPS (recomendado)
+        sameSite: env.cookie.sameSite, // ✅ 'none' si front/back son dominios distintos
+        maxAge: env.cookie.maxAge,
+        path: '/', // ✅ CLAVE
+        ...(env.cookie.domain ? { domain: env.cookie.domain } : {}) // ✅ opcional
       })
 
       log(`🍪 Cookie JWT seteada correctamente: ${env.cookie.name}`)
@@ -44,7 +46,6 @@ class SessionsService {
       }
     } catch (err) {
       logError('❌ SessionsService.generateAuthResponse error:', err)
-      // Pasamos error para que lo maneje errorHandler.js
       err.statusCode = 500
       throw err
     }

@@ -345,7 +345,7 @@ class ProductsService {
     }
   }
 
-  // update  products
+  // update products
   async updateProduct(id, body, files = []) {
     let uploadedFileIds = [] // ✅ rollback si falla update
     let oldFileIdsToDelete = [] // ✅ para limpiar imágenes anteriores si se reemplazan
@@ -382,7 +382,11 @@ class ProductsService {
         'prodFuente',
         'prodTecladoMouse',
         'prodStock',
-        'isActive'
+        'isActive',
+
+        // ✅ NUEVO
+        'prodDestacado',
+        'prodNovedad'
       ])
 
       // Normalización (solo si vienen)
@@ -395,6 +399,14 @@ class ProductsService {
       // ✅ isActive viene como string en multipart
       if (base.isActive !== undefined) {
         base.isActive = String(base.isActive).toLowerCase() === 'true'
+      }
+
+      // ✅ NUEVO: flags vienen como string en multipart
+      if (base.prodDestacado !== undefined) {
+        base.prodDestacado = String(base.prodDestacado).toLowerCase() === 'true'
+      }
+      if (base.prodNovedad !== undefined) {
+        base.prodNovedad = String(base.prodNovedad).toLowerCase() === 'true'
       }
 
       // ✅ precios/stock (si vienen)
@@ -512,7 +524,6 @@ class ProductsService {
       if (!updated) throw new ServiceError('Producto no encontrado', 'PRODUCT_NOT_FOUND', 404)
 
       // ✅ Si se reemplazaron imágenes y todo salió bien => borrar imágenes viejas
-      // Si NO querés borrar, comentá este bloque.
       if (prodImgsUpdate !== undefined && oldFileIdsToDelete.length) {
         for (const fid of oldFileIdsToDelete) {
           try {

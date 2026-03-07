@@ -1,4 +1,3 @@
-// models/product.model.js
 import mongoose from 'mongoose'
 
 const productCollection = 'products'
@@ -89,6 +88,14 @@ const productSchema = new mongoose.Schema(
       min: 0
     },
 
+    // ✅ IVA persistido (no requerido para no romper productos existentes)
+    prodIva: {
+      type: Number,
+      required: false,
+      enum: [0.105, 0.21],
+      default: undefined
+    },
+
     // Catálogo
     prodCategoria: {
       type: String,
@@ -145,8 +152,9 @@ productSchema.index({ prodName: 1 })
 productSchema.index({ prodCategoria: 1 })
 productSchema.index({ prodMarca: 1 })
 productSchema.index({ isActive: 1 })
-productSchema.index({ prodDestacado: 1 }) // 🔥 útil para sliders
-productSchema.index({ prodNovedad: 1 }) // 🔥 útil para sliders
+productSchema.index({ prodDestacado: 1 })
+productSchema.index({ prodNovedad: 1 })
+productSchema.index({ prodIva: 1 })
 productSchema.index({ createdAt: -1 })
 
 const productModel = mongoose.model(productCollection, productSchema)

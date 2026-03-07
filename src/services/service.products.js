@@ -169,7 +169,7 @@ class ProductsService {
   }
 
   async createProduct(body, files = []) {
-    let uploadedFileIds = [] // ✅ rollback si falla el create
+    let uploadedFileIds = [] // rollback si falla el create
 
     try {
       logger.debug('[ProductsService] createProduct')
@@ -182,7 +182,6 @@ class ProductsService {
         )
       }
 
-      // ✅ helpers locales (por si llegan como "true"/"false" desde multipart)
       const toBool = (v, fallback = false) => {
         if (typeof v === 'boolean') return v
         if (typeof v === 'string') {
@@ -194,11 +193,12 @@ class ProductsService {
         return fallback
       }
 
+      const roundPrice = (value) => Number(Number(value).toFixed(2))
+
       const base = pick(body, [
         'prodName',
         'prodDescription',
-        'prodPrecioMinorista',
-        'prodPrecioMayorista',
+        'prodPrecioMayorista', // llega SIN IVA desde el front
         'prodCategoria',
         'prodMarca',
         'prodProcesador',
@@ -211,10 +211,10 @@ class ProductsService {
         'prodTecladoMouse',
         'prodStock',
         'isActive',
-
-        // ✅ NUEVO (viene del front)
         'prodDestacado',
-        'prodNovedad' // (si en el model lo vas a llamar prodNovedades, cambiá este key)
+        'prodNovedad',
+        'prodIva105',
+        'prodIva21'
       ])
 
       base.prodName = normalizeString(base.prodName)
@@ -222,54 +222,64 @@ class ProductsService {
       base.prodCategoria = normalizeString(base.prodCategoria)
       base.prodMarca = normalizeString(base.prodMarca) ?? ''
 
-      if (!base.prodName) throw new ServiceError('prodName es requerido', 'MISSING_PROD_NAME', 400)
-      if (!base.prodCategoria)
+      if (!base.prodName) {
+        throw new ServiceError('prodName es requerido', 'MISSING_PROD_NAME', 400)
+      }
+
+      if (!base.prodCategoria) {
         throw new ServiceError('prodCategoria es requerido', 'MISSING_PROD_CATEGORIA', 400)
+      }
 
-      // ✅ isActive boolean real (multipart lo manda string)
       base.isActive = toBool(base.isActive, true)
-
-      // ✅ NUEVO: flags booleanos (default false si no llegan)
       base.prodDestacado = toBool(base.prodDestacado, false)
       base.prodNovedad = toBool(base.prodNovedad, false)
 
-      // precios
-      if (base.prodPrecioMinorista === undefined || base.prodPrecioMinorista === null) {
-        throw new ServiceError('prodPrecioMinorista es requerido', 'MISSING_PRICE_MINORISTA', 400)
-      }
-      if (base.prodPrecioMayorista === undefined || base.prodPrecioMayorista === null) {
-        throw new ServiceError('prodPrecioMayorista es requerido', 'MISSING_PRICE_MAYORISTA', 400)
-      }
+      const prodIva105 = toBool(base.prodIva105, false)
+      const prodIva21 = toBool(base.prodIva21, true)
 
-      const minorista = Number(base.prodPrecioMinorista)
-      const mayorista = Number(base.prodPrecioMayorista)
-
-      if (Number.isNaN(minorista) || minorista < 0)
-        throw new ServiceError('prodPrecioMinorista inválido', 'INVALID_PRICE_MINORISTA', 400)
-
-      if (Number.isNaN(mayorista) || mayorista < 0)
-        throw new ServiceError('prodPrecioMayorista inválido', 'INVALID_PRICE_MAYORISTA', 400)
-
-      if (mayorista > minorista) {
+      if (prodIva105 && prodIva21) {
         throw new ServiceError(
-          'El precio mayorista no puede ser mayor al minorista',
-          'INVALID_PRICE_RELATION',
+          'No se puede aplicar IVA 10.5% y 21% al mismo tiempo',
+          'INVALID_IVA_SELECTION',
           400
         )
       }
 
-      base.prodPrecioMinorista = minorista
-      base.prodPrecioMayorista = mayorista
+      const ivaRate = prodIva105 ? 0.105 : 0.21
 
-      // ✅ stock
+      if (base.prodPrecioMayorista === undefined || base.prodPrecioMayorista === null) {
+        throw new ServiceError('prodPrecioMayorista es requerido', 'MISSING_PRICE_MAYORISTA', 400)
+      }
+
+      const precioBaseMayorista = Number(base.prodPrecioMayorista)
+
+      if (Number.isNaN(precioBaseMayorista) || precioBaseMayorista < 0) {
+        throw new ServiceError('prodPrecioMayorista inválido', 'INVALID_PRICE_MAYORISTA', 400)
+      }
+
+      const ivaMayorista = roundPrice(precioBaseMayorista * ivaRate)
+      const precioMayoristaFinal = roundPrice(precioBaseMayorista + ivaMayorista)
+
+      const margenMinorista = roundPrice(precioBaseMayorista * 0.1)
+      const subtotalMinorista = roundPrice(precioBaseMayorista + margenMinorista)
+      const ivaMinorista = roundPrice(subtotalMinorista * ivaRate)
+      const precioMinoristaFinal = roundPrice(subtotalMinorista + ivaMinorista)
+
+      base.prodPrecioMayorista = precioMayoristaFinal
+      base.prodPrecioMinorista = precioMinoristaFinal
+      base.prodIva = ivaRate
+
+      delete base.prodIva105
+      delete base.prodIva21
+
       if (base.prodStock !== undefined && base.prodStock !== null) {
         const s = Number(base.prodStock)
-        if (Number.isNaN(s) || s < 0)
+        if (Number.isNaN(s) || s < 0) {
           throw new ServiceError('prodStock inválido', 'INVALID_STOCK', 400)
+        }
         base.prodStock = s
       }
 
-      // ✅ Imágenes: prioridad a files
       let prodImgs = []
 
       if (Array.isArray(files) && files.length) {
@@ -286,7 +296,7 @@ class ProductsService {
             })
           }
 
-          logger.debug(`[ProductsService] uploading ${f.originalname} (${f.size}) `)
+          logger.debug(`[ProductsService] uploading ${f.originalname} (${f.size})`)
 
           const uploadResult = await FileService.uploadFile(f.buffer, f.originalname, {
             contentType: f.mimetype
@@ -326,18 +336,20 @@ class ProductsService {
       logger.info(`[ProductsService] Producto creado id=${created._id}`)
       return created.toObject()
     } catch (err) {
-      // ✅ rollback: si subimos imágenes y luego falló el create, las borramos
       if (uploadedFileIds.length) {
         for (const fid of uploadedFileIds) {
           try {
             await FileService.deleteFileById(fid)
-          } catch (_) {
-            // no frenamos el error original
+          } catch (cleanupErr) {
+            logger.warn(
+              `[ProductsService] cleanup deleteFileById failed: ${cleanupErr?.message || cleanupErr}`
+            )
           }
         }
       }
 
       if (err instanceof ServiceError) throw err
+
       logger.error(`[ProductsService] createProduct error: ${err?.message || err}`)
       throw new ServiceError('Error interno al crear producto', 'CREATE_PRODUCT_FAILED', 500, {
         cause: err?.message
@@ -347,8 +359,8 @@ class ProductsService {
 
   // update products
   async updateProduct(id, body, files = []) {
-    let uploadedFileIds = [] // ✅ rollback si falla update
-    let oldFileIdsToDelete = [] // ✅ para limpiar imágenes anteriores si se reemplazan
+    let uploadedFileIds = [] // rollback si falla update
+    let oldFileIdsToDelete = [] // para limpiar imágenes anteriores si se reemplazan
 
     try {
       logger.debug(`[ProductsService] updateProduct id=${id}`)
@@ -362,15 +374,26 @@ class ProductsService {
         )
       }
 
-      // ✅ buscamos el producto actual (necesario para reglas de precios y para imágenes)
       const current = await productModel.findById(id).lean()
       if (!current) throw new ServiceError('Producto no encontrado', 'PRODUCT_NOT_FOUND', 404)
+
+      const toBool = (v, fallback = false) => {
+        if (typeof v === 'boolean') return v
+        if (typeof v === 'string') {
+          const s = v.trim().toLowerCase()
+          if (s === 'true') return true
+          if (s === 'false') return false
+        }
+        if (typeof v === 'number') return v === 1
+        return fallback
+      }
+
+      const roundPrice = (value) => Number(Number(value).toFixed(2))
 
       const base = pick(body, [
         'prodName',
         'prodDescription',
-        'prodPrecioMinorista',
-        'prodPrecioMayorista',
+        'prodPrecioMayorista', // llega SIN IVA si viene
         'prodCategoria',
         'prodMarca',
         'prodProcesador',
@@ -383,75 +406,119 @@ class ProductsService {
         'prodTecladoMouse',
         'prodStock',
         'isActive',
-
-        // ✅ NUEVO
         'prodDestacado',
-        'prodNovedad'
+        'prodNovedad',
+        'prodIva105',
+        'prodIva21'
       ])
 
-      // Normalización (solo si vienen)
       if (base.prodName !== undefined) base.prodName = normalizeString(base.prodName)
-      if (base.prodDescription !== undefined)
+      if (base.prodDescription !== undefined) {
         base.prodDescription = normalizeString(base.prodDescription) ?? ''
+      }
       if (base.prodCategoria !== undefined) base.prodCategoria = normalizeString(base.prodCategoria)
       if (base.prodMarca !== undefined) base.prodMarca = normalizeString(base.prodMarca) ?? ''
 
-      // ✅ isActive viene como string en multipart
       if (base.isActive !== undefined) {
-        base.isActive = String(base.isActive).toLowerCase() === 'true'
+        base.isActive = toBool(base.isActive, true)
       }
 
-      // ✅ NUEVO: flags vienen como string en multipart
       if (base.prodDestacado !== undefined) {
-        base.prodDestacado = String(base.prodDestacado).toLowerCase() === 'true'
+        base.prodDestacado = toBool(base.prodDestacado, false)
       }
+
       if (base.prodNovedad !== undefined) {
-        base.prodNovedad = String(base.prodNovedad).toLowerCase() === 'true'
+        base.prodNovedad = toBool(base.prodNovedad, false)
       }
 
-      // ✅ precios/stock (si vienen)
-      const incomingMinor =
-        base.prodPrecioMinorista !== undefined ? Number(base.prodPrecioMinorista) : undefined
-      const incomingMayor =
-        base.prodPrecioMayorista !== undefined ? Number(base.prodPrecioMayorista) : undefined
-
-      if (incomingMinor !== undefined && (Number.isNaN(incomingMinor) || incomingMinor < 0)) {
-        throw new ServiceError('prodPrecioMinorista inválido', 'INVALID_PRICE_MINORISTA', 400)
-      }
-      if (incomingMayor !== undefined && (Number.isNaN(incomingMayor) || incomingMayor < 0)) {
-        throw new ServiceError('prodPrecioMayorista inválido', 'INVALID_PRICE_MAYORISTA', 400)
-      }
-
-      // Validar relación mayorista<=minorista:
-      if (incomingMinor !== undefined || incomingMayor !== undefined) {
-        const finalMinor =
-          incomingMinor !== undefined ? incomingMinor : Number(current.prodPrecioMinorista)
-        const finalMayor =
-          incomingMayor !== undefined ? incomingMayor : Number(current.prodPrecioMayorista)
-
-        if (finalMayor > finalMinor) {
-          throw new ServiceError(
-            'El precio mayorista no puede ser mayor al minorista',
-            'INVALID_PRICE_RELATION',
-            400
-          )
-        }
-
-        if (incomingMinor !== undefined) base.prodPrecioMinorista = finalMinor
-        if (incomingMayor !== undefined) base.prodPrecioMayorista = finalMayor
-      }
-
-      // ✅ stock
       if (base.prodStock !== undefined && base.prodStock !== null) {
         const s = Number(base.prodStock)
-        if (Number.isNaN(s) || s < 0)
+        if (Number.isNaN(s) || s < 0) {
           throw new ServiceError('prodStock inválido', 'INVALID_STOCK', 400)
+        }
         base.prodStock = s
       }
 
-      // ✅ Imágenes:
-      // - si vienen files => reemplazamos prodImgs
-      // - si no vienen files => no tocamos prodImgs (salvo que mandes IDs y extractImageIds no sea null)
+      const hasIncomingMayorista =
+        base.prodPrecioMayorista !== undefined && base.prodPrecioMayorista !== null
+
+      const hasIncomingIva105 = body.prodIva105 !== undefined
+      const hasIncomingIva21 = body.prodIva21 !== undefined
+      const hasIncomingIvaSelection = hasIncomingIva105 || hasIncomingIva21
+
+      if (hasIncomingMayorista || hasIncomingIvaSelection) {
+        let ivaRate
+
+        if (hasIncomingIvaSelection) {
+          const prodIva105 = toBool(body.prodIva105, false)
+          const prodIva21 = toBool(body.prodIva21, false)
+
+          if (prodIva105 && prodIva21) {
+            throw new ServiceError(
+              'No se puede aplicar IVA 10.5% y 21% al mismo tiempo',
+              'INVALID_IVA_SELECTION',
+              400
+            )
+          }
+
+          if (!prodIva105 && !prodIva21) {
+            throw new ServiceError(
+              'Debés seleccionar un IVA válido para recalcular precios.',
+              'MISSING_VALID_IVA',
+              400
+            )
+          }
+
+          ivaRate = prodIva105 ? 0.105 : 0.21
+        } else {
+          ivaRate = current.prodIva
+
+          if (ivaRate !== 0.105 && ivaRate !== 0.21) {
+            throw new ServiceError(
+              'El producto no tiene IVA persistido. Debés enviar IVA para recalcular precios.',
+              'MISSING_PERSISTED_IVA',
+              400
+            )
+          }
+        }
+
+        const precioBaseMayorista = hasIncomingMayorista
+          ? Number(base.prodPrecioMayorista)
+          : (() => {
+              const persistedRate = Number(current.prodIva)
+              if (persistedRate !== 0.105 && persistedRate !== 0.21) {
+                throw new ServiceError(
+                  'El producto no tiene IVA persistido. No se puede recalcular correctamente.',
+                  'MISSING_PERSISTED_IVA',
+                  400
+                )
+              }
+
+              return roundPrice(Number(current.prodPrecioMayorista) / (1 + persistedRate))
+            })()
+
+        if (Number.isNaN(precioBaseMayorista) || precioBaseMayorista < 0) {
+          throw new ServiceError('prodPrecioMayorista inválido', 'INVALID_PRICE_MAYORISTA', 400)
+        }
+
+        const ivaMayorista = roundPrice(precioBaseMayorista * ivaRate)
+        const precioMayoristaFinal = roundPrice(precioBaseMayorista + ivaMayorista)
+
+        const margenMinorista = roundPrice(precioBaseMayorista * 0.1)
+        const subtotalMinorista = roundPrice(precioBaseMayorista + margenMinorista)
+        const ivaMinorista = roundPrice(subtotalMinorista * ivaRate)
+        const precioMinoristaFinal = roundPrice(subtotalMinorista + ivaMinorista)
+
+        base.prodPrecioMayorista = precioMayoristaFinal
+        base.prodPrecioMinorista = precioMinoristaFinal
+        base.prodIva = ivaRate
+      } else {
+        delete base.prodPrecioMinorista
+      }
+
+      delete base.prodIva105
+      delete base.prodIva21
+
       let prodImgsUpdate = undefined
 
       if (Array.isArray(files) && files.length) {
@@ -459,7 +526,6 @@ class ProductsService {
           throw new ServiceError('Máximo 4 imágenes', 'MAX_IMAGES_EXCEEDED', 400)
         }
 
-        // guardo las viejas para poder borrarlas si todo sale ok
         oldFileIdsToDelete = Array.isArray(current.prodImgs)
           ? current.prodImgs.map((img) => String(img.fileId)).filter(Boolean)
           : []
@@ -475,7 +541,7 @@ class ProductsService {
             })
           }
 
-          logger.debug(`[ProductsService] uploading ${f.originalname} (${f.size}) `)
+          logger.debug(`[ProductsService] uploading ${f.originalname} (${f.size})`)
 
           const uploadResult = await FileService.uploadFile(f.buffer, f.originalname, {
             contentType: f.mimetype
@@ -498,19 +564,16 @@ class ProductsService {
             length: f.size,
             uploadDate: new Date(),
             isCover: false,
-            alt: '' // opcional
+            alt: ''
           })
         }
 
-        // cover: por defecto la 1ra
         if (prodImgs.length) prodImgs[0].isCover = true
-
         prodImgsUpdate = prodImgs
       } else {
-        // compatibilidad: si mandás IDs en body, actualiza prodImgs
-        const imageIds = extractImageIds(body) // si no viene nada => null
+        const imageIds = extractImageIds(body)
         if (imageIds !== null) {
-          prodImgsUpdate = await this.#buildProdImgsFromFileIds(imageIds) // puede ser []
+          prodImgsUpdate = await this.#buildProdImgsFromFileIds(imageIds)
         }
       }
 
@@ -523,13 +586,14 @@ class ProductsService {
 
       if (!updated) throw new ServiceError('Producto no encontrado', 'PRODUCT_NOT_FOUND', 404)
 
-      // ✅ Si se reemplazaron imágenes y todo salió bien => borrar imágenes viejas
       if (prodImgsUpdate !== undefined && oldFileIdsToDelete.length) {
         for (const fid of oldFileIdsToDelete) {
           try {
             await FileService.deleteFileById(fid)
-          } catch (_) {
-            // no rompemos la actualización por fallas de cleanup
+          } catch (cleanupErr) {
+            logger.warn(
+              `[ProductsService] cleanup old image delete failed: ${cleanupErr?.message || cleanupErr}`
+            )
           }
         }
       }
@@ -537,13 +601,14 @@ class ProductsService {
       logger.info(`[ProductsService] Producto actualizado id=${updated._id}`)
       return updated
     } catch (err) {
-      // ✅ rollback: si subimos imágenes nuevas y falló update, borramos las nuevas
       if (uploadedFileIds.length) {
         for (const fid of uploadedFileIds) {
           try {
             await FileService.deleteFileById(fid)
-          } catch (_) {
-            // no frenamos el error original
+          } catch (cleanupErr) {
+            logger.warn(
+              `[ProductsService] cleanup deleteFileById failed: ${cleanupErr?.message || cleanupErr}`
+            )
           }
         }
       }

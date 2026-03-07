@@ -48,6 +48,7 @@ const allowedOrigins = [
   'https://www.lccomp.com.ar',
   'https://lccomp.com.ar',
   'http://localhost:5173',
+  'http://localhost:5174',
   'http://127.0.0.1:5173'
 ]
 

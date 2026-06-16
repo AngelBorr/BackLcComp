@@ -30,5 +30,25 @@ export default {
   // 🔑 SESSION
   session: {
     secret: process.env.DATASESSION || 'sessionSecretAAA'
+  },
+
+  // 📧 NODEMAIL — SMTP CONFIG FIJA + FALLBACK
+  email: {
+    user: process.env.USER_EMAIL, // obligatorio
+    pass: process.env.PASS_EMAIL, // obligatorio
+
+    // Estos valores JAMÁS quedan null
+    host: process.env.EMAIL_HOST || 'luis@lccomp.com.ar',
+
+    port: process.env.EMAIL_PORT ? Number(process.env.EMAIL_PORT) : 26 // fallback seguro al puerto SMTP de cPanel
+  },
+
+  // 🔍 DEBUG EMAIL ENDPOINT
+  debugMailSecret: process.env.DEBUG_MAIL_SECRET || 'MiClaveSuperSegura123',
+
+  resend: {
+    apiKey: process.env.RESEND_API_KEY,
+    from: process.env.RESEND_FROM,
+    url: process.env.RESEND_URL || 'https://api.resend.com/emails'
   }
 }

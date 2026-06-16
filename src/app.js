@@ -4,17 +4,15 @@ import mongoose from 'mongoose'
 import cors from 'cors'
 import displayRoutes from 'express-routemap'
 import env from './config.js'
+import initializePassport from './config/passport.config.js'
+import passport from 'passport'
+import cookieParser from 'cookie-parser'
 
+//Routers
 import UsersRouter from './routes/users.router.js'
 import SessionsRouter from './routes/sessions.router.js'
 import FilesRouter from './routes/files.router.js'
 import ProductsRouter from './routes/products.router.js'
-
-import initializePassport from './config/passport.config.js'
-import passport from 'passport'
-
-import srcDirname from './utils/utils.js'
-import cookieParser from 'cookie-parser'
 
 // ✅ IMPORTANTE: usar el GridFSBucket del driver que trae mongoose
 const { GridFSBucket } = mongoose.mongo
@@ -23,10 +21,12 @@ const { GridFSBucket } = mongoose.mongo
 import { log } from './utils/logger.js'
 
 // ✅ Middlewares (AAA-style)
+import srcDirname from './utils/utils.js'
 import httpLogger from './middlewares/httpLogger.js'
 import { notFoundHandler, errorHandler } from './middlewares/errorHandler.js'
 import { attachLogger } from './middlewares/attachLogger.js'
 import { serviceErrorHandler } from './middlewares/serviceErrorHandler.js'
+import MessengerRouter from './routes/messenger.router.js'
 
 const PORT = env.port
 
@@ -104,7 +104,7 @@ const usersRouter = new UsersRouter()
 const sessionsRouter = new SessionsRouter()
 const filesRouter = new FilesRouter()
 const productsRouter = new ProductsRouter()
-
+const messengerRouter = new MessengerRouter()
 // --------------------------------------------------------------
 // 📦 GridFS (opcional: bucket en req) - consistente con mongoose
 // --------------------------------------------------------------
@@ -126,6 +126,7 @@ app.use('/api/users', usersRouter.getRouter())
 app.use('/api/sessions', sessionsRouter.getRouter())
 app.use('/api/files', filesRouter.getRouter())
 app.use('/api/products', productsRouter.getRouter())
+app.use('/api/messenger', messengerRouter.getRouter())
 
 // --------------------------------------------------------------
 // ✅ 404 + error handlers (SIEMPRE al final)

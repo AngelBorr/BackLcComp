@@ -27,6 +27,7 @@ import { notFoundHandler, errorHandler } from './middlewares/errorHandler.js'
 import { attachLogger } from './middlewares/attachLogger.js'
 import { serviceErrorHandler } from './middlewares/serviceErrorHandler.js'
 import MessengerRouter from './routes/messenger.router.js'
+import FileAssetsRouter from './routes/fileAssets.router.js'
 
 const PORT = env.port
 
@@ -105,6 +106,7 @@ const sessionsRouter = new SessionsRouter()
 const filesRouter = new FilesRouter()
 const productsRouter = new ProductsRouter()
 const messengerRouter = new MessengerRouter()
+const fileAssetManager = new FileAssetsRouter()
 // --------------------------------------------------------------
 // 📦 GridFS (opcional: bucket en req) - consistente con mongoose
 // --------------------------------------------------------------
@@ -125,6 +127,7 @@ app.use((req, res, next) => {
 app.use('/api/users', usersRouter.getRouter())
 app.use('/api/sessions', sessionsRouter.getRouter())
 app.use('/api/files', filesRouter.getRouter())
+app.use('/api/file-assets', fileAssetManager.getRouter())
 app.use('/api/products', productsRouter.getRouter())
 app.use('/api/messenger', messengerRouter.getRouter())
 

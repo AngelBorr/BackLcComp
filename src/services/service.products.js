@@ -77,7 +77,7 @@ class ProductsService {
   async getProducts() {
     try {
       logger.debug('[ProductsService] getProducts')
-      const products = await productModel.find({ isActive: true }).sort({ createdAt: -1 }).lean()
+      const products = await productModel.find().sort({ createdAt: -1 }).lean()
       return Array.isArray(products) ? products : []
     } catch (err) {
       logger.error(`[ProductsService] getProducts error: ${err?.message || err}`)

@@ -1,10 +1,137 @@
 import mongoose from 'mongoose'
-import FileService from './service.files.js'
 import FileAssetManager from '../dao/managers/fileAsset.mongo.js'
 
+const { GridFSBucket } = mongoose.mongo
+
 const fileAssetManager = new FileAssetManager()
+const bucketInstances = new Map()
 
 export default class FileAssetService {
+  static getBucketNameByModule(module) {
+    const buckets = {
+      catalog: 'lccompFilesCatalog',
+      messenger: 'lccompFilesMessenger',
+      quote: 'lccompFilesQuote',
+      billing: 'lccompFilesBilling',
+      general: 'lccompFilesGeneral'
+    }
+
+    return buckets[module] || buckets.general
+  }
+
+  static async ensureConnection() {
+    if (mongoose.connection.readyState === 1) return
+
+    await new Promise((resolve, reject) => {
+      mongoose.connection.once('connected', resolve)
+      mongoose.connection.once('error', reject)
+    })
+  }
+
+  static async getBucket(module = 'general') {
+    this.validateModule(module)
+
+    await this.ensureConnection()
+
+    const bucketName = this.getBucketNameByModule(module)
+
+    if (!bucketInstances.has(bucketName)) {
+      const bucket = new GridFSBucket(mongoose.connection.db, {
+        bucketName
+      })
+
+      bucketInstances.set(bucketName, bucket)
+      console.log(`[FileAssetService] GridFSBucket creado: ${bucketName}`)
+    }
+
+    return bucketInstances.get(bucketName)
+  }
+
+  static async uploadBufferToGridFS({ file, filename, module, metadata = {} }) {
+    this.validateFile(file)
+    this.validateModule(module)
+
+    const bucket = await this.getBucket(module)
+
+    return await new Promise((resolve, reject) => {
+      const uploadStream = bucket.openUploadStream(filename, {
+        metadata: {
+          ...metadata,
+          originalName: file.originalname,
+          contentType: file.mimetype,
+          size: file.size,
+          module,
+          uploadDate: new Date()
+        }
+      })
+
+      uploadStream.on('error', reject)
+
+      uploadStream.on('finish', () => {
+        resolve({
+          success: true,
+          fileId: uploadStream.id,
+          filename,
+          bucketName: this.getBucketNameByModule(module),
+          metadata
+        })
+      })
+
+      uploadStream.end(file.buffer)
+    })
+  }
+
+  static async getGridFsFileById({ fileId, module }) {
+    this.validateObjectId(fileId, 'ID de archivo')
+    this.validateModule(module)
+
+    const bucket = await this.getBucket(module)
+    const objectId = new mongoose.Types.ObjectId(fileId)
+
+    const files = await bucket.find({ _id: objectId }).toArray()
+
+    if (!files || files.length === 0) {
+      throw new Error('Archivo físico no encontrado en GridFS')
+    }
+
+    const fileInfo = files[0]
+
+    return {
+      success: true,
+      fileInfo: {
+        id: fileInfo._id,
+        filename: fileInfo.filename,
+        length: fileInfo.length,
+        uploadDate: fileInfo.uploadDate,
+        contentType: fileInfo.metadata?.contentType,
+        metadata: fileInfo.metadata || {}
+      },
+      createDownloadStream: () => bucket.openDownloadStream(objectId)
+    }
+  }
+
+  static async deleteGridFsFileById({ fileId, module }) {
+    this.validateObjectId(fileId, 'ID de archivo')
+    this.validateModule(module)
+
+    const bucket = await this.getBucket(module)
+    const objectId = new mongoose.Types.ObjectId(fileId)
+
+    const files = await bucket.find({ _id: objectId }).toArray()
+
+    if (!files || files.length === 0) {
+      throw new Error('Archivo físico no encontrado en GridFS')
+    }
+
+    await bucket.delete(objectId)
+
+    return {
+      success: true,
+      deletedFileId: fileId,
+      filename: files[0].filename
+    }
+  }
+
   static validateFile(file) {
     if (!file) {
       throw new Error('No se recibió ningún archivo')
@@ -140,13 +267,18 @@ export default class FileAssetService {
 
     const filename = this.buildSafeFilename(file)
 
-    const uploadResult = await FileService.uploadFile(file.buffer, filename, {
-      originalName: file.originalname,
-      contentType: file.mimetype,
+    const uploadResult = await this.uploadBufferToGridFS({
+      file,
+      filename,
       module,
-      entityType,
-      entityId,
-      visibility: finalVisibility
+      metadata: {
+        originalName: file.originalname,
+        contentType: file.mimetype,
+        module,
+        entityType,
+        entityId,
+        visibility: finalVisibility
+      }
     })
 
     if (!uploadResult?.success) {
@@ -164,7 +296,10 @@ export default class FileAssetService {
       entityId,
       visibility: finalVisibility,
       uploadedBy,
-      data
+      data: {
+        ...data,
+        bucketName: uploadResult.bucketName
+      }
     })
 
     return {
@@ -195,6 +330,116 @@ export default class FileAssetService {
         ...data
       }
     })
+  }
+
+  static async uploadMessengerAttachment({ file, uploadedBy = null, entityId = null, data = {} }) {
+    const result = await this.uploadGenericFile({
+      file,
+      module: 'messenger',
+      entityType: 'send',
+      entityId,
+      visibility: 'private',
+      uploadedBy,
+      data: {
+        source: 'messenger_attachment',
+        ...data
+      }
+    })
+
+    const asset = result.data
+
+    return {
+      asset,
+      fileAssetId: asset._id,
+      fileId: asset.fileId,
+      filename: asset.filename,
+      originalName: asset.originalName,
+      mimetype: asset.mimetype,
+      size: asset.size
+    }
+  }
+
+  static async uploadMessengerAttachments({
+    files = [],
+    uploadedBy = null,
+    entityId = null,
+    data = {}
+  }) {
+    if (!Array.isArray(files) || files.length === 0) {
+      return []
+    }
+
+    const attachments = []
+
+    for (const file of files) {
+      const attachment = await this.uploadMessengerAttachment({
+        file,
+        uploadedBy,
+        entityId,
+        data
+      })
+
+      attachments.push(attachment)
+    }
+
+    return attachments
+  }
+
+  static async attachAssetsToSend(attachments = [], sendId) {
+    const ids = attachments.map((item) => item.fileAssetId).filter(Boolean)
+
+    if (!ids.length) return null
+
+    return await fileAssetManager.attachToSend(ids, sendId)
+  }
+
+  static async getMessengerAssetsBySendId(sendId) {
+    this.validateObjectId(sendId, 'sendId')
+
+    return await fileAssetManager.getMessengerAssetsBySendId(sendId)
+  }
+
+  static streamToBuffer(stream) {
+    return new Promise((resolve, reject) => {
+      const chunks = []
+
+      stream.on('data', (chunk) => chunks.push(chunk))
+      stream.on('error', reject)
+      stream.on('end', () => resolve(Buffer.concat(chunks)))
+    })
+  }
+
+  static async getBufferByFileId(fileId, user = { role: 'ADMIN' }) {
+    this.validateObjectId(fileId, 'ID de archivo')
+
+    const streamResult = await this.getStreamByFileId(fileId, user)
+
+    if (!streamResult?.success || !streamResult.stream) {
+      throw new Error('No se pudo obtener el archivo adjunto')
+    }
+
+    return await this.streamToBuffer(streamResult.stream)
+  }
+
+  static async buildResendAttachmentsFromAssets(attachments = []) {
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+      return []
+    }
+
+    const resendAttachments = []
+
+    for (const attachment of attachments) {
+      if (!attachment.fileId) continue
+
+      const buffer = await this.getBufferByFileId(attachment.fileId, { role: 'ADMIN' })
+
+      resendAttachments.push({
+        filename: attachment.originalName || attachment.filename,
+        content: buffer.toString('base64')
+      })
+    }
+
+    return resendAttachments
   }
 
   static async getAssetById(id) {
@@ -242,11 +487,10 @@ export default class FileAssetService {
       throw new Error('No autorizado para acceder al archivo')
     }
 
-    const fileResult = await FileService.getFileById(asset.fileId)
-
-    if (!fileResult.success) {
-      throw new Error(fileResult.error || 'Archivo físico no encontrado')
-    }
+    const fileResult = await this.getGridFsFileById({
+      fileId: asset.fileId,
+      module: asset.module
+    })
 
     return {
       success: true,
@@ -269,11 +513,10 @@ export default class FileAssetService {
       throw new Error('No autorizado para acceder al archivo')
     }
 
-    const fileResult = await FileService.getFileById(fileId)
-
-    if (!fileResult.success) {
-      throw new Error(fileResult.error || 'Archivo físico no encontrado')
-    }
+    const fileResult = await this.getGridFsFileById({
+      fileId,
+      module: asset.module
+    })
 
     return {
       success: true,
@@ -287,11 +530,10 @@ export default class FileAssetService {
     const catalogResult = await this.getActiveCatalog(user)
     const catalog = catalogResult.data
 
-    const fileResult = await FileService.getFileById(catalog.fileId)
-
-    if (!fileResult.success) {
-      throw new Error(fileResult.error || 'Archivo físico del catálogo no encontrado')
-    }
+    const fileResult = await this.getGridFsFileById({
+      fileId: catalog.fileId,
+      module: catalog.module
+    })
 
     return {
       success: true,
@@ -304,16 +546,45 @@ export default class FileAssetService {
   static async deleteAsset(id) {
     this.validateObjectId(id, 'ID de archivo')
 
-    const asset = await fileAssetManager.softDelete(id)
+    const asset = await fileAssetManager.getById(id)
 
     if (!asset) {
       throw new Error('Archivo no encontrado')
     }
 
+    try {
+      await this.deleteGridFsFileById({
+        fileId: asset.fileId,
+        module: asset.module
+      })
+    } catch (err) {
+      console.warn(`[FileAssetService] No se pudo borrar archivo físico: ${err.message}`)
+    }
+
+    const deletedAsset = await fileAssetManager.softDelete(id)
+
     return {
       success: true,
       message: 'Archivo eliminado correctamente',
-      data: asset
+      data: deletedAsset
+    }
+  }
+
+  static async deleteManyAssets(ids = []) {
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return {
+        success: true,
+        message: 'No hay archivos para eliminar',
+        data: null
+      }
+    }
+
+    const result = await fileAssetManager.softDeleteMany(ids)
+
+    return {
+      success: true,
+      message: 'Archivos eliminados correctamente',
+      data: result
     }
   }
 

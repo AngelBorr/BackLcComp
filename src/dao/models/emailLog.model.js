@@ -87,18 +87,21 @@ const EmailLogSchema = new Schema(
 
     attachments: [
       {
-        filename: {
-          type: String,
-          required: true
-        },
-        mimetype: {
-          type: String,
+        fileAssetId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'file_assets',
           required: false
         },
-        size: {
-          type: Number,
+
+        fileId: {
+          type: mongoose.Schema.Types.ObjectId,
           required: false
-        }
+        },
+
+        filename: String,
+        originalName: String,
+        mimetype: String,
+        size: Number
       }
     ],
 

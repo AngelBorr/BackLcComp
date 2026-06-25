@@ -83,14 +83,32 @@ const SendSchema = new Schema(
 
     attachments: [
       {
+        fileAssetId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'file_assets',
+          required: false
+        },
+
+        fileId: {
+          type: mongoose.Schema.Types.ObjectId,
+          required: false
+        },
+
         filename: {
           type: String,
           required: true
         },
+
+        originalName: {
+          type: String,
+          required: false
+        },
+
         mimetype: {
           type: String,
           required: false
         },
+
         size: {
           type: Number,
           required: false

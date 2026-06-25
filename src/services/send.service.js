@@ -3,6 +3,7 @@ import env from '../config.js'
 import SendManager from '../dao/managers/send.mongo.js'
 import EmailLogManager from '../dao/managers/emailLog.mongo.js'
 import MessageTemplateManager from '../dao/managers/messageTemplate.mongo.js'
+import FileAssetService from '../services/service.fileAsset.js'
 import { sendResendEmail } from '../utils/resend.js'
 import { log, error as logError, secureLog } from '../utils/logger.js'
 
@@ -11,20 +12,13 @@ class SendService {
     this.sendManager = new SendManager()
     this.emailLogManager = new EmailLogManager()
     this.messageManager = new MessageTemplateManager()
+    this.fileAssetService = FileAssetService
   }
 
   normalizeAttachments(files = []) {
     return files.map((file) => ({
       filename: file.originalname,
       content: file.buffer.toString('base64')
-    }))
-  }
-
-  getAttachmentMetadata(files = []) {
-    return files.map((file) => ({
-      filename: file.originalname,
-      mimetype: file.mimetype,
-      size: file.size
     }))
   }
 
@@ -143,6 +137,17 @@ class SendService {
     }
   }
 
+  async persistMessengerAttachments({ files = [], createdBy = null, sendData = {} }) {
+    if (!Array.isArray(files) || files.length === 0) return []
+
+    return await this.fileAssetService.uploadMessengerAttachments({
+      files,
+      uploadedBy: createdBy,
+      entityId: null,
+      data: sendData
+    })
+  }
+
   async createAndSendMessengerEmail({
     email,
     subject,
@@ -175,8 +180,17 @@ class SendService {
       content: normalizedData.content
     })
 
-    const attachmentMetadata = this.getAttachmentMetadata(files)
-    const attachments = this.normalizeAttachments(files)
+    const resendAttachments = this.normalizeAttachments(files)
+
+    const attachmentMetadata = await this.persistMessengerAttachments({
+      files,
+      createdBy: normalizedData.createdBy,
+      sendData: {
+        sendName: normalizedData.sendName,
+        sendType: normalizedData.sendType,
+        sendSource: 'legacy_individual'
+      }
+    })
 
     const send = await this.sendManager.createSend({
       sendName: normalizedData.sendName,
@@ -203,18 +217,30 @@ class SendService {
       ]
     })
 
+    await this.fileAssetService.attachAssetsToSend(attachmentMetadata, send._id)
+
     try {
       const resendPayload = {
         from: env.resend.from,
         to: normalizedData.email,
         subject: messageSnapshot.subjectSnapshot,
         html: messageSnapshot.contentSnapshot,
-        ...(attachments.length > 0 && { attachments })
+        ...(resendAttachments.length > 0 && { attachments: resendAttachments })
       }
 
       secureLog('📤 Resend payload Messenger:', {
-        ...resendPayload,
-        attachments: attachmentMetadata
+        sendName: normalizedData.sendName,
+        sendType: normalizedData.sendType,
+        to: normalizedData.email,
+        subject: messageSnapshot.subjectSnapshot,
+        htmlLength: messageSnapshot.contentSnapshot?.length || 0,
+        attachmentsCount: resendAttachments.length,
+        attachments: attachmentMetadata.map((file) => ({
+          filename: file.originalName || file.filename,
+          size: file.size,
+          hasFileId: Boolean(file.fileId),
+          hasFileAssetId: Boolean(file.fileAssetId)
+        }))
       })
 
       const sent = await sendResendEmail(resendPayload)
@@ -302,20 +328,6 @@ class SendService {
     }
   }
 
-  async getSends(params) {
-    return await this.sendManager.getSends(params)
-  }
-
-  async getSendById(id) {
-    const send = await this.sendManager.getSendById(id)
-
-    if (!send) {
-      throw new Error('Envío no encontrado')
-    }
-
-    return send
-  }
-
   async createAndSendMessengerBatch({
     subject,
     content,
@@ -352,8 +364,17 @@ class SendService {
       content: normalizedData.content
     })
 
-    const attachmentMetadata = this.getAttachmentMetadata(files)
-    const attachments = this.normalizeAttachments(files)
+    const resendAttachments = this.normalizeAttachments(files)
+
+    const attachmentMetadata = await this.persistMessengerAttachments({
+      files,
+      createdBy: normalizedData.createdBy,
+      sendData: {
+        sendName: normalizedData.sendName,
+        sendType: normalizedData.sendType,
+        sendSource: normalizedData.sendSource
+      }
+    })
 
     const send = await this.sendManager.createSend({
       sendName: normalizedData.sendName,
@@ -379,6 +400,8 @@ class SendService {
       }))
     })
 
+    await this.fileAssetService.attachAssetsToSend(attachmentMetadata, send._id)
+
     let successCount = 0
     let failedCount = 0
     const results = []
@@ -390,24 +413,21 @@ class SendService {
           to: recipient.email,
           subject: messageSnapshot.subjectSnapshot,
           html: messageSnapshot.contentSnapshot,
-          ...(attachments.length > 0 && { attachments })
+          ...(resendAttachments.length > 0 && { attachments: resendAttachments })
         }
 
         secureLog('📤 Resend payload Messenger Batch:', {
           sendName: normalizedData.sendName,
           sendType: normalizedData.sendType,
-
-          to: resendPayload.to,
-
-          subject: resendPayload.subject,
-
-          htmlLength: resendPayload.html?.length || 0,
-
-          attachmentsCount: attachmentMetadata.length,
-
+          to: recipient.email,
+          subject: messageSnapshot.subjectSnapshot,
+          htmlLength: messageSnapshot.contentSnapshot?.length || 0,
+          attachmentsCount: resendAttachments.length,
           attachments: attachmentMetadata.map((file) => ({
-            filename: file.filename,
-            size: file.size
+            filename: file.originalName || file.filename,
+            size: file.size,
+            hasFileId: Boolean(file.fileId),
+            hasFileAssetId: Boolean(file.fileAssetId)
           }))
         })
 
@@ -531,8 +551,12 @@ class SendService {
       throw new Error('El envío no posee contenido válido para reintentar')
     }
 
+    const retryAttachments = await this.fileAssetService.buildResendAttachmentsFromAssets(
+      send.attachments || []
+    )
+
     log(
-      `🔁 SendService Retry → reenviando fallidos del envío ${sendId}. Total: ${failedRecipients.length}`
+      `🔁 SendService Retry → reenviando fallidos del envío ${sendId}. Total: ${failedRecipients.length} | Adjuntos: ${retryAttachments.length}`
     )
 
     let retrySuccessCount = 0
@@ -545,10 +569,8 @@ class SendService {
           from: env.resend.from,
           to: recipient.email,
           subject: send.subjectSnapshot,
-          html: send.contentSnapshot
-          // Importante:
-          // No se reenvían adjuntos en retry porque hoy solo guardamos metadata.
-          // Para reenviar adjuntos reales, hay que persistirlos en GridFS o storage.
+          html: send.contentSnapshot,
+          ...(retryAttachments.length > 0 && { attachments: retryAttachments })
         }
 
         secureLog('🔁 Resend payload Retry:', {
@@ -557,10 +579,12 @@ class SendService {
           to: recipient.email,
           subject: send.subjectSnapshot,
           htmlLength: send.contentSnapshot?.length || 0,
-          attachmentsCount: send.attachments?.length || 0,
+          attachmentsCount: retryAttachments.length,
           attachments: (send.attachments || []).map((file) => ({
-            filename: file.filename,
-            size: file.size
+            filename: file.originalName || file.filename,
+            size: file.size,
+            hasFileId: Boolean(file.fileId),
+            hasFileAssetId: Boolean(file.fileAssetId)
           }))
         })
 
@@ -586,7 +610,9 @@ class SendService {
             originalEmailLogId: recipient.emailLogId || null,
             messageId: send.messageId || null,
             retriedBy,
-            retry: true
+            retry: true,
+            retryWithAttachments: retryAttachments.length > 0,
+            attachmentsCount: retryAttachments.length
           }
         })
 
@@ -626,7 +652,9 @@ class SendService {
             originalEmailLogId: recipient.emailLogId || null,
             messageId: send.messageId || null,
             retriedBy,
-            retry: true
+            retry: true,
+            retryWithAttachments: retryAttachments.length > 0,
+            attachmentsCount: retryAttachments.length
           }
         })
 
@@ -660,9 +688,24 @@ class SendService {
         retriedRecipients: failedRecipients.length,
         successCount: retrySuccessCount,
         failedCount: retryFailedCount,
+        attachmentsCount: retryAttachments.length,
         status: updatedSend.status
       }
     }
+  }
+
+  async getSends(params) {
+    return await this.sendManager.getSends(params)
+  }
+
+  async getSendById(id) {
+    const send = await this.sendManager.getSendById(id)
+
+    if (!send) {
+      throw new Error('Envío no encontrado')
+    }
+
+    return send
   }
 }
 

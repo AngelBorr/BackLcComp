@@ -35,7 +35,13 @@ const EmailLogSchema = new Schema(
     type: {
       type: String,
       required: true,
-      enum: ['inscription_validation', 'mass_validation', 'retry_validation', 'messenger_send']
+      enum: [
+        'inscription_validation',
+        'mass_validation',
+        'retry_validation',
+        'messenger_send',
+        'messenger_send_retry'
+      ]
     },
 
     status: {

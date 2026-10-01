@@ -89,12 +89,10 @@ export const logoutUser = async (req, res, next) => {
   try {
     const result = await sessionsService.logoutUser(req.user)
 
-    const isProd = process.env.NODE_ENV === 'production'
-
     res.clearCookie(env.cookie.name, {
       httpOnly: true,
-      secure: isProd,
-      sameSite: isProd ? 'none' : 'lax',
+      secure: env.cookie.secure,
+      sameSite: env.cookie.sameSite,
       path: '/', // ✅ CLAVE
       ...(env.cookie.domain ? { domain: env.cookie.domain } : {}) // ✅ opcional
     })

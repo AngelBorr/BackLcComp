@@ -30,12 +30,10 @@ class SessionsService {
         expiresIn: env.jwt.expiresIn
       })
 
-      const isProd = process.env.NODE_ENV === 'production'
-
       res.cookie(env.cookie.name, token, {
         httpOnly: true,
-        secure: isProd,
-        sameSite: isProd ? 'none' : 'lax',
+        secure: env.cookie.secure,
+        sameSite: env.cookie.sameSite,
         maxAge: env.cookie.maxAge,
         path: '/', // ✅ CLAVE
         ...(env.cookie.domain ? { domain: env.cookie.domain } : {}) // ✅ opcional

@@ -2,6 +2,38 @@ import dotenv from 'dotenv'
 
 dotenv.config()
 
+const parseBoolean = (value, fallback) => {
+  if (typeof value !== 'string') return fallback
+
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'true') return true
+  if (normalized === 'false') return false
+  return fallback
+}
+
+const parseSameSite = (value, fallback) => {
+  const normalized = String(value || '').trim().toLowerCase()
+  return ['lax', 'strict', 'none'].includes(normalized) ? normalized : fallback
+}
+
+export const resolveCookieConfig = (environment = process.env) => {
+  const nodeEnvironment = String(environment.NODE_ENV || 'development').trim().toLowerCase()
+  const crossSiteHttps = ['staging', 'production'].includes(nodeEnvironment)
+  const defaultSameSite = crossSiteHttps ? 'none' : 'lax'
+  const configuredDomain = String(environment.COOKIE_DOMAIN || '').trim()
+
+  return {
+    name: environment.COOKIE_NAME || 'cookieToken',
+    maxAge:
+      Number(environment.cookie_MAX_AGE) || Number(environment.COOKIE_MAX_AGE) || 3600000,
+    sameSite: parseSameSite(environment.COOKIE_SAME_SITE, defaultSameSite),
+    secure: parseBoolean(environment.COOKIE_SECURE, crossSiteHttps),
+    ...(configuredDomain ? { domain: configuredDomain } : {})
+  }
+}
+
+const cookieConfig = resolveCookieConfig()
+
 export default {
   port: process.env.PORT,
   userMongo: process.env.USER_MONGO,
@@ -21,12 +53,7 @@ export default {
   },
 
   // 🍪 COOKIE
-  cookie: {
-    name: process.env.COOKIE_NAME || 'cookieToken',
-    maxAge: Number(process.env.cookie_MAX_AGE) || Number(process.env.COOKIE_MAX_AGE) || 3600000,
-    sameSite: process.env.COOKIE_SAME_SITE || 'none',
-    secure: true
-  },
+  cookie: cookieConfig,
 
   // 🔑 SESSION
   session: {

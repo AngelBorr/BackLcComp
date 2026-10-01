@@ -50,12 +50,13 @@ app.set('trust proxy', 1)
 // ✅ CORS (FIX: incluir www + localhost + permitir preflight con mismas opciones)
 // --------------------------------------------------------------
 const allowedOrigins = [
+  env.frontendUrl,
   'https://www.lccomp.com.ar',
   'https://lccomp.com.ar',
   'http://localhost:5173',
   'http://localhost:5174',
   'http://127.0.0.1:5173'
-]
+].filter(Boolean)
 
 // ✅ Config CORS única (la reutilizamos también en app.options)
 const corsOptions = {

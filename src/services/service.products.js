@@ -1,6 +1,7 @@
 // services/service.products.js
 import mongoose from 'mongoose'
-import productModel from '../dao/models/produtc.model.js'
+import productModel, { getEffectiveInventoryMode } from '../dao/models/produtc.model.js'
+import ProductUnitManager from '../dao/managers/productUnit.manager.js'
 import logger from '../utils/logger.js'
 import FileService from './service.files.js' // ✅ tu service GridFS (ya existe)
 
@@ -10,8 +11,14 @@ class ServiceError extends Error {
     this.name = 'ServiceError'
     this.code = code
     this.status = status
+    this.statusCode = status
     this.details = details
   }
+}
+
+const TRANSACTION_OPTIONS = {
+  readConcern: { level: 'snapshot' },
+  writeConcern: { w: 'majority' }
 }
 
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(String(id || ''))
@@ -68,6 +75,40 @@ const extractImageIds = (payload) => {
 }
 
 class ProductsService {
+  #assertActiveExternalSession(session) {
+    if (
+      session &&
+      (session.hasEnded ||
+        typeof session.inTransaction !== 'function' ||
+        !session.inTransaction())
+    ) {
+      throw new ServiceError(
+        'La sesión externa debe tener una transacción activa',
+        'EXTERNAL_TRANSACTION_REQUIRED',
+        400
+      )
+    }
+  }
+
+  async #runInTransaction(operation, { session: externalSession } = {}) {
+    this.#assertActiveExternalSession(externalSession)
+
+    if (externalSession) return operation(externalSession)
+
+    const ownedSession = await mongoose.startSession()
+    let result
+
+    try {
+      await ownedSession.withTransaction(async () => {
+        result = await operation(ownedSession)
+      }, TRANSACTION_OPTIONS)
+
+      return result
+    } finally {
+      await ownedSession.endSession()
+    }
+  }
+
   #assertValidObjectId(id) {
     if (!id) throw new ServiceError('ID requerido', 'MISSING_ID', 400)
     if (!mongoose.Types.ObjectId.isValid(id))
@@ -178,6 +219,14 @@ class ProductsService {
         throw new ServiceError(
           'Datos inválidos para crear producto',
           'INVALID_PRODUCT_PAYLOAD',
+          400
+        )
+      }
+
+      if (body.inventoryMode !== undefined && body.inventoryMode !== 'manual') {
+        throw new ServiceError(
+          'inventoryMode se administra mediante operaciones explícitas de serialización',
+          'INVENTORY_MODE_MANAGED',
           400
         )
       }
@@ -374,8 +423,26 @@ class ProductsService {
         )
       }
 
+      if (body.inventoryMode !== undefined) {
+        throw new ServiceError(
+          'inventoryMode no puede modificarse mediante la actualización general del producto',
+          'INVENTORY_MODE_MANAGED',
+          400
+        )
+      }
+
       const current = await productModel.findById(id).lean()
       if (!current) throw new ServiceError('Producto no encontrado', 'PRODUCT_NOT_FOUND', 404)
+
+      const currentInventoryMode = getEffectiveInventoryMode(current)
+
+      if (currentInventoryMode === 'serialized' && body.prodStock !== undefined) {
+        throw new ServiceError(
+          'No se puede modificar prodStock manualmente para un producto serializado',
+          'SERIALIZED_STOCK_MANAGED_BY_UNITS',
+          409
+        )
+      }
 
       const toBool = (v, fallback = false) => {
         if (typeof v === 'boolean') return v
@@ -580,11 +647,33 @@ class ProductsService {
       const $set = { ...base }
       if (prodImgsUpdate !== undefined) $set.prodImgs = prodImgsUpdate
 
+      const updateFilter = { _id: id }
+
+      if (body.prodStock !== undefined) {
+        updateFilter.inventoryMode = { $ne: 'serialized' }
+      }
+
       const updated = await productModel
-        .findByIdAndUpdate(id, { $set }, { new: true, runValidators: true, context: 'query' })
+        .findOneAndUpdate(updateFilter, { $set }, { new: true, runValidators: true, context: 'query' })
         .lean()
 
-      if (!updated) throw new ServiceError('Producto no encontrado', 'PRODUCT_NOT_FOUND', 404)
+      if (!updated) {
+        const productAfterUpdateAttempt = await productModel.findById(id).lean()
+
+        if (
+          productAfterUpdateAttempt &&
+          getEffectiveInventoryMode(productAfterUpdateAttempt) === 'serialized' &&
+          body.prodStock !== undefined
+        ) {
+          throw new ServiceError(
+            'No se puede modificar prodStock manualmente para un producto serializado',
+            'SERIALIZED_STOCK_MANAGED_BY_UNITS',
+            409
+          )
+        }
+
+        throw new ServiceError('Producto no encontrado', 'PRODUCT_NOT_FOUND', 404)
+      }
 
       if (prodImgsUpdate !== undefined && oldFileIdsToDelete.length) {
         for (const fid of oldFileIdsToDelete) {
@@ -621,6 +710,141 @@ class ProductsService {
     }
   }
 
+  async startSerialization(id) {
+    try {
+      logger.debug(`[ProductsService] startSerialization id=${id}`)
+      this.#assertValidObjectId(id)
+
+      const product = await productModel.findById(id).lean()
+      if (!product) throw new ServiceError('Producto no encontrado', 'PRODUCT_NOT_FOUND', 404)
+
+      if (getEffectiveInventoryMode(product) !== 'manual') {
+        throw new ServiceError(
+          'La serialización solo puede iniciarse en productos con inventario manual',
+          'INVALID_INVENTORY_MODE_TRANSITION',
+          409
+        )
+      }
+
+      const updated = await productModel
+        .findOneAndUpdate(
+          {
+            _id: id,
+            $or: [{ inventoryMode: 'manual' }, { inventoryMode: { $exists: false } }]
+          },
+          { $set: { inventoryMode: 'serializing' } },
+          { new: true, runValidators: true, context: 'query' }
+        )
+        .lean()
+
+      if (!updated) {
+        throw new ServiceError(
+          'La serialización no pudo iniciarse porque el modo de inventario cambió',
+          'INVENTORY_MODE_TRANSITION_CONFLICT',
+          409
+        )
+      }
+
+      logger.info(`[ProductsService] Serialización iniciada id=${updated._id}`)
+
+      return {
+        product: updated,
+        inventoryMode: getEffectiveInventoryMode(updated)
+      }
+    } catch (err) {
+      if (err instanceof ServiceError) throw err
+
+      logger.error(`[ProductsService] startSerialization error: ${err?.message || err}`)
+      throw new ServiceError('Error interno al iniciar serialización', 'START_SERIALIZATION_FAILED', 500, {
+        cause: err?.message
+      })
+    }
+  }
+
+  async finishSerialization(id, { session: externalSession } = {}) {
+    try {
+      logger.debug(`[ProductsService] finishSerialization id=${id}`)
+      this.#assertValidObjectId(id)
+
+      const result = await this.#runInTransaction(
+        async (session) => {
+          const product = await productModel
+            .findOneAndUpdate(
+              { _id: id, inventoryMode: 'serializing' },
+              { $inc: { __v: 1 } },
+              { new: true, session }
+            )
+            .lean()
+
+          if (!product) {
+            const existingProduct = await productModel.findById(id).session(session).lean()
+
+            if (!existingProduct) {
+              throw new ServiceError('Producto no encontrado', 'PRODUCT_NOT_FOUND', 404)
+            }
+
+            throw new ServiceError(
+              'La serialización no pudo finalizarse porque el modo de inventario cambió',
+              'INVENTORY_MODE_TRANSITION_CONFLICT',
+              409
+            )
+          }
+
+          const summary = await ProductUnitManager.countByProductAndStatus(
+            new mongoose.Types.ObjectId(id),
+            { session }
+          )
+          const serializedAvailableUnits =
+            summary.find((item) => item._id === 'available')?.count || 0
+          const previousStock = Number(product.prodStock ?? 0)
+
+          const updated = await productModel
+            .findOneAndUpdate(
+              { _id: id, inventoryMode: 'serializing' },
+              {
+                $set: {
+                  inventoryMode: 'serialized',
+                  prodStock: serializedAvailableUnits
+                }
+              },
+              { new: true, session, runValidators: true, context: 'query' }
+            )
+            .lean()
+
+          if (!updated) {
+            throw new ServiceError(
+              'La serialización no pudo finalizarse porque el modo de inventario cambió',
+              'INVENTORY_MODE_TRANSITION_CONFLICT',
+              409
+            )
+          }
+
+          return { product: updated, previousStock, serializedAvailableUnits }
+        },
+        { session: externalSession }
+      )
+
+      const { product: updated, previousStock, serializedAvailableUnits } = result
+
+      logger.info(`[ProductsService] Serialización finalizada id=${updated._id}`)
+
+      return {
+        product: updated,
+        previousStock,
+        serializedAvailableUnits,
+        difference: serializedAvailableUnits - previousStock,
+        inventoryMode: getEffectiveInventoryMode(updated)
+      }
+    } catch (err) {
+      if (err instanceof ServiceError) throw err
+
+      logger.error(`[ProductsService] finishSerialization error: ${err?.message || err}`)
+      throw new ServiceError('Error interno al finalizar serialización', 'FINISH_SERIALIZATION_FAILED', 500, {
+        cause: err?.message
+      })
+    }
+  }
+
   /**
    * ✅ deleteProduct:
    * - deleteImages=true borra GridFS de prodImgs[*].fileId
@@ -631,8 +855,69 @@ class ProductsService {
       logger.debug(`[ProductsService] deleteProduct id=${id}`)
       this.#assertValidObjectId(id)
 
-      const product = await productModel.findById(id).lean()
-      if (!product) throw new ServiceError('Producto no encontrado', 'PRODUCT_NOT_FOUND', 404)
+      if (soft) {
+        const product = await productModel.findById(id).lean()
+        if (!product) throw new ServiceError('Producto no encontrado', 'PRODUCT_NOT_FOUND', 404)
+
+        if (deleteImages) {
+          const ids = Array.isArray(product.prodImgs)
+            ? product.prodImgs.map((i) => i?.fileId).filter(Boolean)
+            : []
+
+          for (const fileId of ids) {
+            try {
+              await FileService.deleteFileById(String(fileId))
+            } catch (e) {
+              logger.warn?.(
+                `[ProductsService] deleteProduct warn: no se pudo borrar imagen fileId=${fileId} (${
+                  e?.message || e
+                })`
+              )
+            }
+          }
+        }
+
+        await productModel.updateOne({ _id: id }, { $set: { isActive: false } })
+        return { deleted: true, mode: 'soft' }
+      }
+
+      const product = await this.#runInTransaction(
+        async (session) => {
+          const guardedProduct = await productModel
+            .findOneAndUpdate(
+              { _id: id },
+              { $inc: { __v: 1 } },
+              { new: true, session }
+            )
+            .lean()
+
+          if (!guardedProduct) {
+            throw new ServiceError('Producto no encontrado', 'PRODUCT_NOT_FOUND', 404)
+          }
+
+          const hasProductUnits = await ProductUnitManager.existsByProduct(id, { session })
+
+          if (hasProductUnits) {
+            throw new ServiceError(
+              'No se puede eliminar físicamente un producto que posee unidades registradas',
+              'PRODUCT_HAS_PRODUCT_UNITS',
+              409
+            )
+          }
+
+          const deleteResult = await productModel.deleteOne({ _id: id }, { session })
+
+          if (deleteResult.deletedCount !== 1) {
+            throw new ServiceError(
+              'El producto cambió durante la eliminación',
+              'PRODUCT_DELETE_CONFLICT',
+              409
+            )
+          }
+
+          return guardedProduct
+        }
+      )
 
       if (deleteImages) {
         const ids = Array.isArray(product.prodImgs)
@@ -653,12 +938,6 @@ class ProductsService {
         }
       }
 
-      if (soft) {
-        await productModel.updateOne({ _id: id }, { $set: { isActive: false } })
-        return { deleted: true, mode: 'soft' }
-      }
-
-      await productModel.deleteOne({ _id: id })
       return { deleted: true, mode: 'hard' }
     } catch (err) {
       if (err instanceof ServiceError) throw err

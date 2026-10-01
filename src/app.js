@@ -13,6 +13,10 @@ import UsersRouter from './routes/users.router.js'
 import SessionsRouter from './routes/sessions.router.js'
 import FilesRouter from './routes/files.router.js'
 import ProductsRouter from './routes/products.router.js'
+import ProductUnitRouter from './routes/productUnit.router.js'
+import WebhooksRouter from './routes/webhooks.router.js'
+import CheckoutRouter from './routes/checkout.router.js'
+import OrdersRouter from './routes/orders.router.js'
 
 // ✅ IMPORTANTE: usar el GridFSBucket del driver que trae mongoose
 const { GridFSBucket } = mongoose.mongo
@@ -65,7 +69,7 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
   exposedHeaders: ['Set-Cookie']
 }
 
@@ -107,6 +111,10 @@ const filesRouter = new FilesRouter()
 const productsRouter = new ProductsRouter()
 const messengerRouter = new MessengerRouter()
 const fileAssetManager = new FileAssetsRouter()
+const productUnitRouter = new ProductUnitRouter()
+const webhooksRouter = new WebhooksRouter()
+const checkoutRouter = new CheckoutRouter()
+const ordersRouter = new OrdersRouter()
 // --------------------------------------------------------------
 // 📦 GridFS (opcional: bucket en req) - consistente con mongoose
 // --------------------------------------------------------------
@@ -130,6 +138,10 @@ app.use('/api/files', filesRouter.getRouter())
 app.use('/api/file-assets', fileAssetManager.getRouter())
 app.use('/api/products', productsRouter.getRouter())
 app.use('/api/messenger', messengerRouter.getRouter())
+app.use('/api/product-units', productUnitRouter.getRouter())
+app.use('/api/webhooks', webhooksRouter.getRouter())
+app.use('/api/checkout', checkoutRouter.getRouter())
+app.use('/api/orders', ordersRouter.getRouter())
 
 // --------------------------------------------------------------
 // ✅ 404 + error handlers (SIEMPRE al final)

@@ -92,7 +92,11 @@ const initializePassport = () => {
             return done(null, false)
           }
 
-          secureLog('🔐 JWT verificado para usuario:', payload.user)
+          secureLog('🔐 JWT verificado para usuario:', {
+            id: payload.user.id,
+            email: payload.user.email,
+            role: payload.user.role
+          })
 
           return done(null, payload.user)
         } catch (err) {

@@ -1,0 +1,127 @@
+import PaymentModel from '../models/payment.model.js'
+
+class PaymentManager {
+  async create(data, { session } = {}) {
+    const payment = new PaymentModel(data)
+    return payment.save({ session })
+  }
+
+  async getById(id, { session } = {}) {
+    const query = PaymentModel.findById(id).lean()
+    if (session) query.session(session)
+    return query
+  }
+
+  async getByOrderId(orderId, { session } = {}) {
+    const query = PaymentModel.find({ orderId }).sort({ createdAt: -1 }).lean()
+    if (session) query.session(session)
+    return query
+  }
+
+  async getLatestByOrderId(orderId, { session } = {}) {
+    const query = PaymentModel.findOne({ orderId }).sort({ createdAt: -1 }).lean()
+    if (session) query.session(session)
+    return query
+  }
+
+  async getByProviderPaymentId(providerPaymentId, { session } = {}) {
+    const query = PaymentModel.findOne({ providerPaymentId }).lean()
+    if (session) query.session(session)
+    return query
+  }
+
+  async getByProviderOrderId(provider, providerOrderId, { session } = {}) {
+    const query = PaymentModel.findOne({ provider, providerOrderId }).lean()
+    if (session) query.session(session)
+    return query
+  }
+
+  async associateProviderOrderIfMissing(
+    paymentId,
+    providerOrderId,
+    { providerStatus, providerStatusDetail },
+    { session } = {}
+  ) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        provider: 'mercado_pago',
+        normalizedStatus: 'pending',
+        $or: [
+          { providerOrderId: null },
+          { providerOrderId: { $exists: false } }
+        ]
+      },
+      {
+        $set: {
+          providerOrderId,
+          providerStatus,
+          providerStatusDetail
+        }
+      },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
+  async updateProviderObservation(paymentId, update, { session } = {}) {
+    return PaymentModel.findOneAndUpdate(
+      { _id: paymentId, provider: 'mercado_pago' },
+      { $set: update },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
+  async assignProviderIdempotencyKeyIfMissing(paymentId, provider, providerIdempotencyKey) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        provider,
+        normalizedStatus: 'pending',
+        $or: [
+          { providerIdempotencyKey: null },
+          { providerIdempotencyKey: { $exists: false } }
+        ]
+      },
+      { $set: { providerIdempotencyKey } },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
+  async attachProviderOrder(
+    paymentId,
+    providerIdempotencyKey,
+    { providerOrderId, providerCheckoutUrl, providerStatus }
+  ) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        provider: 'mercado_pago',
+        normalizedStatus: 'pending',
+        providerIdempotencyKey,
+        $or: [
+          { providerOrderId: null },
+          { providerOrderId: { $exists: false } }
+        ]
+      },
+      {
+        $set: {
+          providerOrderId,
+          providerCheckoutUrl,
+          providerStatus
+        }
+      },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
+  async updateStatus(paymentId, expectedStatus, update, { session } = {}) {
+    return PaymentModel.findOneAndUpdate(
+      { _id: paymentId, normalizedStatus: expectedStatus },
+      { $set: update },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+}
+
+export { PaymentManager }
+export default new PaymentManager()

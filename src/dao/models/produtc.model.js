@@ -1,6 +1,9 @@
 import mongoose from 'mongoose'
 
 const productCollection = 'products'
+export const inventoryModes = ['manual', 'serializing', 'serialized']
+
+export const getEffectiveInventoryMode = (product) => product?.inventoryMode ?? 'manual'
 
 // -------------------------
 // Subschema: GridFS image
@@ -136,6 +139,11 @@ const productSchema = new mongoose.Schema(
       type: Number,
       default: 0,
       min: 0
+    },
+    inventoryMode: {
+      type: String,
+      enum: inventoryModes,
+      default: 'manual'
     },
     isActive: {
       type: Boolean,

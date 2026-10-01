@@ -11,6 +11,7 @@ export default {
   secret: process.env.DATASESSION,
   dbCluster: process.env.DB_CLUSTER,
   baseUrl: process.env.BASE_URL,
+  frontendUrl: process.env.FRONTEND_URL,
 
   // 🗝️ KEYS
   privateKey: process.env.PRIVATE_KEY || 'devAAASecretKey10',
@@ -50,5 +51,14 @@ export default {
     apiKey: process.env.RESEND_API_KEY,
     from: process.env.RESEND_FROM,
     url: process.env.RESEND_URL || 'https://api.resend.com/emails'
+  },
+
+  mercadoPago: {
+    accessToken: process.env.MERCADOPAGO_ACCESS_TOKEN,
+    webhookSecret: process.env.MERCADOPAGO_WEBHOOK_SECRET,
+    returnBaseUrl: process.env.MERCADOPAGO_RETURN_BASE_URL,
+    timeoutMs: process.env.MERCADOPAGO_TIMEOUT_MS
+      ? Number(process.env.MERCADOPAGO_TIMEOUT_MS)
+      : 10000
   }
 }

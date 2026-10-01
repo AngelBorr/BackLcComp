@@ -29,7 +29,11 @@ const handlePolicies =
       // 🟠 2. Leer cookie JWT
       const token = req.cookies?.[env.cookie.name]
 
-      if (isDev) secureLog('🔵 Cookie recibida:', token)
+      if (isDev) {
+        secureLog('🔵 Cookie de autenticación recibida:', {
+          cookiePresent: Boolean(token)
+        })
+      }
 
       if (!token) {
         warn('❌ Cookie no encontrada. Acceso denegado.')

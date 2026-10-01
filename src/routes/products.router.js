@@ -5,6 +5,8 @@ import {
   getProductById,
   createProduct,
   updateProduct,
+  startSerialization,
+  finishSerialization,
   deleteProduct
 } from '../controllers/controller.products.js'
 
@@ -23,6 +25,9 @@ export default class ProductsRouter extends MyOwnRouter {
 
     // ✅ Actualizar
     this.put('/:id', ['ADMIN'], uploader.array('images', 4), updateProduct)
+
+    this.post('/:id/start-serialization', ['ADMIN'], startSerialization)
+    this.post('/:id/finish-serialization', ['ADMIN'], finishSerialization)
 
     // ✅ Eliminar (query opcional: deleteImages=true&soft=true)
     this.delete('/:id', ['ADMIN'], deleteProduct)

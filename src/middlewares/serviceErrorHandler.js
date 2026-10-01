@@ -1,11 +1,14 @@
-import { ServiceError } from '../services/services.users.js'
+import { ServiceError as ProductsServiceError } from '../services/service.products.js'
+import { ServiceError as UsersServiceError } from '../services/services.users.js'
 import { mapServiceErrorToHttp } from './serviceErrorMapper.js'
 
 export const serviceErrorHandler = (err, req, res, next) => {
   if (res.headersSent) return next(err)
 
   // Solo manejamos ServiceError acá; lo demás va al errorHandler global
-  if (!(err instanceof ServiceError)) return next(err)
+  if (!(err instanceof UsersServiceError) && !(err instanceof ProductsServiceError)) {
+    return next(err)
+  }
 
   const { status, message } = mapServiceErrorToHttp(err)
 

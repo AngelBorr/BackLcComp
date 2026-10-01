@@ -2,6 +2,14 @@ import mongoose from 'mongoose'
 import UserAdminManager from '../dao/managers/userAdmin.mongo.js'
 import logger from '../utils/logger.js'
 import { createHash } from '../utils/utils.passport.js'
+import {
+  generateVerificationToken,
+  getVerificationTokenExpiration,
+  hashVerificationToken
+} from '../utils/emailVerificationToken.js'
+import TransactionalEmailService from './transactionalEmail.service.js'
+
+const EMAIL_VERIFICATION_COOLDOWN_MS = 60 * 1000
 
 class ServiceError extends Error {
   constructor(message, code = 'SERVICE_ERROR', meta = undefined) {
@@ -15,6 +23,7 @@ class ServiceError extends Error {
 class UsersService {
   constructor() {
     this.users = new UserAdminManager()
+    this.transactionalEmailService = new TransactionalEmailService()
     this.allowedRoles = new Set(['ADMIN', 'USER', 'PREMIUM'])
   }
 
@@ -112,6 +121,175 @@ class UsersService {
     }
   }
 
+  async registerPublicUser(bodyUser) {
+    try {
+      logger.debug('[UsersService] registerPublicUser')
+
+      if (!bodyUser || typeof bodyUser !== 'object') {
+        throw new ServiceError('Datos inválidos para crear usuario', 'INVALID_USER_PAYLOAD')
+      }
+
+      const { firstName, lastName, email, password } = bodyUser
+
+      const user = await this.addUser({
+        firstName,
+        lastName,
+        email,
+        password,
+        role: 'USER'
+      })
+
+      let verificationEmailSent = false
+
+      try {
+        const issuedAt = new Date()
+        const token = generateVerificationToken()
+        const tokenHash = hashVerificationToken(token)
+        const expiresAt = getVerificationTokenExpiration(issuedAt)
+
+        const pendingUser = await this.users.setEmailVerificationToken(user._id, {
+          tokenHash,
+          expiresAt,
+          lastSentAt: issuedAt
+        })
+
+        if (!pendingUser) {
+          throw new Error('No se pudo preparar la verificación de email')
+        }
+
+        await this.transactionalEmailService.sendEmailVerification({
+          email: pendingUser.email,
+          firstName: pendingUser.firstName,
+          token
+        })
+
+        verificationEmailSent = true
+      } catch (verificationError) {
+        logger.error(
+          `[UsersService] No se pudo enviar la verificación inicial: ${verificationError?.message || verificationError}`
+        )
+      }
+
+      return {
+        user,
+        verificationEmailSent
+      }
+    } catch (err) {
+      if (err instanceof ServiceError) throw err
+
+      logger.error(`[UsersService] registerPublicUser error: ${err?.message || err}`)
+      throw new ServiceError('Error interno al registrar usuario', 'PUBLIC_REGISTER_FAILED', {
+        cause: err?.message
+      })
+    }
+  }
+
+  async verifyEmail(token) {
+    try {
+      const normalizedToken = typeof token === 'string' ? token.trim() : ''
+
+      if (!normalizedToken || normalizedToken.length > 512) {
+        throw new ServiceError(
+          'El token de verificación es inválido.',
+          'EMAIL_VERIFICATION_TOKEN_INVALID'
+        )
+      }
+
+      const tokenHash = hashVerificationToken(normalizedToken)
+      const pendingUser = await this.users.getPendingUserByVerificationTokenHash(tokenHash)
+
+      if (!pendingUser) {
+        throw new ServiceError(
+          'El token de verificación es inválido o ya fue utilizado.',
+          'EMAIL_VERIFICATION_TOKEN_INVALID'
+        )
+      }
+
+      const now = new Date()
+      const expiresAt = pendingUser.emailVerificationExpiresAt
+
+      if (!expiresAt || new Date(expiresAt).getTime() <= now.getTime()) {
+        throw new ServiceError(
+          'El token de verificación venció. Solicitá un nuevo correo.',
+          'EMAIL_VERIFICATION_TOKEN_EXPIRED'
+        )
+      }
+
+      const verifiedUser = await this.users.markEmailVerified({
+        userId: pendingUser._id,
+        tokenHash,
+        verifiedAt: now
+      })
+
+      if (!verifiedUser) {
+        throw new ServiceError(
+          'El token de verificación es inválido o ya fue utilizado.',
+          'EMAIL_VERIFICATION_TOKEN_INVALID'
+        )
+      }
+
+      return {
+        emailVerified: true,
+        emailVerifiedAt: verifiedUser.emailVerifiedAt
+      }
+    } catch (err) {
+      if (err instanceof ServiceError) throw err
+
+      logger.error(`[UsersService] verifyEmail error: ${err?.message || err}`)
+      throw new ServiceError(
+        'No se pudo verificar el correo electrónico.',
+        'EMAIL_VERIFICATION_FAILED'
+      )
+    }
+  }
+
+  async resendEmailVerification(email) {
+    const normalizedEmail = String(email || '')
+      .trim()
+      .toLowerCase()
+
+    if (!normalizedEmail || !/^\S+@\S+\.\S+$/.test(normalizedEmail)) {
+      return { accepted: true }
+    }
+
+    try {
+      const attemptedAt = new Date()
+      const cooldownBefore = new Date(attemptedAt.getTime() - EMAIL_VERIFICATION_COOLDOWN_MS)
+      const token = generateVerificationToken()
+      const tokenHash = hashVerificationToken(token)
+      const expiresAt = getVerificationTokenExpiration(attemptedAt)
+
+      const pendingUser = await this.users.claimEmailVerificationResend({
+        email: normalizedEmail,
+        tokenHash,
+        expiresAt,
+        attemptedAt,
+        cooldownBefore
+      })
+
+      if (!pendingUser) {
+        return { accepted: true }
+      }
+
+      try {
+        await this.transactionalEmailService.sendEmailVerification({
+          email: pendingUser.email,
+          firstName: pendingUser.firstName,
+          token
+        })
+      } catch (sendError) {
+        logger.error(
+          `[UsersService] No se pudo reenviar la verificación: ${sendError?.message || sendError}`
+        )
+      }
+
+      return { accepted: true }
+    } catch (err) {
+      logger.error(`[UsersService] resendEmailVerification error: ${err?.message || err}`)
+      return { accepted: true }
+    }
+  }
+
   async deleteUserById(id) {
     try {
       logger.debug(`[UsersService] deleteUserById id=${id}`)
@@ -182,9 +360,15 @@ class UsersService {
   #sanitizeUser(user) {
     const obj = typeof user?.toObject === 'function' ? user.toObject() : user
     if (!obj || typeof obj !== 'object') return obj
-    // eslint-disable-next-line no-unused-vars
-    const { password, __v, ...rest } = obj
-    return rest
+    const sanitized = { ...obj }
+
+    delete sanitized.password
+    delete sanitized.__v
+    delete sanitized.emailVerificationTokenHash
+    delete sanitized.emailVerificationExpiresAt
+    delete sanitized.emailVerificationLastSentAt
+
+    return sanitized
   }
 }
 

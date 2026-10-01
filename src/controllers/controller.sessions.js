@@ -21,7 +21,11 @@ export const loginUser = async (req, res, next) => {
     }
 
     // Log seguro (solo en dev)
-    secureLog('🔐 Usuario autenticado → payload:', req.user)
+    secureLog('🔐 Usuario autenticado → payload:', {
+      id: req.user._id ?? req.user.id,
+      email: req.user.email,
+      role: req.user.role
+    })
 
     const result = await sessionsService.generateAuthResponse(req.user, res)
 
@@ -61,7 +65,11 @@ export const currentUser = async (req, res, next) => {
       })
     }
 
-    secureLog('🔍 currentUser req.user:', req.user)
+    secureLog('🔍 currentUser req.user:', {
+      id: req.user.id ?? req.user._id,
+      email: req.user.email,
+      role: req.user.role
+    })
 
     const result = await sessionsService.getCurrentUser(req.user)
     return res.status(result.status).json(result)

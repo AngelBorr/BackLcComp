@@ -20,7 +20,11 @@ class SessionsService {
         role: user.role
       }
 
-      secureLog('🔐 Generando token para usuario:', payload)
+      secureLog('🔐 Generando token para usuario:', {
+        id: payload.id,
+        email: payload.email,
+        role: payload.role
+      })
 
       const token = jwt.sign({ user: payload }, env.jwt.privateKey, {
         expiresIn: env.jwt.expiresIn
@@ -78,7 +82,11 @@ class SessionsService {
         role: dbUser.role
       }
 
-      secureLog('🔍 Usuario encontrado en DB:', safeUser)
+      secureLog('🔍 Usuario encontrado en DB:', {
+        id: safeUser.id,
+        email: safeUser.email,
+        role: safeUser.role
+      })
 
       return {
         status: 200,

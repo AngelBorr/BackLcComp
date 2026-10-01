@@ -96,6 +96,42 @@ export const updateProduct = async (req, res, next) => {
   }
 }
 
+export const startSerialization = async (req, res, next) => {
+  try {
+    req.logger?.debug?.('[products.controller] startSerialization')
+    const { id } = req.params
+
+    const result = await productsService.startSerialization(id)
+
+    return res.status(200).json({
+      status: 'success',
+      message: 'Serialización iniciada correctamente.',
+      data: result
+    })
+  } catch (err) {
+    logError('❌ controller.products.startSerialization error:', err)
+    next(err)
+  }
+}
+
+export const finishSerialization = async (req, res, next) => {
+  try {
+    req.logger?.debug?.('[products.controller] finishSerialization')
+    const { id } = req.params
+
+    const result = await productsService.finishSerialization(id)
+
+    return res.status(200).json({
+      status: 'success',
+      message: 'Serialización finalizada correctamente.',
+      data: result
+    })
+  } catch (err) {
+    logError('❌ controller.products.finishSerialization error:', err)
+    next(err)
+  }
+}
+
 export const deleteProduct = async (req, res, next) => {
   try {
     req.logger?.debug?.('[products.controller] deleteProduct')

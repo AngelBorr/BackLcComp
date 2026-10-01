@@ -31,6 +31,30 @@ const userAdminSchema = new mongoose.Schema(
       type: String,
       enum: ['ADMIN', 'USER', 'PREMIUM'],
       default: 'USER'
+    },
+    emailVerified: {
+      type: Boolean,
+      default: false
+    },
+    emailVerifiedAt: {
+      type: Date,
+      default: null
+    },
+    emailVerificationTokenHash: {
+      type: String,
+      default: null,
+      select: false,
+      index: true
+    },
+    emailVerificationExpiresAt: {
+      type: Date,
+      default: null,
+      select: false
+    },
+    emailVerificationLastSentAt: {
+      type: Date,
+      default: null,
+      select: false
     }
   },
   {

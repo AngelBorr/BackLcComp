@@ -19,6 +19,10 @@ const sanitizeLogText = (value, secrets = []) => {
   }
 
   sanitized = sanitized
+    .replace(
+      /["']?(?:authorization|access[_ -]?token|cookie|set-cookie|x-idempotency-key)["']?\s*:\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/gi,
+      '[REDACTED]'
+    )
     .replace(/\bBearer\s+[^\s,;"']+/gi, '[REDACTED]')
     .replace(
       /\b(?:authorization|access[_ -]?token|cookie|set-cookie|x-idempotency-key)\b\s*[:=]\s*[^\s,;]+/gi,
@@ -61,14 +65,34 @@ const sanitizeLogDetail = (value, secrets) => {
   return Array.isArray(value) ? sanitizedEntries : sanitizedEntries[0]
 }
 
-const sanitizeMercadoPagoHttpError = ({ status, payload, path, method, secrets = [] }) => {
+const sanitizeMercadoPagoHttpError = ({
+  status,
+  payload,
+  rawBody,
+  path,
+  method,
+  secrets = []
+}) => {
   const providerCode = payload?.code || payload?.error || payload?.cause?.[0]?.code
+  const sanitizedProviderCode = sanitizeLogText(providerCode, secrets)
+  const sanitizedMessage = sanitizeLogText(payload?.message, secrets)
+  const sanitizedCause = sanitizeLogDetail(payload?.cause, secrets)
+  const sanitizedDetails = sanitizeLogDetail(payload?.details ?? payload?.detail, secrets)
+  const hasKnownProviderError = [
+    sanitizedProviderCode,
+    sanitizedMessage,
+    sanitizedCause,
+    sanitizedDetails
+  ].some((value) => value !== null)
   const sanitized = {
     httpStatus: Number(status),
-    providerCode: sanitizeLogText(providerCode, secrets),
-    message: sanitizeLogText(payload?.message, secrets),
-    cause: sanitizeLogDetail(payload?.cause, secrets),
-    details: sanitizeLogDetail(payload?.details ?? payload?.detail, secrets),
+    providerCode: sanitizedProviderCode,
+    message: sanitizedMessage,
+    cause: sanitizedCause,
+    details: sanitizedDetails,
+    rawBody: hasKnownProviderError
+      ? null
+      : sanitizeLogText(rawBody, secrets),
     path: sanitizeLogText(path, secrets),
     method: sanitizeLogText(method, secrets)?.toUpperCase() || 'GET'
   }
@@ -309,10 +333,11 @@ class MercadoPagoProvider {
         signal: controller.signal,
         ...(body && { body: JSON.stringify(body) })
       })
-      let payload
+      const responseText = await response.text()
+      let payload = null
 
       try {
-        payload = await response.json()
+        payload = JSON.parse(responseText)
       } catch {
         if (response.ok) {
           throw new MercadoPagoProviderError(
@@ -322,13 +347,13 @@ class MercadoPagoProvider {
           )
         }
 
-        payload = null
       }
 
       if (!response.ok) {
         const sanitizedError = sanitizeMercadoPagoHttpError({
           status: response.status,
           payload,
+          rawBody: responseText,
           path,
           method,
           secrets: [this.accessToken, idempotencyKey]

@@ -32,13 +32,15 @@ const providerPayload = (overrides = {}) => ({
   ...overrides
 })
 
-const jsonResponse = (payload, { status = 201, ok = status >= 200 && status < 300 } = {}) => ({
+const textResponse = (body, { status = 201, ok = status >= 200 && status < 300 } = {}) => ({
   ok,
   status,
-  async json() {
-    return payload
+  async text() {
+    return body
   }
 })
+
+const jsonResponse = (payload, options) => textResponse(JSON.stringify(payload), options)
 
 const makeProvider = (fetchImplementation, options = {}) =>
   new MercadoPagoProvider({
@@ -339,6 +341,132 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
       'X-Idempotency-Key'
     ]) {
       assert.equal(serializedLog.includes(sensitiveValue), false)
+    }
+  })
+
+  it('reads a known JSON error body once and does not add rawBody', async () => {
+    let textReads = 0
+    const logged = []
+    const provider = makeProvider(
+      async () => ({
+        ok: false,
+        status: 400,
+        async text() {
+          textReads += 1
+          return JSON.stringify({
+            code: 'invalid_order',
+            message: 'Known provider validation error'
+          })
+        },
+        async json() {
+          assert.fail('response.json() must not be called')
+        }
+      }),
+      { errorLogger: (...args) => logged.push(args) }
+    )
+
+    await assert.rejects(
+      provider.createCheckoutOrder({ providerIdempotencyKey, request: {} }),
+      (error) => error.code === 'MERCADOPAGO_ORDER_REJECTED'
+    )
+
+    assert.equal(textReads, 1)
+    assert.equal(logged[0][1].providerCode, 'invalid_order')
+    assert.equal(logged[0][1].message, 'Known provider validation error')
+    assert.equal(Object.hasOwn(logged[0][1], 'rawBody'), false)
+  })
+
+  it('logs a sanitized and truncated rawBody for JSON with an unknown structure', async () => {
+    const logged = []
+    const accessToken = 'unknown-json-access-token'
+    const bearerToken = 'unknown-json-bearer-token'
+    const payerEmail = 'unknown-json@example.com'
+    const cookie = 'unknown-json-session-cookie'
+    const provider = makeProvider(
+      async () => textResponse(JSON.stringify({
+        diagnostic: 'unknown-provider-shape',
+        authorization: `Bearer ${bearerToken}`,
+        cookie,
+        'x-idempotency-key': providerIdempotencyKey,
+        contact: payerEmail,
+        filler: 'x'.repeat(800)
+      }), { status: 400 }),
+      {
+        accessToken,
+        errorLogger: (...args) => logged.push(args)
+      }
+    )
+
+    await assert.rejects(
+      provider.createCheckoutOrder({ providerIdempotencyKey, request: {} }),
+      (error) => (
+        error.code === 'MERCADOPAGO_ORDER_REJECTED' &&
+        !error.message.includes('unknown-provider-shape') &&
+        !error.message.includes(payerEmail)
+      )
+    )
+
+    const rawBody = logged[0][1].rawBody
+    assert.equal(typeof rawBody, 'string')
+    assert.equal(rawBody.length, 500)
+    assert.equal(rawBody.includes('unknown-provider-shape'), true)
+    assert.equal(rawBody.includes('[REDACTED]'), true)
+    assert.equal(rawBody.includes('[REDACTED_EMAIL]'), true)
+    for (const sensitiveValue of [
+      accessToken,
+      bearerToken,
+      payerEmail,
+      cookie,
+      providerIdempotencyKey,
+      'authorization',
+      'x-idempotency-key'
+    ]) {
+      assert.equal(rawBody.toLowerCase().includes(sensitiveValue.toLowerCase()), false)
+    }
+  })
+
+  it('logs a sanitized and truncated rawBody for a non-JSON error response', async () => {
+    const logged = []
+    const accessToken = 'plain-access-token'
+    const bearerToken = 'plain-bearer-token'
+    const payerEmail = 'plain-error@example.com'
+    const cookie = 'plain-session-cookie'
+    const responseBody =
+      `Gateway rejected the request; Authorization: Bearer ${bearerToken}; ` +
+      `Cookie=${cookie}; X-Idempotency-Key=${providerIdempotencyKey}; ` +
+      `payer=${payerEmail}; ${'z'.repeat(800)}`
+    const provider = makeProvider(
+      async () => textResponse(responseBody, { status: 400 }),
+      {
+        accessToken,
+        errorLogger: (...args) => logged.push(args)
+      }
+    )
+
+    await assert.rejects(
+      provider.createCheckoutOrder({ providerIdempotencyKey, request: {} }),
+      (error) => (
+        error.code === 'MERCADOPAGO_ORDER_REJECTED' &&
+        !error.message.includes('Gateway rejected') &&
+        !error.message.includes(payerEmail)
+      )
+    )
+
+    const rawBody = logged[0][1].rawBody
+    assert.equal(typeof rawBody, 'string')
+    assert.equal(rawBody.length, 500)
+    assert.equal(rawBody.startsWith('Gateway rejected the request'), true)
+    for (const sensitiveValue of [
+      accessToken,
+      bearerToken,
+      payerEmail,
+      cookie,
+      providerIdempotencyKey,
+      'Authorization',
+      'Cookie',
+      'X-Idempotency-Key'
+    ]) {
+      assert.equal(rawBody.toLowerCase().includes(sensitiveValue.toLowerCase()), false)
     }
   })
 

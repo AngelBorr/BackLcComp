@@ -1,8 +1,82 @@
 import config from '../config.js'
+import { error as logError } from '../utils/logger.js'
 
 const MERCADOPAGO_API_URL = 'https://api.mercadopago.com'
 const MERCADOPAGO_CHECKOUT_HOST = 'www.mercadopago.com.ar'
 const DEFAULT_TIMEOUT_MS = 10000
+const MAX_LOG_TEXT_LENGTH = 500
+const MAX_LOG_DETAIL_ITEMS = 10
+
+const sanitizeLogText = (value, secrets = []) => {
+  if (value === undefined || value === null || value === '') return null
+  if (!['string', 'number', 'boolean'].includes(typeof value)) return null
+
+  let sanitized = String(value)
+
+  for (const secret of secrets) {
+    const normalizedSecret = String(secret || '')
+    if (normalizedSecret) sanitized = sanitized.split(normalizedSecret).join('[REDACTED]')
+  }
+
+  sanitized = sanitized
+    .replace(/\bBearer\s+[^\s,;"']+/gi, '[REDACTED]')
+    .replace(
+      /\b(?:authorization|access[_ -]?token|cookie|set-cookie|x-idempotency-key)\b\s*[:=]\s*[^\s,;]+/gi,
+      '[REDACTED]'
+    )
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[REDACTED_EMAIL]')
+
+  return sanitized.slice(0, MAX_LOG_TEXT_LENGTH)
+}
+
+const sanitizeLogDetail = (value, secrets) => {
+  if (value === undefined || value === null) return null
+
+  const entries = Array.isArray(value)
+    ? value.slice(0, MAX_LOG_DETAIL_ITEMS)
+    : [value]
+
+  const sanitizedEntries = entries
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return sanitizeLogText(entry, secrets)
+      }
+
+      const sanitizedEntry = {
+        code: sanitizeLogText(entry.code, secrets),
+        message: sanitizeLogText(entry.message, secrets),
+        description: sanitizeLogText(entry.description, secrets),
+        type: sanitizeLogText(entry.type, secrets)
+      }
+
+      return Object.fromEntries(
+        Object.entries(sanitizedEntry).filter(([, fieldValue]) => fieldValue !== null)
+      )
+    })
+    .filter((entry) => entry !== null && (
+      typeof entry !== 'object' || Object.keys(entry).length > 0
+    ))
+
+  if (!sanitizedEntries.length) return null
+  return Array.isArray(value) ? sanitizedEntries : sanitizedEntries[0]
+}
+
+const sanitizeMercadoPagoHttpError = ({ status, payload, path, method, secrets = [] }) => {
+  const providerCode = payload?.code || payload?.error || payload?.cause?.[0]?.code
+  const sanitized = {
+    httpStatus: Number(status),
+    providerCode: sanitizeLogText(providerCode, secrets),
+    message: sanitizeLogText(payload?.message, secrets),
+    cause: sanitizeLogDetail(payload?.cause, secrets),
+    details: sanitizeLogDetail(payload?.details ?? payload?.detail, secrets),
+    path: sanitizeLogText(path, secrets),
+    method: sanitizeLogText(method, secrets)?.toUpperCase() || 'GET'
+  }
+
+  return Object.fromEntries(
+    Object.entries(sanitized).filter(([, value]) => value !== null)
+  )
+}
 
 class MercadoPagoProviderError extends Error {
   constructor(message, code, status = 502) {
@@ -106,10 +180,12 @@ class MercadoPagoProvider {
   constructor({
     fetchImplementation = globalThis.fetch,
     accessToken = config.mercadoPago?.accessToken,
-    timeoutMs = config.mercadoPago?.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    timeoutMs = config.mercadoPago?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    errorLogger = logError
   } = {}) {
     this.fetch = fetchImplementation
     this.accessToken = accessToken
+    this.errorLogger = errorLogger
     this.timeoutMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
       ? Number(timeoutMs)
       : DEFAULT_TIMEOUT_MS
@@ -235,7 +311,25 @@ class MercadoPagoProvider {
         payload = null
       }
 
-      if (!response.ok) throw this.#mapHttpError(response.status, payload)
+      if (!response.ok) {
+        const sanitizedError = sanitizeMercadoPagoHttpError({
+          status: response.status,
+          payload,
+          path,
+          method,
+          secrets: [this.accessToken, idempotencyKey]
+        })
+
+        if (typeof this.errorLogger === 'function') {
+          try {
+            this.errorLogger('Mercado Pago HTTP request rejected', sanitizedError)
+          } catch {
+            // La observabilidad nunca debe alterar el mapeo del error del provider.
+          }
+        }
+
+        throw this.#mapHttpError(response.status, payload)
+      }
       return payload
     } catch (error) {
       if (error instanceof MercadoPagoProviderError) throw error

@@ -219,6 +219,101 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     )
   })
 
+  it('logs a sanitized HTTP 400 detail while preserving MERCADOPAGO_ORDER_REJECTED', async () => {
+    const logged = []
+    const accessToken = 'sensitive-access-token'
+    const payerEmail = 'buyer-sensitive@example.com'
+    const provider = makeProvider(
+      async () => jsonResponse({
+        code: 'invalid_order',
+        message:
+          `Invalid payer ${payerEmail}; Authorization: Bearer ${accessToken}; ` +
+          `Cookie=session-secret; X-Idempotency-Key=${providerIdempotencyKey}`,
+        cause: [{
+          code: 'invalid_item',
+          description: `Invalid item for ${payerEmail}`,
+          data: { payerEmail, token: accessToken }
+        }],
+        details: [{
+          code: 'invalid_total',
+          message: `Rejected key ${providerIdempotencyKey}`,
+          authorization: accessToken
+        }],
+        headers: { Authorization: `Bearer ${accessToken}` },
+        payer: { email: payerEmail },
+        cookie: 'session-secret'
+      }, { status: 400 }),
+      {
+        accessToken,
+        errorLogger: (...args) => logged.push(args)
+      }
+    )
+
+    await assert.rejects(
+      provider.createCheckoutOrder({ providerIdempotencyKey, request: { type: 'online' } }),
+      (error) => (
+        error instanceof MercadoPagoProviderError &&
+        error.code === 'MERCADOPAGO_ORDER_REJECTED' &&
+        error.status === 502 &&
+        !error.message.includes('invalid_order') &&
+        !error.message.includes(payerEmail)
+      )
+    )
+
+    assert.equal(logged.length, 1)
+    assert.equal(logged[0][0], 'Mercado Pago HTTP request rejected')
+    assert.deepEqual(logged[0][1], {
+      httpStatus: 400,
+      providerCode: 'invalid_order',
+      message:
+        'Invalid payer [REDACTED_EMAIL]; [REDACTED]; [REDACTED]; [REDACTED]',
+      cause: [{
+        code: 'invalid_item',
+        description: 'Invalid item for [REDACTED_EMAIL]'
+      }],
+      details: [{
+        code: 'invalid_total',
+        message: 'Rejected key [REDACTED]'
+      }],
+      path: '/v1/orders',
+      method: 'POST'
+    })
+
+    const serializedLog = JSON.stringify(logged)
+    for (const sensitiveValue of [
+      accessToken,
+      providerIdempotencyKey,
+      payerEmail,
+      'session-secret',
+      'Authorization',
+      'X-Idempotency-Key'
+    ]) {
+      assert.equal(serializedLog.includes(sensitiveValue), false)
+    }
+  })
+
+  it('preserves existing HTTP mappings for 401, 403, 409, 423 and 5xx', async () => {
+    const cases = [
+      [401, {}, 'MERCADOPAGO_AUTH_ERROR', 502],
+      [403, {}, 'MERCADOPAGO_AUTH_ERROR', 502],
+      [409, { code: 'idempotency_key_already_used' }, 'MERCADOPAGO_IDEMPOTENCY_CONFLICT', 409],
+      [423, { code: 'resource_locked' }, 'MERCADOPAGO_ORDER_CONFLICT', 409],
+      [503, {}, 'MERCADOPAGO_UNAVAILABLE', 503]
+    ]
+
+    for (const [httpStatus, payload, expectedCode, expectedStatus] of cases) {
+      const provider = makeProvider(
+        async () => jsonResponse(payload, { status: httpStatus }),
+        { errorLogger: () => {} }
+      )
+
+      await assert.rejects(
+        provider.createCheckoutOrder({ providerIdempotencyKey, request: {} }),
+        (error) => error.code === expectedCode && error.status === expectedStatus
+      )
+    }
+  })
+
   it('maps HTTP 429 as rate limiting', async () => {
     const provider = makeProvider(async () => jsonResponse({}, { status: 429 }))
     await assert.rejects(
@@ -561,6 +656,36 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.equal(state.order.status, 'pending_payment')
     assert.equal(state.payment.providerOrderId, null)
     assert.equal(state.payment.providerIdempotencyKey, providerIdempotencyKey)
+  })
+
+  it('keeps HTTP 400 provider details out of the public ServiceError', async () => {
+    const providerMessage = 'internal provider validation detail'
+    const httpProvider = makeProvider(
+      async () => jsonResponse({
+        code: 'invalid_order',
+        message: providerMessage,
+        payer: { email: 'private@example.com' }
+      }, { status: 400 }),
+      { errorLogger: () => {} }
+    )
+    const { service, state, provider } = makeServiceHarness({
+      payment: { providerIdempotencyKey: null }
+    })
+    provider.createCheckoutOrder = (input) => httpProvider.createCheckoutOrder(input)
+
+    await assert.rejects(
+      service.ensureCheckoutOrderForPayment(paymentId, { now }),
+      (error) => (
+        error.code === 'MERCADOPAGO_ORDER_REJECTED' &&
+        error.status === 502 &&
+        !error.message.includes(providerMessage) &&
+        !error.message.includes('private@example.com')
+      )
+    )
+
+    assert.equal(state.payment.normalizedStatus, 'pending')
+    assert.equal(state.order.status, 'pending_payment')
+    assert.equal(state.payment.providerOrderId, null)
   })
 
   it('reuses the same providerIdempotencyKey after a failed external attempt', async () => {

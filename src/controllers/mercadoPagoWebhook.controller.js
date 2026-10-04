@@ -1,5 +1,5 @@
 import MercadoPagoWebhookService from '../services/mercadoPagoWebhook.service.js'
-import { error as logError } from '../utils/logger.js'
+import { error as logError, secureLog } from '../utils/logger.js'
 
 class MercadoPagoWebhookController {
   constructor({ webhookService = MercadoPagoWebhookService } = {}) {
@@ -9,6 +9,26 @@ class MercadoPagoWebhookController {
 
   async handle(req, res) {
     try {
+      const hasObjectBody = req.body !== null && typeof req.body === 'object'
+
+      secureLog('Mercado Pago webhook estructura recibida', {
+        bodyType: typeof req.body,
+        bodyKeys: hasObjectBody ? Object.keys(req.body) : [],
+        bodyIdType: typeof req.body?.id,
+        hasBodyId: hasObjectBody && Object.hasOwn(req.body, 'id'),
+        hasBodyDataId:
+          req.body?.data !== null &&
+          typeof req.body?.data === 'object' &&
+          Object.hasOwn(req.body.data, 'id'),
+        queryKeys:
+          req.query !== null && typeof req.query === 'object'
+            ? Object.keys(req.query)
+            : [],
+        hasSignature: Boolean(req.get('x-signature')),
+        hasRequestId: Boolean(req.get('x-request-id')),
+        contentType: req.get('content-type') || null
+      })
+
       await this.webhookService.handleWebhook({
         query: req.query,
         headers: {

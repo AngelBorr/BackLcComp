@@ -1,7 +1,9 @@
 /* eslint-env mocha */
 import assert from 'node:assert/strict'
-import { createHmac } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
+import express from 'express'
 import mongoose from 'mongoose'
+import request from 'supertest'
 import PaymentModel from '../../src/dao/models/payment.model.js'
 import PaymentEventModel from '../../src/dao/models/paymentEvent.model.js'
 import PaymentManager from '../../src/dao/managers/payment.manager.js'
@@ -15,7 +17,8 @@ import {
 import {
   MercadoPagoWebhookService
 } from '../../src/services/mercadoPagoWebhook.service.js'
-import {
+import WebhooksRouter from '../../src/routes/webhooks.router.js'
+import MercadoPagoWebhookControllerInstance, {
   MercadoPagoWebhookController
 } from '../../src/controllers/mercadoPagoWebhook.controller.js'
 import {
@@ -40,11 +43,24 @@ const productId = new mongoose.Types.ObjectId().toString()
 const unitId = new mongoose.Types.ObjectId().toString()
 const now = new Date('2026-09-29T12:00:00.000Z')
 
-const signatureFor = (dataId = providerOrderId, valueSecret = secret) => {
-  const manifest = buildSignatureManifest({ dataId, xRequestId: requestId, timestamp })
+const signatureFor = (
+  dataId = providerOrderId,
+  valueSecret = secret,
+  valueRequestId = requestId
+) => {
+  const manifest = buildSignatureManifest({
+    dataId,
+    xRequestId: valueRequestId,
+    timestamp
+  })
   const hash = createHmac('sha256', valueSecret).update(manifest).digest('hex')
   return `ts=${timestamp},v1=${hash}`
 }
+
+const deliveryEventIdFor = (dataId, valueRequestId) =>
+  `delivery:${createHash('sha256')
+    .update(`mercado_pago:order:${dataId}:${valueRequestId}`)
+    .digest('hex')}`
 
 const webhookInput = (overrides = {}) => ({
   query: { type: 'order', 'data.id': providerOrderId, ...overrides.query },
@@ -60,6 +76,21 @@ const webhookInput = (overrides = {}) => ({
     data: { id: providerOrderId },
     ...overrides.body
   }
+})
+
+const sandboxWebhookBody = ({
+  eventId,
+  dataId = providerOrderId
+} = {}) => ({
+  action: 'order.processed',
+  api_version: 'v1',
+  application_id: 'sandbox-application',
+  data: { id: dataId },
+  date_created: '2026-10-04T20:00:00.000Z',
+  live_mode: false,
+  type: 'order',
+  user_id: 123456,
+  ...(eventId !== undefined && { id: eventId })
 })
 
 const providerOrder = (overrides = {}) => ({
@@ -342,6 +373,158 @@ const createWebhookHarness = (overrides = {}) => {
     get createdEvents() { return createdEvents }
   }
 }
+
+const createWebhookHttpHarness = (overrides = {}) => {
+  const harness = createWebhookHarness(overrides)
+  const previousService = MercadoPagoWebhookControllerInstance.webhookService
+  MercadoPagoWebhookControllerInstance.webhookService = harness.service
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api/webhooks', new WebhooksRouter().getRouter())
+
+  return {
+    app,
+    harness,
+    restore() {
+      MercadoPagoWebhookControllerInstance.webhookService = previousService
+    }
+  }
+}
+
+const postWebhook = ({
+  app,
+  body,
+  dataId = providerOrderId,
+  valueRequestId = requestId,
+  xSignature = signatureFor(dataId, secret, valueRequestId)
+}) => request(app)
+  .post('/api/webhooks/mercadopago')
+  .query({ type: 'order', 'data.id': dataId })
+  .set('x-signature', xSignature)
+  .set('x-request-id', valueRequestId)
+  .set('content-type', 'application/json')
+  .send(body)
+
+describe('Mercado Pago webhook HTTP delivery identity (isolated)', () => {
+  const restorations = []
+
+  afterEach(() => {
+    while (restorations.length) restorations.pop()()
+  })
+
+  const setup = (overrides) => {
+    const context = createWebhookHttpHarness(overrides)
+    restorations.push(context.restore)
+    return context
+  }
+
+  it('uses the real provider event id when body.id is present', async () => {
+    const { app, harness } = setup()
+
+    const response = await postWebhook({
+      app,
+      body: sandboxWebhookBody({ eventId: providerEventId })
+    })
+
+    assert.equal(response.status, 200)
+    assert.equal(harness.events.has(providerEventId), true)
+    assert.equal(harness.createdEvents, 1)
+    assert.equal(harness.reconciliationCalls, 1)
+  })
+
+  it('accepts a finite numeric body.id and persists it as text', async () => {
+    const { app, harness } = setup()
+
+    const response = await postWebhook({
+      app,
+      body: sandboxWebhookBody({ eventId: 123456 })
+    })
+
+    assert.equal(response.status, 200)
+    assert.equal(harness.events.has('123456'), true)
+  })
+
+  it('generates a stable delivery id after valid signature when body.id is absent', async () => {
+    const { app, harness } = setup()
+    const expectedEventId = deliveryEventIdFor(providerOrderId, requestId)
+
+    const first = await postWebhook({ app, body: sandboxWebhookBody() })
+    const second = await postWebhook({ app, body: sandboxWebhookBody() })
+
+    assert.equal(first.status, 200)
+    assert.equal(second.status, 200)
+    assert.match(expectedEventId, /^delivery:[a-f0-9]{64}$/)
+    assert.equal(harness.events.has(expectedEventId), true)
+    assert.equal(harness.createdEvents, 1)
+    assert.equal(harness.reconciliationCalls, 1)
+  })
+
+  it('uses a different fallback for a different signed x-request-id', async () => {
+    const { app, harness } = setup()
+    const otherRequestId = 'd03c5bb9-5837-4edf-9034-1b5a32f9ffb8'
+
+    const first = await postWebhook({ app, body: sandboxWebhookBody() })
+    const second = await postWebhook({
+      app,
+      body: sandboxWebhookBody(),
+      valueRequestId: otherRequestId
+    })
+
+    const firstEventId = deliveryEventIdFor(providerOrderId, requestId)
+    const secondEventId = deliveryEventIdFor(providerOrderId, otherRequestId)
+
+    assert.equal(first.status, 200)
+    assert.equal(second.status, 200)
+    assert.notEqual(firstEventId, secondEventId)
+    assert.equal(harness.events.has(firstEventId), true)
+    assert.equal(harness.events.has(secondEventId), true)
+    assert.equal(harness.reconciliationCalls, 2)
+  })
+
+  it('does not generate or process an event without body.id when signature is invalid', async () => {
+    const { app, harness } = setup()
+
+    const response = await postWebhook({
+      app,
+      body: sandboxWebhookBody(),
+      xSignature: `ts=${timestamp},v1=${'0'.repeat(64)}`
+    })
+
+    assert.equal(response.status, 401)
+    assert.equal(harness.events.size, 0)
+    assert.equal(harness.createdEvents, 0)
+    assert.equal(harness.reconciliationCalls, 0)
+  })
+
+  it('rejects a query/body provider order mismatch without effects', async () => {
+    const { app, harness } = setup()
+
+    const response = await postWebhook({
+      app,
+      body: sandboxWebhookBody({ dataId: 'OTHER-ORDER' })
+    })
+
+    assert.equal(response.status, 400)
+    assert.equal(harness.events.size, 0)
+    assert.equal(harness.reconciliationCalls, 0)
+  })
+
+  for (const invalidEventId of ['', null, [], {}, true]) {
+    it(`rejects an invalid explicit body.id (${JSON.stringify(invalidEventId)})`, async () => {
+      const { app, harness } = setup()
+
+      const response = await postWebhook({
+        app,
+        body: sandboxWebhookBody({ eventId: invalidEventId })
+      })
+
+      assert.equal(response.status, 400)
+      assert.equal(harness.events.size, 0)
+      assert.equal(harness.reconciliationCalls, 0)
+    })
+  }
+})
 
 describe('Mercado Pago webhook signature (isolated)', () => {
   it('accepts a valid HMAC-SHA256 signature', () => {

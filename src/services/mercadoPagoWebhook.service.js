@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import config from '../config.js'
 import PaymentEventManager from '../dao/managers/paymentEvent.manager.js'
 import MercadoPagoReconciliationService from './mercadoPagoReconciliation.service.js'
@@ -18,6 +19,34 @@ const requiredText = (value, code, message) => {
   const normalized = String(value ?? '').trim()
   if (!normalized) throw new ServiceError(message, code, 400)
   return normalized
+}
+
+const normalizeProviderEventId = (body) => {
+  if (body === null || typeof body !== 'object' || !Object.hasOwn(body, 'id')) {
+    return null
+  }
+
+  const value = body.id
+  const isValidString = typeof value === 'string' && value.trim().length > 0
+  const isValidNumber = typeof value === 'number' && Number.isFinite(value)
+
+  if (!isValidString && !isValidNumber) {
+    throw new ServiceError(
+      'ID de evento de Mercado Pago inválido',
+      'MERCADOPAGO_WEBHOOK_EVENT_ID_INVALID',
+      400
+    )
+  }
+
+  return String(value).trim()
+}
+
+const buildDeliveryEventId = ({ providerOrderId, xRequestId }) => {
+  const digest = createHash('sha256')
+    .update(`mercado_pago:order:${providerOrderId}:${xRequestId}`)
+    .digest('hex')
+
+  return `delivery:${digest}`
 }
 
 class MercadoPagoWebhookService {
@@ -53,11 +82,7 @@ class MercadoPagoWebhookService {
       'MERCADOPAGO_WEBHOOK_ORDER_ID_REQUIRED',
       'ID de order de Mercado Pago requerido'
     )
-    const providerEventId = requiredText(
-      body?.id,
-      'MERCADOPAGO_WEBHOOK_EVENT_ID_REQUIRED',
-      'ID de evento de Mercado Pago requerido'
-    )
+    const providerEventId = normalizeProviderEventId(body)
 
     if (body?.type !== undefined && String(body.type).trim().toLowerCase() !== 'order') {
       throw new ServiceError(
@@ -115,9 +140,18 @@ class MercadoPagoWebhookService {
       )
     }
 
+    const providerEventId = normalized.providerEventId || buildDeliveryEventId({
+      providerOrderId: normalized.providerOrderId,
+      xRequestId: requiredText(
+        normalized.xRequestId,
+        'MERCADOPAGO_WEBHOOK_REQUEST_ID_REQUIRED',
+        'Identificador de solicitud de Mercado Pago requerido'
+      )
+    })
+
     const claim = await this.paymentEvents.claimForProcessing({
       provider: 'mercado_pago',
-      providerEventId: normalized.providerEventId,
+      providerEventId,
       providerOrderId: normalized.providerOrderId,
       receivedAt,
       processingStartedAt: receivedAt,
@@ -161,7 +195,7 @@ class MercadoPagoWebhookService {
       }
 
       secureLog('Mercado Pago webhook procesado', {
-        providerEventId: normalized.providerEventId,
+        providerEventId,
         providerOrderId: normalized.providerOrderId,
         processingStatus,
         outcome: result.outcome,
@@ -177,7 +211,7 @@ class MercadoPagoWebhookService {
         })
       } catch (markError) {
         logError('Mercado Pago webhook no pudo registrar fallo', {
-          providerEventId: normalized.providerEventId,
+          providerEventId,
           code: markError?.code || 'PAYMENT_EVENT_FAILURE_UPDATE_FAILED'
         })
       }

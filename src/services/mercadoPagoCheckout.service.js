@@ -295,9 +295,7 @@ class MercadoPagoCheckoutService {
           title: `Pedido LC COMP ${orderNumber}`,
           external_code: orderNumber,
           quantity: 1,
-          unit_price: totalArs,
-          total_amount: totalArs,
-          unit_measure: 'unit'
+          unit_price: totalArs
         }
       ],
       config: {

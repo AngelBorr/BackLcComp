@@ -690,14 +690,16 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
   it('uses one exact ARS summary item instead of converting OrderItems separately', async () => {
     const { service, state } = makeServiceHarness()
     await service.ensureCheckoutOrderForPayment(paymentId, { now })
-    assert.deepEqual(state.providerCalls[0].request.items, [{
+    const [item] = state.providerCalls[0].request.items
+
+    assert.deepEqual(item, {
       title: 'Pedido LC COMP LC-2026-000001',
       external_code: 'LC-2026-000001',
       quantity: 1,
-      unit_price: '154500.00',
-      total_amount: '154500.00',
-      unit_measure: 'unit'
-    }])
+      unit_price: '154500.00'
+    })
+    assert.equal(Object.hasOwn(item, 'total_amount'), false)
+    assert.equal(Object.hasOwn(item, 'unit_measure'), false)
   })
 
   it('builds return URLs and approved auto_return from backend configuration', async () => {

@@ -53,31 +53,6 @@ const normalizeReturnBaseUrl = (value) => {
   return url.origin
 }
 
-const toIsoDuration = (milliseconds) => {
-  const totalSeconds = Math.floor(milliseconds / 1000)
-
-  if (!Number.isSafeInteger(totalSeconds) || totalSeconds <= 0) {
-    throw new ServiceError(
-      'La reserva del checkout ya expiró',
-      'MERCADOPAGO_CHECKOUT_EXPIRED',
-      409
-    )
-  }
-
-  const days = Math.floor(totalSeconds / 86400)
-  const hours = Math.floor((totalSeconds % 86400) / 3600)
-  const minutes = Math.floor((totalSeconds % 3600) / 60)
-  const seconds = totalSeconds % 60
-  const datePart = days ? `${days}D` : ''
-  const timeParts = [
-    hours ? `${hours}H` : '',
-    minutes ? `${minutes}M` : '',
-    seconds ? `${seconds}S` : ''
-  ].join('')
-
-  return `P${datePart}${timeParts ? `T${timeParts}` : ''}`
-}
-
 const normalizeMoney = (value, fieldName) => {
   try {
     const decimal = String(value ?? '').trim()
@@ -266,7 +241,7 @@ class MercadoPagoCheckoutService {
     return { payment: current, providerIdempotencyKey: concurrentKey }
   }
 
-  #buildRequest(order, { now, reservationExpiresAt }) {
+  #buildRequest(order, { now }) {
     const returnBaseUrl = normalizeReturnBaseUrl(this.returnBaseUrl)
     const totalArs = normalizeMoney(order.totals?.totalArs, 'Order.totalArs')
     const orderNumber = String(order.orderNumber || '').trim()
@@ -284,7 +259,6 @@ class MercadoPagoCheckoutService {
       processing_mode: 'manual',
       total_amount: totalArs,
       external_reference: orderNumber,
-      expiration_time: toIsoDuration(reservationExpiresAt.getTime() - now.getTime()),
       payer: {
         email: order.buyerSnapshot.email,
         first_name: order.buyerSnapshot.firstName,
@@ -588,7 +562,6 @@ class MercadoPagoCheckoutService {
 export {
   MercadoPagoCheckoutService,
   RETURN_PATHS,
-  normalizeReturnBaseUrl,
-  toIsoDuration
+  normalizeReturnBaseUrl
 }
 export default new MercadoPagoCheckoutService()

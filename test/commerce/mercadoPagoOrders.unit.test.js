@@ -7,10 +7,7 @@ import {
   MercadoPagoProvider,
   MercadoPagoProviderError
 } from '../../src/providers/mercadoPago.provider.js'
-import {
-  MercadoPagoCheckoutService,
-  toIsoDuration
-} from '../../src/services/mercadoPagoCheckout.service.js'
+import { MercadoPagoCheckoutService } from '../../src/services/mercadoPagoCheckout.service.js'
 import { PaymentService } from '../../src/services/payment.service.js'
 
 const paymentId = new mongoose.Types.ObjectId().toString()
@@ -714,11 +711,24 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     })
   })
 
-  it('uses the exact remaining reservation duration as ISO 8601 expiration_time', async () => {
+  it('omits provider expiration without changing local reservation or request authority', async () => {
     const { service, state } = makeServiceHarness()
     await service.ensureCheckoutOrderForPayment(paymentId, { now })
-    assert.equal(state.providerCalls[0].request.expiration_time, 'PT5H59M30S')
-    assert.equal(toIsoDuration(6 * 60 * 60 * 1000), 'PT6H')
+    const request = state.providerCalls[0].request
+
+    assert.equal(Object.hasOwn(request, 'expiration_time'), false)
+    assert.equal(request.config.online.available_from, now.toISOString())
+    assert.equal(request.total_amount, '154500.00')
+    assert.deepEqual(request.items, [{
+      title: 'Pedido LC COMP LC-2026-000001',
+      external_code: 'LC-2026-000001',
+      quantity: 1,
+      unit_price: '154500.00'
+    }])
+    assert.equal(state.order.reservationExpiresAt, expiration)
+    assert.equal(state.order._id, orderId)
+    assert.equal(state.payment._id, paymentId)
+    assert.equal(state.payment.providerIdempotencyKey, providerIdempotencyKey)
   })
 
   it('rejects localhost return configuration before calling Mercado Pago', async () => {
@@ -931,7 +941,7 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.deepEqual(state.providerKeys, [providerIdempotencyKey, providerIdempotencyKey])
     assert.deepEqual(sentRequests[1], sentRequests[0])
     assert.equal(sentRequests[0].config.online.available_from, now.toISOString())
-    assert.equal(sentRequests[0].expiration_time, 'PT5H59M30S')
+    assert.equal(Object.hasOwn(sentRequests[0], 'expiration_time'), false)
     assert.equal(state.requestPreparations, 1)
     assert.equal(state.keyRotations, 0)
     assert.equal(state.payment.providerAttemptStatus, 'succeeded')
@@ -985,7 +995,7 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.deepEqual(sentAttempts.map(({ key }) => key), [providerIdempotencyKey, nextProviderKey])
     assert.notDeepEqual(sentAttempts[1].request, sentAttempts[0].request)
     assert.equal(sentAttempts[1].request.config.online.available_from, retryNow.toISOString())
-    assert.equal(sentAttempts[1].request.expiration_time, 'PT5H57M30S')
+    assert.equal(Object.hasOwn(sentAttempts[1].request, 'expiration_time'), false)
     assert.equal(sentAttempts[1].request.external_reference, state.order.orderNumber)
     assert.equal(state.payment._id, initialPaymentId)
     assert.equal(state.order._id, initialOrderId)

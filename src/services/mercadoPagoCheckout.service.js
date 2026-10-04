@@ -96,6 +96,18 @@ const normalizeMoney = (value, fieldName) => {
   }
 }
 
+const cloneProviderRequest = (request) => {
+  try {
+    return JSON.parse(JSON.stringify(request))
+  } catch {
+    throw new ServiceError(
+      'El request almacenado de Mercado Pago es invÃ¡lido',
+      'MERCADOPAGO_ORDER_CONFLICT',
+      409
+    )
+  }
+}
+
 class MercadoPagoCheckoutService {
   constructor({
     paymentManager = PaymentManager,
@@ -300,6 +312,120 @@ class MercadoPagoCheckoutService {
     }
   }
 
+  #resolveRequestAnchor(order, requestedAt) {
+    const pendingHistory = Array.isArray(order.statusHistory)
+      ? order.statusHistory.find((entry) => entry?.status === 'pending_payment')
+      : null
+    const candidates = [pendingHistory?.changedAt, order.createdAt, requestedAt]
+
+    for (const candidate of candidates) {
+      const date = new Date(candidate)
+      if (!Number.isNaN(date.getTime())) return date
+    }
+
+    throw new ServiceError(
+      'No se pudo determinar la fecha estable del request de Mercado Pago',
+      'MERCADOPAGO_ORDER_CONFLICT',
+      409
+    )
+  }
+
+  async #ensureProviderAttempt(payment, order, requestedAt, reservationExpiresAt) {
+    const ensured = await this.#ensureProviderIdempotencyKey(payment)
+    let current = ensured.payment
+    let providerIdempotencyKey = ensured.providerIdempotencyKey
+    let request = current.providerRequestSnapshot
+
+    if (!request) {
+      const requestAnchor = this.#resolveRequestAnchor(order, requestedAt)
+      const builtRequest = this.#buildRequest(order, {
+        now: requestAnchor,
+        reservationExpiresAt
+      })
+      const prepared = await this.payments.prepareProviderRequestSnapshot(
+        payment._id,
+        providerIdempotencyKey,
+        builtRequest
+      )
+
+      current = prepared || await this.payments.getById(payment._id)
+      providerIdempotencyKey = String(current?.providerIdempotencyKey || '').trim()
+      request = current?.providerRequestSnapshot
+    }
+
+    if (!current || !providerIdempotencyKey || !request) {
+      throw new ServiceError(
+        'No se pudo preparar un request idempotente de Mercado Pago',
+        'MERCADOPAGO_ORDER_CONFLICT',
+        409
+      )
+    }
+
+    if (['rejected', 'conflict'].includes(current.providerAttemptStatus)) {
+      const nextProviderIdempotencyKey = this.uuidFactory()
+      const nextProviderRequest = this.#buildRequest(order, {
+        now: requestedAt,
+        reservationExpiresAt
+      })
+      const rotated = await this.payments.rotateProviderIdempotencyKey(
+        payment._id,
+        providerIdempotencyKey,
+        nextProviderIdempotencyKey,
+        nextProviderRequest
+      )
+
+      current = rotated || await this.payments.getById(payment._id)
+      providerIdempotencyKey = String(current?.providerIdempotencyKey || '').trim()
+      request = current?.providerRequestSnapshot
+    }
+
+    if (
+      !current ||
+      !providerIdempotencyKey ||
+      !request ||
+      ['rejected', 'conflict'].includes(current.providerAttemptStatus)
+    ) {
+      throw new ServiceError(
+        'No se pudo iniciar una nueva tentativa idempotente de Mercado Pago',
+        'MERCADOPAGO_ORDER_CONFLICT',
+        409
+      )
+    }
+
+    return {
+      payment: current,
+      providerIdempotencyKey,
+      request: cloneProviderRequest(request)
+    }
+  }
+
+  async #recordProviderAttemptFailure(attempt, error) {
+    if (!attempt?.providerIdempotencyKey) return
+
+    let providerAttemptStatus = 'uncertain'
+
+    if (error instanceof MercadoPagoProviderError) {
+      if (error.failureKind === 'idempotency_conflict') {
+        providerAttemptStatus = 'conflict'
+      } else if (error.retryStrategy === 'new_attempt') {
+        providerAttemptStatus = 'rejected'
+      }
+    }
+
+    try {
+      await this.payments.updateProviderAttemptStatus(
+        attempt.payment._id,
+        attempt.providerIdempotencyKey,
+        providerAttemptStatus
+      )
+    } catch (stateError) {
+      logError('MercadoPagoCheckoutService attempt state update failed', {
+        paymentId: attempt.payment._id,
+        code: stateError?.code || 'PROVIDER_ATTEMPT_STATE_UPDATE_FAILED'
+      })
+    }
+  }
+
   #validateProviderResult(result, order, totalArs) {
     if (result.externalReference !== order.orderNumber) {
       throw new ServiceError(
@@ -363,29 +489,33 @@ class MercadoPagoCheckoutService {
     const storedCheckout = this.#validateStoredCheckout(payment)
     if (storedCheckout) return storedCheckout
 
-    const ensured = await this.#ensureProviderIdempotencyKey(payment)
-    payment = ensured.payment
-
-    const concurrentCheckout = this.#validateStoredCheckout(payment)
-    if (concurrentCheckout) return concurrentCheckout
-
-    const request = this.#buildRequest(order, {
-      now: requestedAt,
-      reservationExpiresAt
-    })
     const startedAt = Date.now()
+    let attempt
+    let providerRequestSent = false
 
     try {
+      attempt = await this.#ensureProviderAttempt(
+        payment,
+        order,
+        requestedAt,
+        reservationExpiresAt
+      )
+      payment = attempt.payment
+
+      const concurrentCheckout = this.#validateStoredCheckout(payment)
+      if (concurrentCheckout) return concurrentCheckout
+
+      providerRequestSent = true
       const providerOrder = await this.provider.createCheckoutOrder({
-        providerIdempotencyKey: ensured.providerIdempotencyKey,
-        request
+        providerIdempotencyKey: attempt.providerIdempotencyKey,
+        request: attempt.request
       })
 
       this.#validateProviderResult(providerOrder, order, orderTotalArs)
 
       const attached = await this.payments.attachProviderOrder(
         payment._id,
-        ensured.providerIdempotencyKey,
+        attempt.providerIdempotencyKey,
         {
           providerOrderId: providerOrder.providerOrderId,
           providerCheckoutUrl: providerOrder.checkoutUrl,
@@ -424,6 +554,10 @@ class MercadoPagoCheckoutService {
         409
       )
     } catch (error) {
+      if (providerRequestSent) {
+        await this.#recordProviderAttemptFailure(attempt, error)
+      }
+
       const mappedError = error instanceof MercadoPagoProviderError
         ? new ServiceError(error.message, error.code, error.status)
         : error

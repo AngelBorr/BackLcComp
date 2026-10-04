@@ -79,11 +79,18 @@ const sanitizeMercadoPagoHttpError = ({ status, payload, path, method, secrets =
 }
 
 class MercadoPagoProviderError extends Error {
-  constructor(message, code, status = 502) {
+  constructor(
+    message,
+    code,
+    status = 502,
+    { failureKind = 'unknown', retryStrategy = 'same_attempt' } = {}
+  ) {
     super(message)
     this.name = 'MercadoPagoProviderError'
     this.code = code
     this.status = status
+    this.failureKind = failureKind
+    this.retryStrategy = retryStrategy
   }
 }
 
@@ -218,7 +225,8 @@ class MercadoPagoProvider {
       return new MercadoPagoProviderError(
         'Mercado Pago rechazó las credenciales configuradas',
         'MERCADOPAGO_AUTH_ERROR',
-        502
+        502,
+        { failureKind: 'authentication' }
       )
     }
 
@@ -226,7 +234,8 @@ class MercadoPagoProvider {
       return new MercadoPagoProviderError(
         'Mercado Pago limitó temporalmente las solicitudes',
         'MERCADOPAGO_RATE_LIMIT',
-        503
+        503,
+        { failureKind: 'rate_limit' }
       )
     }
 
@@ -234,7 +243,8 @@ class MercadoPagoProvider {
       return new MercadoPagoProviderError(
         'Mercado Pago rechazó la clave de idempotencia',
         'MERCADOPAGO_IDEMPOTENCY_CONFLICT',
-        409
+        502,
+        { failureKind: 'idempotency_conflict', retryStrategy: 'new_attempt' }
       )
     }
 
@@ -242,7 +252,8 @@ class MercadoPagoProvider {
       return new MercadoPagoProviderError(
         'La order de Mercado Pago está temporalmente bloqueada',
         'MERCADOPAGO_ORDER_CONFLICT',
-        409
+        409,
+        { failureKind: 'resource_locked' }
       )
     }
 
@@ -250,14 +261,16 @@ class MercadoPagoProvider {
       return new MercadoPagoProviderError(
         'Mercado Pago no está disponible temporalmente',
         'MERCADOPAGO_UNAVAILABLE',
-        503
+        503,
+        { failureKind: 'server_error' }
       )
     }
 
     return new MercadoPagoProviderError(
       'Mercado Pago rechazó la creación de la order',
       'MERCADOPAGO_ORDER_REJECTED',
-      502
+      502,
+      { failureKind: 'definitive_rejection', retryStrategy: 'new_attempt' }
     )
   }
 
@@ -271,7 +284,8 @@ class MercadoPagoProvider {
         throw new MercadoPagoProviderError(
           'La clave de idempotencia de Mercado Pago es inválida',
           'MERCADOPAGO_IDEMPOTENCY_CONFLICT',
-          409
+          502,
+          { failureKind: 'idempotency_conflict', retryStrategy: 'new_attempt' }
         )
       }
     }
@@ -338,14 +352,16 @@ class MercadoPagoProvider {
         throw new MercadoPagoProviderError(
           'Mercado Pago no respondió dentro del tiempo permitido',
           'MERCADOPAGO_TIMEOUT',
-          504
+          504,
+          { failureKind: 'timeout' }
         )
       }
 
       throw new MercadoPagoProviderError(
         'No se pudo conectar con Mercado Pago',
         'MERCADOPAGO_UNAVAILABLE',
-        503
+        503,
+        { failureKind: 'network_error' }
       )
     } finally {
       clearTimeout(timeout)

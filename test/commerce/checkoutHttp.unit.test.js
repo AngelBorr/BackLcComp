@@ -303,6 +303,25 @@ describe('POST /api/checkout HTTP orchestration (isolated unit tests)', () => {
     })
   })
 
+  it('does not expose a provider idempotency conflict as a local cart fingerprint conflict', async () => {
+    const providerConflict = new ServiceError(
+      'Mercado Pago rechazó la clave de idempotencia del intento',
+      'MERCADOPAGO_IDEMPOTENCY_CONFLICT',
+      502
+    )
+    const { service } = makeFacadeHarness({ providerError: providerConflict })
+    const app = createControllerApp({ user: { id: userId, role: 'USER' }, service })
+    const response = await request(app)
+      .post('/api/checkout')
+      .set('Idempotency-Key', 'checkout-provider-conflict')
+      .send(validBody())
+
+    assert.equal(response.status, 502)
+    assert.equal(response.body.message, providerConflict.message)
+    assert.notEqual(response.status, 409)
+    assert.equal(response.body.message.includes('carrito'), false)
+  })
+
   it('returns MP configuration errors without secrets or stacks', async () => {
     const error = new ServiceError(
       'Mercado Pago no está configurado',

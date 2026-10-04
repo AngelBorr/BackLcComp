@@ -60,6 +60,8 @@ const makeServiceHarness = (overrides = {}) => {
       providerOrderId: null,
       providerCheckoutUrl: null,
       providerIdempotencyKey,
+      providerRequestSnapshot: null,
+      providerAttemptStatus: null,
       providerStatus: null,
       preferenceId: null,
       providerPaymentId: null,
@@ -69,6 +71,8 @@ const makeServiceHarness = (overrides = {}) => {
       _id: orderId,
       orderNumber: 'LC-2026-000001',
       status: 'pending_payment',
+      createdAt: now,
+      statusHistory: [{ status: 'pending_payment', changedAt: now }],
       totals: { totalUsd: '100.00', totalArs: '154500.00' },
       exchangeRateSnapshot: { source: 'BNA', rate: '1545.00' },
       reservationExpiresAt: expiration,
@@ -82,6 +86,9 @@ const makeServiceHarness = (overrides = {}) => {
     providerCalls: [],
     providerKeys: [],
     keyClaims: 0,
+    requestPreparations: 0,
+    attemptStatusUpdates: [],
+    keyRotations: 0,
     attachAttempts: 0,
     successfulAttachments: 0
   }
@@ -96,6 +103,48 @@ const makeServiceHarness = (overrides = {}) => {
       state.payment.providerIdempotencyKey = key
       return { ...state.payment }
     },
+    async prepareProviderRequestSnapshot(_id, key, request) {
+      state.requestPreparations += 1
+      if (
+        state.payment.providerOrderId ||
+        state.payment.providerIdempotencyKey !== key ||
+        state.payment.providerRequestSnapshot
+      ) {
+        return null
+      }
+
+      state.payment.providerRequestSnapshot = JSON.parse(JSON.stringify(request))
+      state.payment.providerAttemptStatus = 'prepared'
+      return { ...state.payment }
+    },
+    async updateProviderAttemptStatus(_id, key, status) {
+      state.attemptStatusUpdates.push({ key, status })
+      if (
+        state.payment.providerOrderId ||
+        state.payment.providerIdempotencyKey !== key
+      ) {
+        return null
+      }
+
+      state.payment.providerAttemptStatus = status
+      return { ...state.payment }
+    },
+    async rotateProviderIdempotencyKey(_id, expectedKey, nextKey, nextRequest) {
+      if (
+        state.payment.providerOrderId ||
+        state.payment.providerIdempotencyKey !== expectedKey ||
+        !['rejected', 'conflict'].includes(state.payment.providerAttemptStatus) ||
+        !state.payment.providerRequestSnapshot
+      ) {
+        return null
+      }
+
+      state.keyRotations += 1
+      state.payment.providerIdempotencyKey = nextKey
+      state.payment.providerRequestSnapshot = JSON.parse(JSON.stringify(nextRequest))
+      state.payment.providerAttemptStatus = 'prepared'
+      return { ...state.payment }
+    },
     async attachProviderOrder(_id, key, data) {
       state.attachAttempts += 1
       if (
@@ -107,6 +156,7 @@ const makeServiceHarness = (overrides = {}) => {
       }
 
       Object.assign(state.payment, data)
+      state.payment.providerAttemptStatus = 'succeeded'
       state.successfulAttachments += 1
       return { ...state.payment }
     }
@@ -138,7 +188,7 @@ const makeServiceHarness = (overrides = {}) => {
     orderManager,
     provider,
     returnBaseUrl: overrides.returnBaseUrl ?? 'https://www.lccomp.com.ar',
-    uuidFactory: () => providerIdempotencyKey
+    uuidFactory: overrides.uuidFactory || (() => providerIdempotencyKey)
   })
 
   return { service, state, provider }
@@ -294,14 +344,28 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
 
   it('preserves existing HTTP mappings for 401, 403, 409, 423 and 5xx', async () => {
     const cases = [
-      [401, {}, 'MERCADOPAGO_AUTH_ERROR', 502],
-      [403, {}, 'MERCADOPAGO_AUTH_ERROR', 502],
-      [409, { code: 'idempotency_key_already_used' }, 'MERCADOPAGO_IDEMPOTENCY_CONFLICT', 409],
-      [423, { code: 'resource_locked' }, 'MERCADOPAGO_ORDER_CONFLICT', 409],
-      [503, {}, 'MERCADOPAGO_UNAVAILABLE', 503]
+      [401, {}, 'MERCADOPAGO_AUTH_ERROR', 502, 'authentication', 'same_attempt'],
+      [403, {}, 'MERCADOPAGO_AUTH_ERROR', 502, 'authentication', 'same_attempt'],
+      [
+        409,
+        { code: 'idempotency_key_already_used' },
+        'MERCADOPAGO_IDEMPOTENCY_CONFLICT',
+        502,
+        'idempotency_conflict',
+        'new_attempt'
+      ],
+      [423, { code: 'resource_locked' }, 'MERCADOPAGO_ORDER_CONFLICT', 409, 'resource_locked', 'same_attempt'],
+      [503, {}, 'MERCADOPAGO_UNAVAILABLE', 503, 'server_error', 'same_attempt']
     ]
 
-    for (const [httpStatus, payload, expectedCode, expectedStatus] of cases) {
+    for (const [
+      httpStatus,
+      payload,
+      expectedCode,
+      expectedStatus,
+      expectedFailureKind,
+      expectedRetryStrategy
+    ] of cases) {
       const provider = makeProvider(
         async () => jsonResponse(payload, { status: httpStatus }),
         { errorLogger: () => {} }
@@ -309,7 +373,12 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
 
       await assert.rejects(
         provider.createCheckoutOrder({ providerIdempotencyKey, request: {} }),
-        (error) => error.code === expectedCode && error.status === expectedStatus
+        (error) => (
+          error.code === expectedCode &&
+          error.status === expectedStatus &&
+          error.failureKind === expectedFailureKind &&
+          error.retryStrategy === expectedRetryStrategy
+        )
       )
     }
   })
@@ -421,6 +490,11 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.ok(PaymentModel.schema.path('providerOrderId'))
     assert.ok(PaymentModel.schema.path('providerCheckoutUrl'))
     assert.ok(PaymentModel.schema.path('providerIdempotencyKey'))
+    assert.ok(PaymentModel.schema.path('providerRequestSnapshot'))
+    assert.deepEqual(
+      PaymentModel.schema.path('providerAttemptStatus').enumValues,
+      ['prepared', 'uncertain', 'rejected', 'conflict', 'succeeded']
+    )
     assert.ok(indexes.some(([fields, options]) =>
       fields.provider === 1 && fields.providerOrderId === 1 && options.unique === true))
     assert.ok(indexes.some(([fields, options]) =>
@@ -644,7 +718,8 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
       providerError: new MercadoPagoProviderError(
         'No disponible',
         'MERCADOPAGO_UNAVAILABLE',
-        503
+        503,
+        { failureKind: 'server_error', retryStrategy: 'same_attempt' }
       )
     })
     await assert.rejects(
@@ -656,6 +731,7 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.equal(state.order.status, 'pending_payment')
     assert.equal(state.payment.providerOrderId, null)
     assert.equal(state.payment.providerIdempotencyKey, providerIdempotencyKey)
+    assert.equal(state.payment.providerAttemptStatus, 'uncertain')
   })
 
   it('keeps HTTP 400 provider details out of the public ServiceError', async () => {
@@ -686,18 +762,26 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.equal(state.payment.normalizedStatus, 'pending')
     assert.equal(state.order.status, 'pending_payment')
     assert.equal(state.payment.providerOrderId, null)
+    assert.equal(state.payment.providerAttemptStatus, 'rejected')
   })
 
-  it('reuses the same providerIdempotencyKey after a failed external attempt', async () => {
+  it('reuses the same providerIdempotencyKey and exact request after a timeout', async () => {
     const { service, state, provider } = makeServiceHarness({
       payment: { providerIdempotencyKey: null }
     })
     let attempt = 0
+    const sentRequests = []
     provider.createCheckoutOrder = async (input) => {
       state.providerKeys.push(input.providerIdempotencyKey)
+      sentRequests.push(JSON.parse(JSON.stringify(input.request)))
       attempt += 1
       if (attempt === 1) {
-        throw new MercadoPagoProviderError('timeout', 'MERCADOPAGO_TIMEOUT', 504)
+        throw new MercadoPagoProviderError(
+          'timeout',
+          'MERCADOPAGO_TIMEOUT',
+          504,
+          { failureKind: 'timeout', retryStrategy: 'same_attempt' }
+        )
       }
       return {
         providerOrderId,
@@ -709,8 +793,76 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     }
 
     await assert.rejects(service.ensureCheckoutOrderForPayment(paymentId, { now }))
-    await service.ensureCheckoutOrderForPayment(paymentId, { now })
+    assert.equal(state.payment.providerAttemptStatus, 'uncertain')
+
+    const retryNow = new Date(now.getTime() + (2 * 60 * 1000))
+    await service.ensureCheckoutOrderForPayment(paymentId, { now: retryNow })
+
     assert.deepEqual(state.providerKeys, [providerIdempotencyKey, providerIdempotencyKey])
+    assert.deepEqual(sentRequests[1], sentRequests[0])
+    assert.equal(sentRequests[0].config.online.available_from, now.toISOString())
+    assert.equal(sentRequests[0].expiration_time, 'PT5H59M30S')
+    assert.equal(state.requestPreparations, 1)
+    assert.equal(state.keyRotations, 0)
+    assert.equal(state.payment.providerAttemptStatus, 'succeeded')
+  })
+
+  it('rotates only the provider key after a definitive rejection and keeps the same local checkout', async () => {
+    const nextProviderKey = '223e4567-e89b-42d3-a456-426614174001'
+    const { service, state, provider } = makeServiceHarness({
+      payment: { providerIdempotencyKey: null },
+      uuidFactory: (() => {
+        const keys = [providerIdempotencyKey, nextProviderKey]
+        return () => keys.shift()
+      })()
+    })
+    const initialPaymentId = state.payment._id
+    const initialOrderId = state.order._id
+    const sentAttempts = []
+
+    provider.createCheckoutOrder = async (input) => {
+      sentAttempts.push({
+        key: input.providerIdempotencyKey,
+        request: JSON.parse(JSON.stringify(input.request))
+      })
+      if (sentAttempts.length === 1) {
+        throw new MercadoPagoProviderError(
+          'rejected',
+          'MERCADOPAGO_ORDER_REJECTED',
+          502,
+          { failureKind: 'definitive_rejection', retryStrategy: 'new_attempt' }
+        )
+      }
+      return {
+        providerOrderId,
+        status: 'created',
+        checkoutUrl,
+        externalReference: 'LC-2026-000001',
+        totalAmount: '154500.00'
+      }
+    }
+
+    await assert.rejects(
+      service.ensureCheckoutOrderForPayment(paymentId, { now }),
+      (error) => error.code === 'MERCADOPAGO_ORDER_REJECTED'
+    )
+    assert.equal(state.payment.providerAttemptStatus, 'rejected')
+    assert.equal(state.payment.providerOrderId, null)
+
+    const retryNow = new Date(now.getTime() + (2 * 60 * 1000))
+    await service.ensureCheckoutOrderForPayment(paymentId, { now: retryNow })
+
+    assert.deepEqual(sentAttempts.map(({ key }) => key), [providerIdempotencyKey, nextProviderKey])
+    assert.notDeepEqual(sentAttempts[1].request, sentAttempts[0].request)
+    assert.equal(sentAttempts[1].request.config.online.available_from, retryNow.toISOString())
+    assert.equal(sentAttempts[1].request.expiration_time, 'PT5H57M30S')
+    assert.equal(sentAttempts[1].request.external_reference, state.order.orderNumber)
+    assert.equal(state.payment._id, initialPaymentId)
+    assert.equal(state.order._id, initialOrderId)
+    assert.equal(state.keyRotations, 1)
+    assert.equal(state.requestPreparations, 1)
+    assert.equal(state.payment.providerOrderId, providerOrderId)
+    assert.equal(state.payment.providerAttemptStatus, 'succeeded')
   })
 
   it('uses one stable key and one local association during concurrent calls', async () => {

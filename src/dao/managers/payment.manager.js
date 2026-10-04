@@ -87,6 +87,75 @@ class PaymentManager {
     ).lean()
   }
 
+  async prepareProviderRequestSnapshot(
+    paymentId,
+    providerIdempotencyKey,
+    providerRequestSnapshot
+  ) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        provider: 'mercado_pago',
+        normalizedStatus: 'pending',
+        providerIdempotencyKey,
+        providerOrderId: null,
+        providerRequestSnapshot: null
+      },
+      {
+        $set: {
+          providerRequestSnapshot,
+          providerAttemptStatus: 'prepared'
+        }
+      },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
+  async updateProviderAttemptStatus(
+    paymentId,
+    providerIdempotencyKey,
+    providerAttemptStatus
+  ) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        provider: 'mercado_pago',
+        normalizedStatus: 'pending',
+        providerIdempotencyKey,
+        providerOrderId: null
+      },
+      { $set: { providerAttemptStatus } },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
+  async rotateProviderIdempotencyKey(
+    paymentId,
+    expectedProviderIdempotencyKey,
+    providerIdempotencyKey,
+    providerRequestSnapshot
+  ) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        provider: 'mercado_pago',
+        normalizedStatus: 'pending',
+        providerIdempotencyKey: expectedProviderIdempotencyKey,
+        providerAttemptStatus: { $in: ['rejected', 'conflict'] },
+        providerRequestSnapshot: { $type: 'object' },
+        providerOrderId: null
+      },
+      {
+        $set: {
+          providerIdempotencyKey,
+          providerRequestSnapshot,
+          providerAttemptStatus: 'prepared'
+        }
+      },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
   async attachProviderOrder(
     paymentId,
     providerIdempotencyKey,
@@ -107,7 +176,8 @@ class PaymentManager {
         $set: {
           providerOrderId,
           providerCheckoutUrl,
-          providerStatus
+          providerStatus,
+          providerAttemptStatus: 'succeeded'
         }
       },
       { new: true, runValidators: true }

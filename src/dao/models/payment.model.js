@@ -10,6 +10,14 @@ export const PAYMENT_STATUSES = [
   'requires_attention'
 ]
 
+export const PROVIDER_ATTEMPT_STATUSES = [
+  'prepared',
+  'uncertain',
+  'rejected',
+  'conflict',
+  'succeeded'
+]
+
 const paymentSchema = new mongoose.Schema(
   {
     orderId: {
@@ -26,6 +34,12 @@ const paymentSchema = new mongoose.Schema(
     providerOrderId: { type: String, trim: true, maxlength: 200, default: null },
     providerCheckoutUrl: { type: String, trim: true, maxlength: 2048, default: null },
     providerIdempotencyKey: { type: String, trim: true, maxlength: 128, default: null },
+    providerRequestSnapshot: { type: mongoose.Schema.Types.Mixed, default: null },
+    providerAttemptStatus: {
+      type: String,
+      enum: PROVIDER_ATTEMPT_STATUSES,
+      default: null
+    },
     providerPaymentId: { type: String, trim: true, default: null },
     externalReference: { type: String, required: true, trim: true },
     providerStatus: { type: String, trim: true, default: null },

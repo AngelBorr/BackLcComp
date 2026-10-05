@@ -17,6 +17,7 @@ import ProductUnitRouter from './routes/productUnit.router.js'
 import WebhooksRouter from './routes/webhooks.router.js'
 import CheckoutRouter from './routes/checkout.router.js'
 import OrdersRouter from './routes/orders.router.js'
+import AdminOrdersRouter from './routes/adminOrders.router.js'
 
 // ✅ IMPORTANTE: usar el GridFSBucket del driver que trae mongoose
 const { GridFSBucket } = mongoose.mongo
@@ -116,6 +117,7 @@ const productUnitRouter = new ProductUnitRouter()
 const webhooksRouter = new WebhooksRouter()
 const checkoutRouter = new CheckoutRouter()
 const ordersRouter = new OrdersRouter()
+const adminOrdersRouter = new AdminOrdersRouter()
 // --------------------------------------------------------------
 // 📦 GridFS (opcional: bucket en req) - consistente con mongoose
 // --------------------------------------------------------------
@@ -143,6 +145,7 @@ app.use('/api/product-units', productUnitRouter.getRouter())
 app.use('/api/webhooks', webhooksRouter.getRouter())
 app.use('/api/checkout', checkoutRouter.getRouter())
 app.use('/api/orders', ordersRouter.getRouter())
+app.use('/api/admin/orders', adminOrdersRouter.getRouter())
 
 // --------------------------------------------------------------
 // ✅ 404 + error handlers (SIEMPRE al final)

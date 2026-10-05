@@ -150,7 +150,9 @@ const createReconciliationHarness = (overrides = {}) => {
       status: 'pending_payment',
       totals: { totalArs: '154500.00' },
       reservationExpiresAt: new Date('2026-09-29T18:00:00.000Z'),
-      statusHistory: []
+      statusHistory: [],
+      fulfillmentStatus: 'pending',
+      fulfillmentHistory: []
     },
     payment: {
       _id: paymentId,
@@ -201,6 +203,19 @@ const createReconciliationHarness = (overrides = {}) => {
       state.order.statusHistory.push({ status: nextStatus, changedAt, reason })
       if (nextStatus === 'paid') state.order.paidAt = changedAt
       if (nextStatus === 'requires_attention') state.order.attentionReason = reason
+      return clone(state.order)
+    },
+    async updateFulfillmentStatus(
+      id,
+      expectedStatus,
+      { nextStatus, changedAt, changedBy, reason }
+    ) {
+      if (
+        String(id) !== String(state.order._id) ||
+        state.order.fulfillmentStatus !== expectedStatus
+      ) return null
+      state.order.fulfillmentStatus = nextStatus
+      state.order.fulfillmentHistory.push({ status: nextStatus, changedAt, changedBy, reason })
       return clone(state.order)
     }
   }
@@ -748,6 +763,13 @@ describe('Mercado Pago authoritative reconciliation (isolated)', () => {
     assert.equal(state.payment.normalizedStatus, 'approved')
     assert.equal(state.payment.providerPaymentId, 'PAY01M28P44GDSD4JYTSK5SYZT6BH')
     assert.equal(state.order.status, 'paid')
+    assert.equal(state.order.fulfillmentStatus, 'preparing')
+    assert.deepEqual(state.order.fulfillmentHistory, [{
+      status: 'preparing',
+      changedAt: now,
+      changedBy: null,
+      reason: 'payment_approved'
+    }])
     assert.equal(state.units[0].status, 'sold')
     assert.deepEqual(state.units[0].soldAt, now)
     assert.equal(state.prodStock, 0)

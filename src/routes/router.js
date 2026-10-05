@@ -46,6 +46,10 @@ class MyOwnRouter {
     this.router.put(path, handlePolicies(policies), this.applyCallbacks(callbacks))
   }
 
+  patch(path, policies, ...callbacks) {
+    this.router.patch(path, handlePolicies(policies), this.applyCallbacks(callbacks))
+  }
+
   delete(path, policies, ...callbacks) {
     this.router.delete(path, handlePolicies(policies), this.applyCallbacks(callbacks))
   }

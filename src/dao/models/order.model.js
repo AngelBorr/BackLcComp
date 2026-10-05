@@ -9,6 +9,13 @@ export const ORDER_STATUSES = [
 ]
 
 export const ORDER_FULFILLMENT_MODES = ['pickup']
+export const ORDER_FULFILLMENT_STATUSES = [
+  'pending',
+  'preparing',
+  'ready_for_pickup',
+  'picked_up',
+  'cancelled'
+]
 
 const nonNegativeDecimal = {
   validator: (value) => value === null || Number(value.toString()) >= 0,
@@ -84,6 +91,20 @@ const statusHistorySchema = new mongoose.Schema(
   { _id: false }
 )
 
+const fulfillmentHistorySchema = new mongoose.Schema(
+  {
+    status: { type: String, required: true, enum: ORDER_FULFILLMENT_STATUSES },
+    changedAt: { type: Date, required: true },
+    changedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'users',
+      default: null
+    },
+    reason: { type: String, trim: true, maxlength: 500, default: '' }
+  },
+  { _id: false }
+)
+
 const orderSchema = new mongoose.Schema(
   {
     orderNumber: {
@@ -121,6 +142,11 @@ const orderSchema = new mongoose.Schema(
       enum: ORDER_FULFILLMENT_MODES,
       default: 'pickup'
     },
+    fulfillmentStatus: {
+      type: String,
+      enum: ORDER_FULFILLMENT_STATUSES,
+      default: 'pending'
+    },
     status: {
       type: String,
       enum: ORDER_STATUSES,
@@ -149,10 +175,16 @@ const orderSchema = new mongoose.Schema(
     paidAt: { type: Date, default: null },
     cancelledAt: { type: Date, default: null },
     expiredAt: { type: Date, default: null },
+    readyForPickupAt: { type: Date, default: null },
+    pickedUpAt: { type: Date, default: null },
     cancellationReason: { type: String, trim: true, maxlength: 500, default: '' },
     attentionReason: { type: String, trim: true, maxlength: 500, default: '' },
     statusHistory: {
       type: [statusHistorySchema],
+      default: []
+    },
+    fulfillmentHistory: {
+      type: [fulfillmentHistorySchema],
       default: []
     }
   },
@@ -172,6 +204,7 @@ orderSchema.index(
   }
 )
 orderSchema.index({ status: 1 })
+orderSchema.index({ fulfillmentStatus: 1, createdAt: -1 })
 
 const OrderModel = mongoose.model('orders', orderSchema)
 

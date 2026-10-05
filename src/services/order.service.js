@@ -211,6 +211,7 @@ class OrderService {
                 role
               },
               fulfillmentMode,
+              fulfillmentStatus: 'pending',
               status: 'pending_payment',
               commercialCurrency: 'USD',
               paymentCurrency: 'ARS',
@@ -225,6 +226,14 @@ class OrderService {
                   status: 'pending_payment',
                   changedAt: createdAt,
                   reason: ''
+                }
+              ],
+              fulfillmentHistory: [
+                {
+                  status: 'pending',
+                  changedAt: createdAt,
+                  changedBy: null,
+                  reason: 'order_created'
                 }
               ]
             },

@@ -419,6 +419,26 @@ class MercadoPagoReconciliationService {
       { session }
     )
 
+    const preparingOrder = await this.orders.updateFulfillmentStatus(
+      context.order._id,
+      'pending',
+      {
+        nextStatus: 'preparing',
+        changedAt: now,
+        changedBy: null,
+        reason: 'payment_approved'
+      },
+      { session }
+    )
+
+    if (!preparingOrder) {
+      throw new ServiceError(
+        'La preparaciÃ³n de la Order cambiÃ³ durante la confirmaciÃ³n del pago',
+        'ORDER_FULFILLMENT_CONFLICT',
+        409
+      )
+    }
+
     const paidOrder = await this.orders.updateStatus(
       context.order._id,
       'pending_payment',

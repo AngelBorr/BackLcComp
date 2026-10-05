@@ -216,6 +216,23 @@ class ProductUnitManager {
     return query
   }
 
+  async getAssignedByOrderId(orderId, { statuses, session } = {}) {
+    const filter = {
+      isDeleted: false,
+      $or: [
+        { orderId },
+        { reservedByOrderId: orderId },
+        { soldByOrderId: orderId }
+      ]
+    }
+
+    if (Array.isArray(statuses) && statuses.length) filter.status = { $in: statuses }
+
+    const query = ProductUnitModel.find(filter).sort({ createdAt: 1 }).lean()
+    if (session) query.session(session)
+    return query
+  }
+
   async markReservedUnitsSold(unitIds, orderId, soldAt, { session } = {}) {
     return ProductUnitModel.updateMany(
       {

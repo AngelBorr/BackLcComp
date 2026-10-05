@@ -11,6 +11,7 @@ export const PAYMENT_STATUSES = [
 ]
 
 export const PROVIDER_ATTEMPT_STATUSES = [
+  null,
   'prepared',
   'uncertain',
   'rejected',

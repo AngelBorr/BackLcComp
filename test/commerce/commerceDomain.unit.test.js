@@ -128,7 +128,61 @@ describe('Commerce domain foundation (isolated unit tests)', () => {
 
     assert.equal(order.status, 'pending_payment')
     assert.equal(payment.normalizedStatus, 'pending')
+    assert.equal(payment.providerAttemptStatus, null)
     assert.equal(event.processingStatus, 'received')
+  })
+
+  it('accepts only the initial null and operational provider attempt statuses', async () => {
+    const paymentData = {
+      orderId,
+      externalReference: 'LC-2026-000010',
+      amountArs: '150000.00'
+    }
+
+    for (const providerAttemptStatus of [
+      null,
+      'prepared',
+      'uncertain',
+      'rejected',
+      'conflict',
+      'succeeded'
+    ]) {
+      await new PaymentModel({ ...paymentData, providerAttemptStatus }).validate()
+    }
+
+    await assert.rejects(
+      new PaymentModel({ ...paymentData, providerAttemptStatus: 'arbitrary' }).validate(),
+      (error) => error?.errors?.providerAttemptStatus?.kind === 'enum'
+    )
+  })
+
+  it('marks the provider attempt prepared only with its request snapshot', async () => {
+    const payments = new PaymentManager()
+    const providerIdempotencyKey = '123e4567-e89b-42d3-a456-426614174000'
+    const providerRequestSnapshot = { type: 'online', external_reference: 'LC-2026-000010' }
+    let captured
+
+    stub(PaymentModel, 'findOneAndUpdate', (filter, update, options) => {
+      captured = { filter, update, options }
+      return queryResult({
+        _id: paymentId,
+        providerIdempotencyKey,
+        providerRequestSnapshot,
+        providerAttemptStatus: 'prepared'
+      })
+    })
+
+    const payment = await payments.prepareProviderRequestSnapshot(
+      paymentId,
+      providerIdempotencyKey,
+      providerRequestSnapshot
+    )
+
+    assert.equal(captured.filter.providerRequestSnapshot, null)
+    assert.deepEqual(captured.update.$set.providerRequestSnapshot, providerRequestSnapshot)
+    assert.equal(captured.update.$set.providerAttemptStatus, 'prepared')
+    assert.equal(captured.options.runValidators, true)
+    assert.equal(payment.providerAttemptStatus, 'prepared')
   })
 
   it('persists the reproducible BNA exchange-rate snapshot precision', async () => {
@@ -588,6 +642,41 @@ describe('Commerce domain foundation (isolated unit tests)', () => {
     assert.equal(paymentData.externalReference, 'LC-2026-000001')
     assert.equal(paymentData.amountArs, '1234.56')
     assert.equal(paymentSession, externalSession)
+  })
+
+  it('creates the initial Payment with null provider attempt status inside the transaction', async () => {
+    const payments = new PaymentManager()
+    let saveSession
+
+    stub(PaymentModel.prototype, 'save', async function (options) {
+      saveSession = options.session
+      await this.validate()
+      return this
+    })
+
+    const service = new PaymentService({
+      orderManager: {
+        async getById() {
+          return {
+            _id: orderId,
+            orderNumber: 'LC-2026-000001',
+            status: 'pending_payment',
+            totals: { totalArs: '1234.56' },
+            exchangeRateSnapshot: { source: 'BNA' }
+          }
+        }
+      },
+      paymentManager: payments
+    })
+
+    const payment = await service.createPayment(
+      { orderId },
+      { session: externalSession }
+    )
+
+    assert.equal(payment.providerAttemptStatus, null)
+    assert.equal(payment.providerRequestSnapshot, null)
+    assert.equal(saveSession, externalSession)
   })
 
   it('rejects an amountArs supplied by a Payment caller', async () => {

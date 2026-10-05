@@ -618,7 +618,7 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.ok(PaymentModel.schema.path('providerRequestSnapshot'))
     assert.deepEqual(
       PaymentModel.schema.path('providerAttemptStatus').enumValues,
-      ['prepared', 'uncertain', 'rejected', 'conflict', 'succeeded']
+      [null, 'prepared', 'uncertain', 'rejected', 'conflict', 'succeeded']
     )
     assert.ok(indexes.some(([fields, options]) =>
       fields.provider === 1 && fields.providerOrderId === 1 && options.unique === true))

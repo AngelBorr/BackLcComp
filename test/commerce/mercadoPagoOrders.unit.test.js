@@ -9,6 +9,7 @@ import {
 } from '../../src/providers/mercadoPago.provider.js'
 import { MercadoPagoCheckoutService } from '../../src/services/mercadoPagoCheckout.service.js'
 import { PaymentService } from '../../src/services/payment.service.js'
+import { ServiceError } from '../../src/services/service.products.js'
 
 const paymentId = new mongoose.Types.ObjectId().toString()
 const orderId = new mongoose.Types.ObjectId().toString()
@@ -132,7 +133,7 @@ const makeServiceHarness = (overrides = {}) => {
       if (
         state.payment.providerOrderId ||
         state.payment.providerIdempotencyKey !== expectedKey ||
-        !['rejected', 'conflict'].includes(state.payment.providerAttemptStatus) ||
+        state.payment.providerAttemptStatus !== 'rejected' ||
         !state.payment.providerRequestSnapshot
       ) {
         return null
@@ -477,7 +478,7 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
         'MERCADOPAGO_IDEMPOTENCY_CONFLICT',
         502,
         'idempotency_conflict',
-        'new_attempt'
+        'fail_closed'
       ],
       [423, { code: 'resource_locked' }, 'MERCADOPAGO_ORDER_CONFLICT', 409, 'resource_locked', 'same_attempt'],
       [503, {}, 'MERCADOPAGO_UNAVAILABLE', 503, 'server_error', 'same_attempt']
@@ -945,6 +946,131 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.equal(state.requestPreparations, 1)
     assert.equal(state.keyRotations, 0)
     assert.equal(state.payment.providerAttemptStatus, 'succeeded')
+  })
+
+  it('keeps the same provider attempt fail-closed after timeout followed by HTTP 409', async () => {
+    const { service, state, provider } = makeServiceHarness({
+      payment: { providerIdempotencyKey: null }
+    })
+    const sentAttempts = []
+    let attempt = 0
+    provider.createCheckoutOrder = async (input) => {
+      sentAttempts.push({
+        key: input.providerIdempotencyKey,
+        request: JSON.parse(JSON.stringify(input.request))
+      })
+      attempt += 1
+
+      if (attempt === 1) {
+        throw new MercadoPagoProviderError(
+          'timeout',
+          'MERCADOPAGO_TIMEOUT',
+          504,
+          { failureKind: 'timeout', retryStrategy: 'same_attempt' }
+        )
+      }
+
+      throw new MercadoPagoProviderError(
+        'provider idempotency conflict',
+        'MERCADOPAGO_IDEMPOTENCY_CONFLICT',
+        502,
+        { failureKind: 'idempotency_conflict', retryStrategy: 'fail_closed' }
+      )
+    }
+
+    await assert.rejects(
+      service.ensureCheckoutOrderForPayment(paymentId, { now }),
+      (error) => error.code === 'MERCADOPAGO_TIMEOUT'
+    )
+    assert.equal(state.payment.providerAttemptStatus, 'uncertain')
+
+    await assert.rejects(
+      service.ensureCheckoutOrderForPayment(paymentId, {
+        now: new Date(now.getTime() + 1000)
+      }),
+      (error) => error.code === 'MERCADOPAGO_IDEMPOTENCY_CONFLICT'
+    )
+    assert.equal(state.payment.providerAttemptStatus, 'conflict')
+
+    await assert.rejects(
+      service.ensureCheckoutOrderForPayment(paymentId, {
+        now: new Date(now.getTime() + 2000)
+      }),
+      (error) => error.code === 'CHECKOUT_PRIOR_PAYMENT_UNCERTAIN'
+    )
+
+    assert.equal(sentAttempts.length, 2)
+    assert.deepEqual(
+      sentAttempts.map(({ key }) => key),
+      [providerIdempotencyKey, providerIdempotencyKey]
+    )
+    assert.deepEqual(sentAttempts[1].request, sentAttempts[0].request)
+    assert.equal(state.keyRotations, 0)
+    assert.equal(state.payment.providerOrderId, null)
+  })
+
+  it('never rotates a prepared provider attempt after an HTTP 409', async () => {
+    const seed = makeServiceHarness({
+      payment: { providerIdempotencyKey: null },
+      providerError: new MercadoPagoProviderError(
+        'timeout',
+        'MERCADOPAGO_TIMEOUT',
+        504,
+        { failureKind: 'timeout', retryStrategy: 'same_attempt' }
+      )
+    })
+    await assert.rejects(
+      seed.service.ensureCheckoutOrderForPayment(paymentId, { now }),
+      (error) => error.code === 'MERCADOPAGO_TIMEOUT'
+    )
+
+    const preparedRequest = seed.state.payment.providerRequestSnapshot
+    const { service, state } = makeServiceHarness({
+      payment: {
+        providerRequestSnapshot: preparedRequest,
+        providerAttemptStatus: 'prepared'
+      },
+      providerError: new MercadoPagoProviderError(
+        'provider idempotency conflict',
+        'MERCADOPAGO_IDEMPOTENCY_CONFLICT',
+        502,
+        { failureKind: 'idempotency_conflict', retryStrategy: 'fail_closed' }
+      )
+    })
+
+    await assert.rejects(
+      service.ensureCheckoutOrderForPayment(paymentId, { now }),
+      (error) => error.code === 'MERCADOPAGO_IDEMPOTENCY_CONFLICT'
+    )
+
+    assert.equal(state.payment.providerAttemptStatus, 'conflict')
+    assert.equal(state.keyRotations, 0)
+    assert.equal(state.providerCalls.length, 1)
+  })
+
+  it('records an uncertain attempt and does not attach after losing the lease during provider I/O', async () => {
+    const { service, state } = makeServiceHarness({
+      payment: { providerIdempotencyKey: null }
+    })
+    let assertions = 0
+
+    await assert.rejects(
+      service.ensureCheckoutOrderForPayment(paymentId, {
+        now,
+        async assertCheckoutLeaseOwnership() {
+          assertions += 1
+          if (assertions === 4) {
+            throw new ServiceError('stale lease owner', 'CHECKOUT_LOCK_LOST', 409)
+          }
+        }
+      }),
+      (error) => error.code === 'CHECKOUT_LOCK_LOST'
+    )
+
+    assert.equal(state.providerCalls.length, 1)
+    assert.equal(state.payment.providerOrderId, null)
+    assert.equal(state.payment.providerAttemptStatus, 'uncertain')
+    assert.equal(state.attachAttempts, 0)
   })
 
   it('rotates only the provider key after a definitive rejection and keeps the same local checkout', async () => {

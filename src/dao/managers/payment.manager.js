@@ -141,7 +141,7 @@ class PaymentManager {
         provider: 'mercado_pago',
         normalizedStatus: 'pending',
         providerIdempotencyKey: expectedProviderIdempotencyKey,
-        providerAttemptStatus: { $in: ['rejected', 'conflict'] },
+        providerAttemptStatus: 'rejected',
         providerRequestSnapshot: { $type: 'object' },
         providerOrderId: null
       },

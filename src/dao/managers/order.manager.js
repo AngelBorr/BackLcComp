@@ -68,6 +68,16 @@ class OrderManager {
     return query
   }
 
+  async getFinanciallyUnresolvedByUserId(userId, { session } = {}) {
+    const query = OrderModel.find({
+      userId,
+      status: { $ne: 'paid' }
+    }).sort({ createdAt: -1, _id: -1 }).lean()
+
+    if (session) query.session(session)
+    return query
+  }
+
   async listCustomerPage(
     { userId, status, fulfillmentStatus, page, limit },
     { session } = {}

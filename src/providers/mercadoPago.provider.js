@@ -268,7 +268,7 @@ class MercadoPagoProvider {
         'Mercado Pago rechazó la clave de idempotencia',
         'MERCADOPAGO_IDEMPOTENCY_CONFLICT',
         502,
-        { failureKind: 'idempotency_conflict', retryStrategy: 'new_attempt' }
+        { failureKind: 'idempotency_conflict', retryStrategy: 'fail_closed' }
       )
     }
 
@@ -346,7 +346,6 @@ class MercadoPagoProvider {
             502
           )
         }
-
       }
 
       if (!response.ok) {

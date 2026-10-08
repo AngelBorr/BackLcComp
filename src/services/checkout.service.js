@@ -7,6 +7,8 @@ import CommercePricingService from './service.commercePricing.js'
 import ExchangeRateService from './exchangeRate.service.js'
 import OrderService from './order.service.js'
 import PaymentService from './payment.service.js'
+import CheckoutFinancialGuardService from './checkoutFinancialGuard.service.js'
+import CheckoutLeaseService from './checkoutLease.service.js'
 import ProductUnitService from './productUnit.service.js'
 import { ServiceError } from './service.products.js'
 import { log, error as logError, secureLog } from '../utils/logger.js'
@@ -40,7 +42,9 @@ class CheckoutService {
     exchangeRateService = ExchangeRateService,
     orderService = OrderService,
     productUnitService = ProductUnitService,
-    paymentService = PaymentService
+    paymentService = PaymentService,
+    checkoutFinancialGuardService = CheckoutFinancialGuardService,
+    checkoutLeaseService = CheckoutLeaseService
   } = {}) {
     this.mongoose = mongooseInstance
     this.orders = orderManager
@@ -51,6 +55,8 @@ class CheckoutService {
     this.orderService = orderService
     this.productUnits = productUnitService
     this.paymentService = paymentService
+    this.financialGuard = checkoutFinancialGuardService
+    this.checkoutLeases = checkoutLeaseService
   }
 
   #isDuplicateKeyError(error) {
@@ -203,7 +209,8 @@ class CheckoutService {
         id: String(order._id),
         orderNumber: order.orderNumber,
         status: order.status,
-        reservationExpiresAt: dateToIsoString(order.reservationExpiresAt)
+        reservationExpiresAt: dateToIsoString(order.reservationExpiresAt),
+        attentionReason: order.attentionReason || ''
       },
       items: items.map((itemDocument) => {
         const item = toPlainObject(itemDocument)
@@ -267,8 +274,20 @@ class CheckoutService {
     return this.#toCheckoutDto({ order, items, payment, isIdempotent: true })
   }
 
-  async createCheckout(input, { now = new Date() } = {}) {
+  async createCheckout(
+    input,
+    {
+      now = new Date(),
+      checkoutLease = null,
+      assertCheckoutLeaseOwnership = null
+    } = {}
+  ) {
     const normalized = this.#normalizeInput(input)
+    const assertLeaseOwnership = typeof assertCheckoutLeaseOwnership === 'function'
+      ? assertCheckoutLeaseOwnership
+      : checkoutLease
+        ? () => this.checkoutLeases.assertOwnership(checkoutLease)
+        : null
 
     log('🛒 CheckoutService → iniciando checkout transaccional')
     secureLog('🛒 CheckoutService inicio', {
@@ -276,8 +295,22 @@ class CheckoutService {
       lineCount: normalized.items.length
     })
 
+    if (assertLeaseOwnership) await assertLeaseOwnership()
+
     const existing = await this.#loadExistingCheckout(normalized)
-    if (existing) return existing
+    if (existing) {
+      await this.financialGuard.assertCanContinueCheckout(
+        normalized.userId,
+        existing.order.id,
+        { now, reconcile: false }
+      )
+      return existing
+    }
+
+    await this.financialGuard.assertCanCreateCheckout(normalized.userId, {
+      now,
+      reconcile: true
+    })
 
     await this.#preflight(normalized)
 
@@ -292,17 +325,34 @@ class CheckoutService {
     const reservationExpiresAt = new Date(
       reservationCreatedAt.getTime() + RESERVATION_DURATION_MS
     )
+
+    if (assertLeaseOwnership) await assertLeaseOwnership()
+
     const session = await this.mongoose.startSession()
     let checkoutResult
+    let transactionCommitted = false
 
     try {
       await session.withTransaction(async () => {
         const transactionExisting = await this.#loadExistingCheckout(normalized, { session })
 
         if (transactionExisting) {
+          await this.financialGuard.assertCanContinueCheckout(
+            normalized.userId,
+            transactionExisting.order.id,
+            { now: reservationCreatedAt, session, reconcile: false }
+          )
           checkoutResult = transactionExisting
           return
         }
+
+        await this.financialGuard.assertCanCreateCheckout(normalized.userId, {
+          now: reservationCreatedAt,
+          session,
+          reconcile: false
+        })
+
+        if (assertLeaseOwnership) await assertLeaseOwnership()
 
         const userContext = await this.pricing.getAuthoritativeUserContext(normalized.userId, {
           session
@@ -345,6 +395,9 @@ class CheckoutService {
           payment
         })
       }, TRANSACTION_OPTIONS)
+      transactionCommitted = true
+
+      if (assertLeaseOwnership) await assertLeaseOwnership()
 
       secureLog('✅ CheckoutService checkout confirmado', {
         userId: normalized.userId,
@@ -357,7 +410,12 @@ class CheckoutService {
       return checkoutResult
     } catch (error) {
       const reasonCode = error?.code || 'CHECKOUT_FAILED'
-      logError('❌ CheckoutService rollback', { code: reasonCode })
+      logError(
+        transactionCommitted
+          ? 'CheckoutService post-commit fence error'
+          : '❌ CheckoutService rollback',
+        { code: reasonCode }
+      )
 
       if (this.#isDuplicateKeyError(error) || reasonCode === 'CHECKOUT_IDEMPOTENCY_CONFLICT') {
         const idempotentResult = await this.#loadExistingCheckout(normalized)

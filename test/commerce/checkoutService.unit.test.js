@@ -54,6 +54,7 @@ const makeHarness = (overrides = {}) => {
     sessionStarts: 0,
     sessionEnds: 0,
     transactionOptions: null,
+    financialGuardCalls: [],
     committed: 0,
     aborted: 0
   }
@@ -245,6 +246,23 @@ const makeHarness = (overrides = {}) => {
       return payment
     }
   }
+  const checkoutFinancialGuardService = {
+    async assertCanCreateCheckout(requestedUserId, options) {
+      state.financialGuardCalls.push({ userId: requestedUserId, options })
+      if (config.financialError) throw config.financialError
+      return { allowed: true, blocker: null }
+    },
+    async assertCanContinueCheckout(requestedUserId, checkoutId, options) {
+      state.financialGuardCalls.push({
+        userId: requestedUserId,
+        checkoutId,
+        options,
+        continuation: true
+      })
+      if (config.financialError) throw config.financialError
+      return { allowed: true, blocker: null }
+    }
+  }
   const service = new CheckoutService({
     mongooseInstance,
     orderManager,
@@ -254,7 +272,8 @@ const makeHarness = (overrides = {}) => {
     exchangeRateService,
     orderService,
     productUnitService,
-    paymentService
+    paymentService,
+    checkoutFinancialGuardService
   })
 
   return { service, state, session, config }
@@ -350,6 +369,50 @@ describe('CheckoutService transactional orchestration (isolated unit tests)', ()
     assert.equal(state.sessionStarts, 0)
   })
 
+  it('blocks a new idempotency key before pricing, reservations or Payment creation', async () => {
+    const financialError = new ServiceError(
+      'Tu pago ya fue acreditado',
+      'CHECKOUT_BLOCKED_BY_APPROVED_PAYMENT',
+      409
+    )
+    const { service, state } = makeHarness({ financialError })
+
+    await assert.rejects(
+      service.createCheckout(request({
+        idempotencyKey: 'entirely-new-key',
+        items: [{ productId: productA, quantity: 2 }]
+      }), { now: fixedNow }),
+      (error) => error.code === 'CHECKOUT_BLOCKED_BY_APPROVED_PAYMENT'
+    )
+
+    assert.equal(state.bnaCalls, 0)
+    assert.equal(state.orderCalls.length, 0)
+    assert.equal(state.paymentCalls.length, 0)
+    assert.equal(state.reservations.length, 0)
+  })
+
+  it('creates no new commerce records when reconciliation confirms a prior payment', async () => {
+    const financialError = new ServiceError(
+      'Tu pago anterior fue confirmado. No es necesario volver a pagar.',
+      'CHECKOUT_PRIOR_PAYMENT_CONFIRMED',
+      409
+    )
+    const { service, state } = makeHarness({ financialError })
+
+    await assert.rejects(
+      service.createCheckout(request({ idempotencyKey: 'new-key-after-paid' }), {
+        now: fixedNow
+      }),
+      (error) => error.code === 'CHECKOUT_PRIOR_PAYMENT_CONFIRMED'
+    )
+
+    assert.equal(state.bnaCalls, 0)
+    assert.equal(state.sessionStarts, 0)
+    assert.equal(state.orderCalls.length, 0)
+    assert.equal(state.paymentCalls.length, 0)
+    assert.equal(state.reservations.length, 0)
+  })
+
   it('does not open a transaction or write when BNA fails', async () => {
     const { service, state } = makeHarness({
       bnaError: new ServiceError('BNA no disponible', 'BNA_QUOTE_UNAVAILABLE', 503)
@@ -364,6 +427,53 @@ describe('CheckoutService transactional orchestration (isolated unit tests)', ()
     const { service, state } = makeHarness()
     await service.createCheckout(request(), { now: fixedNow })
     assert.ok(state.events.indexOf('bna') < state.events.indexOf('session:start'))
+  })
+
+  it('does not open the transaction when the lease fence is lost after BNA', async () => {
+    const { service, state } = makeHarness()
+    let assertions = 0
+
+    await assert.rejects(
+      service.createCheckout(request(), {
+        now: fixedNow,
+        async assertCheckoutLeaseOwnership() {
+          assertions += 1
+          if (assertions === 2) {
+            throw new ServiceError('Lease perdido', 'CHECKOUT_LOCK_LOST', 409)
+          }
+        }
+      }),
+      (error) => error.code === 'CHECKOUT_LOCK_LOST'
+    )
+
+    assert.equal(state.bnaCalls, 1)
+    assert.equal(state.sessionStarts, 0)
+    assert.equal(state.orderCalls.length, 0)
+    assert.equal(state.reservations.length, 0)
+    assert.equal(state.paymentCalls.length, 0)
+  })
+
+  it('rolls back local writes when the lease fence is lost inside the transaction', async () => {
+    const { service, state } = makeHarness()
+    let assertions = 0
+
+    await assert.rejects(
+      service.createCheckout(request(), {
+        now: fixedNow,
+        async assertCheckoutLeaseOwnership() {
+          assertions += 1
+          if (assertions === 3) {
+            throw new ServiceError('Lease perdido', 'CHECKOUT_LOCK_LOST', 409)
+          }
+        }
+      }),
+      (error) => error.code === 'CHECKOUT_LOCK_LOST'
+    )
+
+    assert.equal(state.aborted, 1)
+    assert.equal(state.orders.size, 0)
+    assert.equal(state.reservations.length, 0)
+    assert.equal(state.payments.size, 0)
   })
 
   it('revalidates the user inside the transaction', async () => {

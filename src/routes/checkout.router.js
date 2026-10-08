@@ -2,6 +2,7 @@ import MyOwnRouter from './router.js'
 import CheckoutController from '../controllers/checkout.controller.js'
 
 const registerCheckoutRoute = (router, controller = CheckoutController) => {
+  router.get('/eligibility', ['USER', 'PREMIUM'], controller.getEligibility)
   router.post('/', ['USER', 'PREMIUM'], controller.create)
 }
 

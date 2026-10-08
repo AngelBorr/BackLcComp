@@ -333,7 +333,15 @@ class MercadoPagoCheckoutService {
       )
     }
 
-    if (['rejected', 'conflict'].includes(current.providerAttemptStatus)) {
+    if (current.providerAttemptStatus === 'conflict') {
+      throw new ServiceError(
+        'Existe un intento anterior de Mercado Pago cuyo resultado no pudo confirmarse',
+        'CHECKOUT_PRIOR_PAYMENT_UNCERTAIN',
+        409
+      )
+    }
+
+    if (current.providerAttemptStatus === 'rejected') {
       const nextProviderIdempotencyKey = this.uuidFactory()
       const nextProviderRequest = this.#buildRequest(order, {
         now: requestedAt,
@@ -355,7 +363,7 @@ class MercadoPagoCheckoutService {
       !current ||
       !providerIdempotencyKey ||
       !request ||
-      ['rejected', 'conflict'].includes(current.providerAttemptStatus)
+      current.providerAttemptStatus === 'rejected'
     ) {
       throw new ServiceError(
         'No se pudo iniciar una nueva tentativa idempotente de Mercado Pago',
@@ -430,15 +438,23 @@ class MercadoPagoCheckoutService {
     }
   }
 
-  async ensureCheckoutOrderForPayment(paymentId, { now = new Date() } = {}) {
+  async ensureCheckoutOrderForPayment(
+    paymentId,
+    { now = new Date(), assertCheckoutLeaseOwnership = null } = {}
+  ) {
     this.#assertPaymentId(paymentId)
     const requestedAt = new Date(now)
+    const assertLeaseOwnership = typeof assertCheckoutLeaseOwnership === 'function'
+      ? assertCheckoutLeaseOwnership
+      : async () => {}
 
     if (Number.isNaN(requestedAt.getTime())) {
       throw new ServiceError('Fecha de operación inválida', 'INVALID_PAYMENT_CHECK_DATE', 400)
     }
 
     log('💳 MercadoPagoCheckoutService → asegurando provider order')
+    await assertLeaseOwnership()
+
     let payment = await this.payments.getById(paymentId)
 
     if (!payment) throw new ServiceError('Pago no encontrado', 'PAYMENT_NOT_FOUND', 404)
@@ -459,13 +475,17 @@ class MercadoPagoCheckoutService {
     }
 
     const storedCheckout = this.#validateStoredCheckout(payment)
-    if (storedCheckout) return storedCheckout
+    if (storedCheckout) {
+      await assertLeaseOwnership()
+      return storedCheckout
+    }
 
     const startedAt = Date.now()
     let attempt
     let providerRequestSent = false
 
     try {
+      await assertLeaseOwnership()
       attempt = await this.#ensureProviderAttempt(
         payment,
         order,
@@ -475,15 +495,21 @@ class MercadoPagoCheckoutService {
       payment = attempt.payment
 
       const concurrentCheckout = this.#validateStoredCheckout(payment)
-      if (concurrentCheckout) return concurrentCheckout
+      if (concurrentCheckout) {
+        await assertLeaseOwnership()
+        return concurrentCheckout
+      }
 
+      await assertLeaseOwnership()
       providerRequestSent = true
       const providerOrder = await this.provider.createCheckoutOrder({
         providerIdempotencyKey: attempt.providerIdempotencyKey,
         request: attempt.request
       })
+      await assertLeaseOwnership()
 
       this.#validateProviderResult(providerOrder, order, orderTotalArs)
+      await assertLeaseOwnership()
 
       const attached = await this.payments.attachProviderOrder(
         payment._id,
@@ -494,6 +520,7 @@ class MercadoPagoCheckoutService {
           providerStatus: providerOrder.status
         }
       )
+      await assertLeaseOwnership()
 
       if (attached) {
         const result = this.#validateStoredCheckout(attached)

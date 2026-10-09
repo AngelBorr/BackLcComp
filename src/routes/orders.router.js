@@ -1,9 +1,19 @@
 import MyOwnRouter from './router.js'
 import OrderStatusController from '../controllers/orderStatus.controller.js'
 import OrderQueryController from '../controllers/orderQuery.controller.js'
+import BuyerPaymentReconciliationController from '../controllers/buyerPaymentReconciliation.controller.js'
 
-const registerOrderRoutes = (router, controller = OrderStatusController) => {
+const registerOrderRoutes = (
+  router,
+  controller = OrderStatusController,
+  reconciliationController = BuyerPaymentReconciliationController
+) => {
   router.get('/:orderNumber/status', ['USER', 'PREMIUM'], controller.getStatus)
+  router.post(
+    '/:orderNumber/reconcile-payment',
+    ['USER', 'PREMIUM'],
+    reconciliationController.reconcile
+  )
 }
 
 const registerOrderQueryRoutes = (router, controller = OrderQueryController) => {

@@ -71,6 +71,28 @@ class PaymentManager {
     ).lean()
   }
 
+  async claimBuyerProviderCheck(
+    paymentId,
+    { checkedAt, cooldownThreshold },
+    { session } = {}
+  ) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        provider: 'mercado_pago',
+        normalizedStatus: 'pending',
+        providerOrderId: { $type: 'string', $ne: '' },
+        $or: [
+          { lastProviderCheckAt: null },
+          { lastProviderCheckAt: { $exists: false } },
+          { lastProviderCheckAt: { $lte: cooldownThreshold } }
+        ]
+      },
+      { $set: { lastProviderCheckAt: checkedAt } },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
   async assignProviderIdempotencyKeyIfMissing(paymentId, provider, providerIdempotencyKey) {
     return PaymentModel.findOneAndUpdate(
       {

@@ -1,3 +1,4 @@
+/* eslint-env mocha */
 import assert from 'node:assert/strict'
 import express from 'express'
 import request from 'supertest'
@@ -69,7 +70,6 @@ const createControllerApp = ({ user, service }) => {
   })
   app.get('/api/orders/:orderNumber/status', controller.getStatus)
   app.use((error, _req, res, _next) => {
-    void _next
     const mapped = mapServiceErrorToHttp(error)
     res.status(mapped.status).json({ status: 'error', message: mapped.message })
   })
@@ -79,16 +79,29 @@ const createControllerApp = ({ user, service }) => {
 
 describe('GET /api/orders/:orderNumber/status (isolated unit tests)', () => {
   it('registers an authenticated buyer route for USER and PREMIUM only', () => {
-    let registered
+    const registered = []
     registerOrderRoutes({
       get(path, policies, handler) {
-        registered = { path, policies, handler }
+        registered.push({ method: 'get', path, policies, handler })
+      },
+      post(path, policies, handler) {
+        registered.push({ method: 'post', path, policies, handler })
       }
-    }, { getStatus() {} })
+    }, { getStatus() {} }, { reconcile() {} })
 
-    assert.equal(registered.path, '/:orderNumber/status')
-    assert.deepEqual(registered.policies, ['USER', 'PREMIUM'])
-    assert.equal(typeof registered.handler, 'function')
+    assert.deepEqual(registered.map(({ method, path, policies }) => ({ method, path, policies })), [
+      {
+        method: 'get',
+        path: '/:orderNumber/status',
+        policies: ['USER', 'PREMIUM']
+      },
+      {
+        method: 'post',
+        path: '/:orderNumber/reconcile-payment',
+        policies: ['USER', 'PREMIUM']
+      }
+    ])
+    assert.equal(registered.every(({ handler }) => typeof handler === 'function'), true)
   })
 
   for (const role of ['USER', 'PREMIUM']) {

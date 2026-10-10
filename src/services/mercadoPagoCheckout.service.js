@@ -18,6 +18,8 @@ const RETURN_PATHS = Object.freeze({
   pendingUrl: '/checkout/pending'
 })
 
+const MERCADOPAGO_ORDER_EXPIRATION = 'PT6H'
+
 const normalizeReturnBaseUrl = (value) => {
   let url
 
@@ -258,6 +260,7 @@ class MercadoPagoCheckoutService {
       type: 'online',
       processing_mode: 'manual',
       total_amount: totalArs,
+      expiration_time: MERCADOPAGO_ORDER_EXPIRATION,
       external_reference: orderNumber,
       payer: {
         email: order.buyerSnapshot.email,
@@ -587,6 +590,7 @@ class MercadoPagoCheckoutService {
 }
 
 export {
+  MERCADOPAGO_ORDER_EXPIRATION,
   MercadoPagoCheckoutService,
   RETURN_PATHS,
   normalizeReturnBaseUrl

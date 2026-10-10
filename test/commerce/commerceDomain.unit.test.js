@@ -92,6 +92,25 @@ describe('Commerce domain foundation (isolated unit tests)', () => {
           fields.provider === 1 && fields.providerPaymentId === 1 && options.unique === true
       )
     )
+    assert.ok(orderIndexes.some(([fields]) => (
+      fields.status === 1 && fields.reservationExpiresAt === 1 && fields._id === 1
+    )))
+    assert.ok(orderIndexes.some(([fields]) => (
+      fields.status === 1 &&
+      fields.reconciliationNextAt === 1 &&
+      fields.reservationExpiresAt === 1 &&
+      fields._id === 1
+    )))
+    assert.ok(paymentIndexes.some(([fields]) => (
+      fields.orderId === 1 && fields.createdAt === -1 && fields._id === -1
+    )))
+    assert.ok(paymentIndexes.some(([fields, options]) => (
+      fields.provider === 1 &&
+      fields.providerCancellationIdempotencyKey === 1 &&
+      options.unique === true &&
+      options.partialFilterExpression?.providerCancellationIdempotencyKey?.$type === 'string' &&
+      options.partialFilterExpression?.providerCancellationIdempotencyKey?.$gt === ''
+    )))
     assert.ok(
       eventIndexes.some(
         ([fields, options]) =>
@@ -127,8 +146,17 @@ describe('Commerce domain foundation (isolated unit tests)', () => {
     await event.validate()
 
     assert.equal(order.status, 'pending_payment')
+    assert.equal(order.reconciliationNextAt, null)
+    assert.equal(order.reconciliationLeaseOwner, null)
+    assert.equal(order.reconciliationLeaseUntil, null)
+    assert.equal(order.reconciliationAttempts, 0)
+    assert.equal(order.reconciliationFailures, 0)
     assert.equal(payment.normalizedStatus, 'pending')
     assert.equal(payment.providerAttemptStatus, null)
+    assert.equal(payment.providerCancellationIdempotencyKey, null)
+    assert.equal(payment.providerCancellationStatus, null)
+    assert.equal(payment.providerCancellationAttemptedAt, null)
+    assert.equal(payment.providerCancellationCompletedAt, null)
     assert.equal(event.processingStatus, 'received')
   })
 
@@ -154,6 +182,81 @@ describe('Commerce domain foundation (isolated unit tests)', () => {
       new PaymentModel({ ...paymentData, providerAttemptStatus: 'arbitrary' }).validate(),
       (error) => error?.errors?.providerAttemptStatus?.kind === 'enum'
     )
+  })
+
+  it('accepts only the explicit provider cancellation attempt statuses', async () => {
+    const paymentData = {
+      orderId,
+      externalReference: 'LC-2026-000010',
+      amountArs: '150000.00'
+    }
+
+    for (const providerCancellationStatus of [
+      null,
+      'prepared',
+      'uncertain',
+      'succeeded',
+      'rejected'
+    ]) {
+      await new PaymentModel({ ...paymentData, providerCancellationStatus }).validate()
+    }
+
+    await assert.rejects(
+      new PaymentModel({ ...paymentData, providerCancellationStatus: 'conflict' }).validate(),
+      (error) => error?.errors?.providerCancellationStatus?.kind === 'enum'
+    )
+  })
+
+  it('rejects an empty provider cancellation idempotency key without breaking null', async () => {
+    const paymentData = {
+      orderId,
+      externalReference: 'LC-2026-000010',
+      amountArs: '150000.00'
+    }
+
+    await new PaymentModel({
+      ...paymentData,
+      providerCancellationIdempotencyKey: null
+    }).validate()
+
+    await assert.rejects(
+      new PaymentModel({
+        ...paymentData,
+        providerCancellationIdempotencyKey: '   '
+      }).validate(),
+      (error) => error?.errors?.providerCancellationIdempotencyKey?.kind === 'user defined'
+    )
+  })
+
+  it('prepares a cancellation key once through a pending-Payment CAS', async () => {
+    const payments = new PaymentManager()
+    const key = 'cancel-123e4567-e89b-42d3-a456-426614174000'
+    const providerOrderId = 'ORD01TESTCANCELCAS'
+    let captured
+
+    stub(PaymentModel, 'findOneAndUpdate', (filter, update, options) => {
+      captured = { filter, update, options }
+      return queryResult({
+        _id: paymentId,
+        providerOrderId,
+        providerCancellationIdempotencyKey: key,
+        providerCancellationStatus: 'prepared'
+      })
+    })
+
+    const payment = await payments.prepareProviderCancellationIfMissing(
+      paymentId,
+      providerOrderId,
+      key
+    )
+
+    assert.equal(captured.filter.normalizedStatus, 'pending')
+    assert.equal(captured.filter.providerOrderId, providerOrderId)
+    assert.equal(captured.filter.$and.length, 2)
+    assert.equal(captured.update.$set.providerCancellationIdempotencyKey, key)
+    assert.equal(captured.update.$set.providerCancellationStatus, 'prepared')
+    assert.equal(captured.options.runValidators, true)
+    assert.equal(payment.providerCancellationStatus, 'prepared')
   })
 
   it('marks the provider attempt prepared only with its request snapshot', async () => {

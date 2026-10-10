@@ -240,7 +240,7 @@ class MercadoPagoProvider {
     }
   }
 
-  #mapHttpError(status, payload) {
+  #mapHttpError(status, payload, operation) {
     const providerCode = String(
       payload?.code || payload?.error || payload?.cause?.[0]?.code || ''
     ).toLowerCase()
@@ -260,6 +260,15 @@ class MercadoPagoProvider {
         'MERCADOPAGO_RATE_LIMIT',
         503,
         { failureKind: 'rate_limit' }
+      )
+    }
+
+    if (operation === 'cancel' && status === 409) {
+      return new MercadoPagoProviderError(
+        'Mercado Pago no pudo confirmar la cancelacion de la order',
+        'MERCADOPAGO_CANCELLATION_CONFLICT',
+        502,
+        { failureKind: 'state_conflict', retryStrategy: 'same_attempt' }
       )
     }
 
@@ -290,6 +299,15 @@ class MercadoPagoProvider {
       )
     }
 
+    if (operation === 'cancel') {
+      return new MercadoPagoProviderError(
+        'Mercado Pago rechazo la cancelacion de la order',
+        'MERCADOPAGO_CANCELLATION_REJECTED',
+        502,
+        { failureKind: 'definitive_rejection', retryStrategy: 'fail_closed' }
+      )
+    }
+
     return new MercadoPagoProviderError(
       'Mercado Pago rechazó la creación de la order',
       'MERCADOPAGO_ORDER_REJECTED',
@@ -298,7 +316,7 @@ class MercadoPagoProvider {
     )
   }
 
-  async #request(path, { method = 'GET', idempotencyKey, body } = {}) {
+  async #request(path, { method = 'GET', idempotencyKey, body, operation = 'read' } = {}) {
     this.#assertConfigured()
 
     if (method === 'POST') {
@@ -366,7 +384,7 @@ class MercadoPagoProvider {
           }
         }
 
-        throw this.#mapHttpError(response.status, payload)
+        throw this.#mapHttpError(response.status, payload, operation)
       }
       return payload
     } catch (error) {
@@ -396,7 +414,8 @@ class MercadoPagoProvider {
     const payload = await this.#request('/v1/orders', {
       method: 'POST',
       idempotencyKey: providerIdempotencyKey,
-      body: request
+      body: request,
+      operation: 'create'
     })
 
     return normalizeProviderOrder(payload, { requireCheckoutUrl: true })
@@ -414,6 +433,29 @@ class MercadoPagoProvider {
     }
 
     const payload = await this.#request(`/v1/orders/${encodeURIComponent(normalizedId)}`)
+    return normalizeProviderOrder(payload, { includeReconciliation: true })
+  }
+
+  async cancelOrder(providerOrderId, { idempotencyKey } = {}) {
+    const normalizedId = String(providerOrderId || '').trim()
+
+    if (!/^ORD[A-Za-z0-9]{3,197}$/.test(normalizedId)) {
+      throw new MercadoPagoProviderError(
+        'ID de order de Mercado Pago invalido',
+        'MERCADOPAGO_INVALID_RESPONSE',
+        400
+      )
+    }
+
+    const payload = await this.#request(
+      `/v1/orders/${encodeURIComponent(normalizedId)}/cancel`,
+      {
+        method: 'POST',
+        idempotencyKey,
+        operation: 'cancel'
+      }
+    )
+
     return normalizeProviderOrder(payload, { includeReconciliation: true })
   }
 }

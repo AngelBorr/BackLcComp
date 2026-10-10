@@ -8,6 +8,10 @@ import MercadoPagoProvider, {
 import { ServiceError } from './service.products.js'
 import { toMinorUnits } from '../utils/commerceMoney.js'
 import { error as logError, secureLog } from '../utils/logger.js'
+import {
+  REMOTE_ORDER_CLASSIFICATIONS,
+  classifyRemoteOrder
+} from './mercadoPagoOrderClassification.service.js'
 
 const TRANSACTION_OPTIONS = Object.freeze({
   readConcern: { level: 'snapshot' },
@@ -288,11 +292,15 @@ class MercadoPagoReconciliationService {
     }
 
     context = await this.#associateEarlyWebhook(context, providerOrder, session)
-    const isRefund =
-      providerOrder.status === 'refunded' ||
-      ['refunded', 'partially_refunded'].includes(providerOrder.statusDetail)
+    const remoteClassification = classifyRemoteOrder(providerOrder, {
+      expectedProviderOrderId: asText(context.payment.providerOrderId) ||
+        providerOrder.providerOrderId,
+      expectedExternalReference: context.order.orderNumber,
+      expectedTotalAmount: context.order.totals.totalArs,
+      expectedCurrency: 'ARS'
+    })
 
-    if (isRefund) {
+    if (remoteClassification === REMOTE_ORDER_CLASSIFICATIONS.REFUNDED) {
       return this.#markRequiresAttention(
         context,
         providerOrder,
@@ -302,10 +310,17 @@ class MercadoPagoReconciliationService {
       )
     }
 
-    const isApproved =
-      providerOrder.status === 'processed' && providerOrder.statusDetail === 'accredited'
+    if (remoteClassification === REMOTE_ORDER_CLASSIFICATIONS.INCONSISTENT) {
+      return this.#markRequiresAttention(
+        context,
+        providerOrder,
+        'PROVIDER_ORDER_INCONSISTENT',
+        now,
+        session
+      )
+    }
 
-    if (!isApproved) {
+    if (remoteClassification !== REMOTE_ORDER_CLASSIFICATIONS.APPROVED) {
       const payment = await this.#observePayment(context.payment, providerOrder, now, session)
       return {
         outcome: 'pending',

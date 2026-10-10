@@ -172,6 +172,11 @@ const orderSchema = new mongoose.Schema(
       immutable: true
     },
     reservationExpiresAt: { type: Date, default: null },
+    reconciliationNextAt: { type: Date, default: null },
+    reconciliationLeaseOwner: { type: String, trim: true, maxlength: 128, default: null },
+    reconciliationLeaseUntil: { type: Date, default: null },
+    reconciliationAttempts: { type: Number, min: 0, default: 0 },
+    reconciliationFailures: { type: Number, min: 0, default: 0 },
     paidAt: { type: Date, default: null },
     cancelledAt: { type: Date, default: null },
     expiredAt: { type: Date, default: null },
@@ -204,6 +209,13 @@ orderSchema.index(
   }
 )
 orderSchema.index({ status: 1 })
+orderSchema.index({ status: 1, reservationExpiresAt: 1, _id: 1 })
+orderSchema.index({
+  status: 1,
+  reconciliationNextAt: 1,
+  reservationExpiresAt: 1,
+  _id: 1
+})
 orderSchema.index({ fulfillmentStatus: 1, createdAt: -1 })
 
 const OrderModel = mongoose.model('orders', orderSchema)

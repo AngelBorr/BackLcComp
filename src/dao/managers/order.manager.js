@@ -31,6 +31,56 @@ const combineFilters = (...filters) => {
   return { $and: present }
 }
 
+const reconciliationDueFilter = (now) => ({
+  $and: [
+    {
+      $or: [
+        { reconciliationNextAt: { $lte: now } },
+        { reconciliationNextAt: null },
+        { reconciliationNextAt: { $exists: false } }
+      ]
+    },
+    {
+      $or: [
+        { reconciliationLeaseUntil: { $lte: now } },
+        { reconciliationLeaseUntil: null },
+        { reconciliationLeaseUntil: { $exists: false } }
+      ]
+    }
+  ]
+})
+
+const reconciliationCursorFilter = (afterCursor) => {
+  if (!afterCursor) return null
+
+  const cursorId = afterCursor._id || afterCursor.id
+  if (!cursorId) throw new TypeError('afterCursor requiere _id')
+
+  if (
+    afterCursor.reservationExpiresAt === null ||
+    afterCursor.reservationExpiresAt === undefined
+  ) {
+    return {
+      $or: [
+        { reservationExpiresAt: null, _id: { $gt: cursorId } },
+        { reservationExpiresAt: { $type: 'date' } }
+      ]
+    }
+  }
+
+  const reservationExpiresAt = new Date(afterCursor.reservationExpiresAt)
+  if (Number.isNaN(reservationExpiresAt.getTime())) {
+    throw new TypeError('afterCursor.reservationExpiresAt es invalido')
+  }
+
+  return {
+    $or: [
+      { reservationExpiresAt: { $gt: reservationExpiresAt } },
+      { reservationExpiresAt, _id: { $gt: cursorId } }
+    ]
+  }
+}
+
 class OrderManager {
   async create(data, { session } = {}) {
     const order = new OrderModel(data)
@@ -115,6 +165,107 @@ class OrderManager {
     const query = OrderModel.find(filter).sort({ createdAt: -1 }).lean()
     if (session) query.session(session)
     return query
+  }
+
+  async findReconciliationCandidates({ now, limit, afterCursor = null }) {
+    if (!Number.isInteger(limit) || limit <= 0) {
+      throw new TypeError('limit es obligatorio y debe ser un entero positivo')
+    }
+
+    const filter = combineFilters(
+      { status: 'pending_payment' },
+      reconciliationDueFilter(now),
+      reconciliationCursorFilter(afterCursor)
+    )
+
+    return OrderModel.find(filter)
+      .sort({ reservationExpiresAt: 1, _id: 1 })
+      .limit(limit)
+      .lean()
+  }
+
+  async claimForReconciliation({ orderId, ownerToken, now, leaseUntil }) {
+    return OrderModel.findOneAndUpdate(
+      combineFilters(
+        { _id: orderId, status: 'pending_payment' },
+        reconciliationDueFilter(now)
+      ),
+      {
+        $set: {
+          reconciliationLeaseOwner: ownerToken,
+          reconciliationLeaseUntil: leaseUntil
+        },
+        $inc: { reconciliationAttempts: 1 }
+      },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
+  async renewReconciliationClaim({ orderId, ownerToken, now, leaseUntil }) {
+    return OrderModel.findOneAndUpdate(
+      {
+        _id: orderId,
+        status: 'pending_payment',
+        reconciliationLeaseOwner: ownerToken,
+        reconciliationLeaseUntil: { $gt: now }
+      },
+      { $set: { reconciliationLeaseUntil: leaseUntil } },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
+  async assertReconciliationOwnership({ orderId, ownerToken, now }, { session } = {}) {
+    const query = OrderModel.findOne({
+      _id: orderId,
+      status: 'pending_payment',
+      reconciliationLeaseOwner: ownerToken,
+      reconciliationLeaseUntil: { $gt: now }
+    }).lean()
+
+    if (session) query.session(session)
+    return query
+  }
+
+  async releaseReconciliationClaim({ orderId, ownerToken }) {
+    return OrderModel.findOneAndUpdate(
+      { _id: orderId, reconciliationLeaseOwner: ownerToken },
+      {
+        $set: {
+          reconciliationLeaseOwner: null,
+          reconciliationLeaseUntil: null
+        }
+      },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
+  async scheduleNextReconciliation({ orderId, ownerToken, now, nextAt }) {
+    return OrderModel.findOneAndUpdate(
+      {
+        _id: orderId,
+        status: 'pending_payment',
+        reconciliationLeaseOwner: ownerToken,
+        reconciliationLeaseUntil: { $gt: now }
+      },
+      { $set: { reconciliationNextAt: nextAt } },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
+  async markReconciliationFailure({ orderId, ownerToken, now, nextAt }) {
+    return OrderModel.findOneAndUpdate(
+      {
+        _id: orderId,
+        status: 'pending_payment',
+        reconciliationLeaseOwner: ownerToken,
+        reconciliationLeaseUntil: { $gt: now }
+      },
+      {
+        $set: { reconciliationNextAt: nextAt },
+        $inc: { reconciliationFailures: 1 }
+      },
+      { new: true, runValidators: true }
+    ).lean()
   }
 
   async listAdminPage(
@@ -302,5 +453,5 @@ class OrderManager {
   }
 }
 
-export { OrderManager }
+export { OrderManager, reconciliationCursorFilter }
 export default new OrderManager()

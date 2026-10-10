@@ -609,6 +609,92 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.equal(result.checkoutUrl, null)
   })
 
+  it('cancels through POST /v1/orders/{id}/cancel with an isolated key and no body', async () => {
+    let captured
+    const cancellationKey = 'cancel-123e4567-e89b-42d3-a456-426614174000'
+    const provider = makeProvider(async (url, options) => {
+      captured = { url, options }
+      return jsonResponse(providerPayload({
+        status: 'canceled',
+        checkout_url: undefined,
+        status_detail: 'canceled',
+        total_paid_amount: '0.00',
+        currency: 'ARS',
+        transactions: { payments: [] }
+      }), { status: 200 })
+    })
+
+    const result = await provider.cancelOrder(providerOrderId, {
+      idempotencyKey: cancellationKey
+    })
+
+    assert.equal(
+      captured.url,
+      `${MERCADOPAGO_API_URL}/v1/orders/${providerOrderId}/cancel`
+    )
+    assert.equal(captured.options.method, 'POST')
+    assert.equal(captured.options.headers.Authorization, 'Bearer test-access-token')
+    assert.equal(captured.options.headers['X-Idempotency-Key'], cancellationKey)
+    assert.equal(Object.hasOwn(captured.options, 'body'), false)
+    assert.deepEqual(result, {
+      providerOrderId,
+      status: 'canceled',
+      checkoutUrl: null,
+      externalReference: 'LC-2026-000001',
+      totalAmount: '154500.00',
+      createdAt: '2026-09-29T12:00:01.000Z',
+      statusDetail: 'canceled',
+      totalPaidAmount: '0.00',
+      currency: 'ARS',
+      lastUpdatedDate: null,
+      payments: []
+    })
+  })
+
+  it('keeps cancellation HTTP 409 ambiguous and sanitizes its logs', async () => {
+    const logged = []
+    const accessToken = 'cancel-sensitive-access-token'
+    const cancellationKey = 'cancel-sensitive-idempotency-key'
+    const provider = makeProvider(
+      async () => jsonResponse({
+        code: 'cannot_cancel_order',
+        message: `Bearer ${accessToken} ${cancellationKey}`
+      }, { status: 409 }),
+      { accessToken, errorLogger: (...args) => logged.push(args) }
+    )
+
+    await assert.rejects(
+      provider.cancelOrder(providerOrderId, { idempotencyKey: cancellationKey }),
+      (error) => (
+        error.code === 'MERCADOPAGO_CANCELLATION_CONFLICT' &&
+        error.failureKind === 'state_conflict' &&
+        error.retryStrategy === 'same_attempt'
+      )
+    )
+
+    const serialized = JSON.stringify(logged)
+    assert.equal(serialized.includes(accessToken), false)
+    assert.equal(serialized.includes(cancellationKey), false)
+  })
+
+  it('rejects invalid cancellation identifiers before provider I/O', async () => {
+    let calls = 0
+    const provider = makeProvider(async () => {
+      calls += 1
+      return jsonResponse(providerPayload())
+    })
+
+    await assert.rejects(
+      provider.cancelOrder('invalid/order', { idempotencyKey: 'cancel-key' }),
+      (error) => error.code === 'MERCADOPAGO_INVALID_RESPONSE'
+    )
+    await assert.rejects(
+      provider.cancelOrder(providerOrderId, { idempotencyKey: '' }),
+      (error) => error.code === 'MERCADOPAGO_IDEMPOTENCY_CONFLICT'
+    )
+    assert.equal(calls, 0)
+  })
+
   it('keeps legacy preferenceId and declares unique partial Orders API indexes', () => {
     const indexes = PaymentModel.schema.indexes()
 
@@ -712,12 +798,13 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     })
   })
 
-  it('omits provider expiration without changing local reservation or request authority', async () => {
+  it('persists PT6H provider expiration without changing the local reservation snapshot', async () => {
     const { service, state } = makeServiceHarness()
     await service.ensureCheckoutOrderForPayment(paymentId, { now })
     const request = state.providerCalls[0].request
 
-    assert.equal(Object.hasOwn(request, 'expiration_time'), false)
+    assert.equal(request.expiration_time, 'PT6H')
+    assert.equal(state.payment.providerRequestSnapshot.expiration_time, 'PT6H')
     assert.equal(request.config.online.available_from, now.toISOString())
     assert.equal(request.total_amount, '154500.00')
     assert.deepEqual(request.items, [{
@@ -730,6 +817,23 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.equal(state.order._id, orderId)
     assert.equal(state.payment._id, paymentId)
     assert.equal(state.payment.providerIdempotencyKey, providerIdempotencyKey)
+  })
+
+  it('serializes PT6H into the final HTTP request body', async () => {
+    const { service, state } = makeServiceHarness()
+    await service.ensureCheckoutOrderForPayment(paymentId, { now })
+    let capturedBody
+    const httpProvider = makeProvider(async (_url, options) => {
+      capturedBody = JSON.parse(options.body)
+      return jsonResponse(providerPayload())
+    })
+
+    await httpProvider.createCheckoutOrder({
+      providerIdempotencyKey,
+      request: state.payment.providerRequestSnapshot
+    })
+
+    assert.equal(capturedBody.expiration_time, 'PT6H')
   })
 
   it('rejects localhost return configuration before calling Mercado Pago', async () => {
@@ -942,10 +1046,64 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.deepEqual(state.providerKeys, [providerIdempotencyKey, providerIdempotencyKey])
     assert.deepEqual(sentRequests[1], sentRequests[0])
     assert.equal(sentRequests[0].config.online.available_from, now.toISOString())
-    assert.equal(Object.hasOwn(sentRequests[0], 'expiration_time'), false)
+    assert.equal(sentRequests[0].expiration_time, 'PT6H')
     assert.equal(state.requestPreparations, 1)
     assert.equal(state.keyRotations, 0)
     assert.equal(state.payment.providerAttemptStatus, 'succeeded')
+  })
+
+  it('reuses a legacy stored snapshot without adding expiration_time', async () => {
+    const legacyRequest = {
+      type: 'online',
+      processing_mode: 'manual',
+      total_amount: '154500.00',
+      external_reference: 'LC-2026-000001'
+    }
+    const { service, state } = makeServiceHarness({
+      payment: {
+        providerRequestSnapshot: structuredClone(legacyRequest),
+        providerAttemptStatus: 'uncertain'
+      }
+    })
+
+    await service.ensureCheckoutOrderForPayment(paymentId, {
+      now: new Date(now.getTime() + 60 * 1000)
+    })
+
+    assert.deepEqual(state.providerCalls[0].request, legacyRequest)
+    assert.deepEqual(state.payment.providerRequestSnapshot, legacyRequest)
+    assert.equal(Object.hasOwn(state.providerCalls[0].request, 'expiration_time'), false)
+    assert.equal(state.requestPreparations, 0)
+    assert.equal(state.keyRotations, 0)
+  })
+
+  it('serializes a legacy retry body without adding expiration_time', async () => {
+    const legacyRequest = {
+      type: 'online',
+      processing_mode: 'manual',
+      total_amount: '154500.00',
+      external_reference: 'LC-2026-000001'
+    }
+    const { service, state } = makeServiceHarness({
+      payment: {
+        providerRequestSnapshot: structuredClone(legacyRequest),
+        providerAttemptStatus: 'uncertain'
+      }
+    })
+    await service.ensureCheckoutOrderForPayment(paymentId, { now })
+    let capturedBody
+    const httpProvider = makeProvider(async (_url, options) => {
+      capturedBody = JSON.parse(options.body)
+      return jsonResponse(providerPayload())
+    })
+
+    await httpProvider.createCheckoutOrder({
+      providerIdempotencyKey,
+      request: state.providerCalls[0].request
+    })
+
+    assert.deepEqual(capturedBody, legacyRequest)
+    assert.equal(Object.hasOwn(capturedBody, 'expiration_time'), false)
   })
 
   it('keeps the same provider attempt fail-closed after timeout followed by HTTP 409', async () => {
@@ -1121,7 +1279,7 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.deepEqual(sentAttempts.map(({ key }) => key), [providerIdempotencyKey, nextProviderKey])
     assert.notDeepEqual(sentAttempts[1].request, sentAttempts[0].request)
     assert.equal(sentAttempts[1].request.config.online.available_from, retryNow.toISOString())
-    assert.equal(Object.hasOwn(sentAttempts[1].request, 'expiration_time'), false)
+    assert.equal(sentAttempts[1].request.expiration_time, 'PT6H')
     assert.equal(sentAttempts[1].request.external_reference, state.order.orderNumber)
     assert.equal(state.payment._id, initialPaymentId)
     assert.equal(state.order._id, initialOrderId)

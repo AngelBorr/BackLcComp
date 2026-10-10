@@ -19,6 +19,14 @@ export const PROVIDER_ATTEMPT_STATUSES = [
   'succeeded'
 ]
 
+export const PROVIDER_CANCELLATION_STATUSES = [
+  null,
+  'prepared',
+  'uncertain',
+  'succeeded',
+  'rejected'
+]
+
 const paymentSchema = new mongoose.Schema(
   {
     orderId: {
@@ -41,6 +49,23 @@ const paymentSchema = new mongoose.Schema(
       enum: PROVIDER_ATTEMPT_STATUSES,
       default: null
     },
+    providerCancellationIdempotencyKey: {
+      type: String,
+      trim: true,
+      maxlength: 128,
+      validate: {
+        validator: (value) => value === null || value === undefined || value.length > 0,
+        message: 'La clave de idempotencia de cancelacion no puede estar vacia'
+      },
+      default: null
+    },
+    providerCancellationStatus: {
+      type: String,
+      enum: PROVIDER_CANCELLATION_STATUSES,
+      default: null
+    },
+    providerCancellationAttemptedAt: { type: Date, default: null },
+    providerCancellationCompletedAt: { type: Date, default: null },
     providerPaymentId: { type: String, trim: true, default: null },
     externalReference: { type: String, required: true, trim: true },
     providerStatus: { type: String, trim: true, default: null },
@@ -73,6 +98,7 @@ const paymentSchema = new mongoose.Schema(
 )
 
 paymentSchema.index({ orderId: 1 })
+paymentSchema.index({ orderId: 1, createdAt: -1, _id: -1 })
 paymentSchema.index(
   { provider: 1, providerOrderId: 1 },
   {
@@ -85,6 +111,15 @@ paymentSchema.index(
   {
     unique: true,
     partialFilterExpression: { providerIdempotencyKey: { $type: 'string' } }
+  }
+)
+paymentSchema.index(
+  { provider: 1, providerCancellationIdempotencyKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      providerCancellationIdempotencyKey: { $type: 'string', $gt: '' }
+    }
   }
 )
 paymentSchema.index(

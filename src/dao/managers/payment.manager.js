@@ -206,6 +206,84 @@ class PaymentManager {
     ).lean()
   }
 
+  async prepareProviderCancellationIfMissing(
+    paymentId,
+    providerOrderId,
+    providerCancellationIdempotencyKey
+  ) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        provider: 'mercado_pago',
+        normalizedStatus: 'pending',
+        providerOrderId,
+        $and: [
+          {
+            $or: [
+              { providerCancellationIdempotencyKey: null },
+              { providerCancellationIdempotencyKey: { $exists: false } }
+            ]
+          },
+          {
+            $or: [
+              { providerCancellationStatus: null },
+              { providerCancellationStatus: { $exists: false } }
+            ]
+          }
+        ]
+      },
+      {
+        $set: {
+          providerCancellationIdempotencyKey,
+          providerCancellationStatus: 'prepared'
+        }
+      },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
+  async markProviderCancellationAttempt(
+    paymentId,
+    providerCancellationIdempotencyKey,
+    attemptedAt
+  ) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        provider: 'mercado_pago',
+        normalizedStatus: 'pending',
+        providerCancellationIdempotencyKey,
+        providerCancellationStatus: { $in: ['prepared', 'uncertain'] }
+      },
+      { $set: { providerCancellationAttemptedAt: attemptedAt } },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
+  async updateProviderCancellationStatus(
+    paymentId,
+    providerCancellationIdempotencyKey,
+    providerCancellationStatus,
+    { completedAt = null } = {}
+  ) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        provider: 'mercado_pago',
+        normalizedStatus: 'pending',
+        providerCancellationIdempotencyKey,
+        providerCancellationStatus: { $in: ['prepared', 'uncertain'] }
+      },
+      {
+        $set: {
+          providerCancellationStatus,
+          ...(completedAt && { providerCancellationCompletedAt: completedAt })
+        }
+      },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
   async updateStatus(paymentId, expectedStatus, update, { session } = {}) {
     return PaymentModel.findOneAndUpdate(
       { _id: paymentId, normalizedStatus: expectedStatus },

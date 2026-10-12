@@ -326,7 +326,8 @@ class MercadoPagoReconciliationService {
         outcome: 'pending',
         orderId: context.order._id,
         paymentId: payment._id,
-        providerPaymentId: payment.providerPaymentId || null
+        providerPaymentId: payment.providerPaymentId || null,
+        remoteClassification
       }
     }
 

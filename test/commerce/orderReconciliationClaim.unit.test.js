@@ -101,6 +101,12 @@ const makeClaimHarness = (overrides = {}) => {
       state.order.reconciliationNextAt = input.nextAt
       return { ...state.order }
     },
+    async scheduleSuccessfulReconciliation(input) {
+      if (!owned(input)) return null
+      state.order.reconciliationNextAt = input.nextAt
+      state.order.reconciliationFailures = 0
+      return { ...state.order }
+    },
     async markReconciliationFailure(input) {
       if (!owned(input)) return null
       state.order.reconciliationNextAt = input.nextAt
@@ -245,6 +251,17 @@ describe('Order reconciliation distributed claim foundation (isolated)', () => {
     assert.equal(state.order.reconciliationFailures, 1)
   })
 
+  it('resets failures after provider success only for the live owner', async () => {
+    const { service, state } = makeClaimHarness({ reconciliationFailures: 3 })
+    await service.claim(orderId, { now, ownerToken: 'owner-a' })
+    const nextAt = new Date(now.getTime() + 5 * 60 * 1000)
+
+    assert.equal(await service.scheduleSuccess(orderId, 'owner-b', nextAt, { now }), null)
+    assert.equal(state.order.reconciliationFailures, 3)
+    assert.ok(await service.scheduleSuccess(orderId, 'owner-a', nextAt, { now }))
+    assert.equal(state.order.reconciliationFailures, 0)
+  })
+
   it('requires a candidate limit and emits cursor ordering without skip', async () => {
     const manager = new OrderManager()
     let captured
@@ -322,17 +339,26 @@ describe('Order reconciliation distributed claim foundation (isolated)', () => {
     const leaseUntil = new Date(now.getTime() + RECONCILIATION_LEASE_MS)
     await manager.claimForReconciliation({ orderId, ownerToken: 'owner-a', now, leaseUntil })
     await manager.renewReconciliationClaim({ orderId, ownerToken: 'owner-a', now, leaseUntil })
+    await manager.scheduleSuccessfulReconciliation({
+      orderId,
+      ownerToken: 'owner-a',
+      now,
+      nextAt: leaseUntil
+    })
     await manager.releaseReconciliationClaim({ orderId, ownerToken: 'owner-a' })
 
     assert.equal(captures[0].update.$inc.reconciliationAttempts, 1)
     assert.equal(JSON.stringify(captures[0].filter).includes('reconciliationLeaseUntil'), true)
     assert.equal(captures[1].filter.reconciliationLeaseOwner, 'owner-a')
     assert.deepEqual(captures[1].filter.reconciliationLeaseUntil, { $gt: now })
-    assert.deepEqual(captures[2].filter, {
+    assert.equal(captures[2].filter.reconciliationLeaseOwner, 'owner-a')
+    assert.deepEqual(captures[2].filter.reconciliationLeaseUntil, { $gt: now })
+    assert.equal(captures[2].update.$set.reconciliationFailures, 0)
+    assert.deepEqual(captures[3].filter, {
       _id: orderId,
       reconciliationLeaseOwner: 'owner-a'
     })
-    assert.equal(captures[2].update.$set.reconciliationLeaseOwner, null)
+    assert.equal(captures[3].update.$set.reconciliationLeaseOwner, null)
     assert.equal(captures.every(({ options }) => options.runValidators === true), true)
   })
 })

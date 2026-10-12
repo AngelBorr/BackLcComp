@@ -16,6 +16,17 @@ const parseSameSite = (value, fallback) => {
   return ['lax', 'strict', 'none'].includes(normalized) ? normalized : fallback
 }
 
+const parsePositiveInteger = (value, fallback) => {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback
+}
+
+export const resolvePaymentReconciliationConfig = (environment = process.env) => ({
+  batchSize: parsePositiveInteger(environment.PAYMENT_RECONCILIATION_BATCH_SIZE, 20),
+  maxOrdersPerRun: parsePositiveInteger(environment.PAYMENT_RECONCILIATION_MAX_PER_RUN, 100),
+  concurrency: parsePositiveInteger(environment.PAYMENT_RECONCILIATION_CONCURRENCY, 2)
+})
+
 export const resolveCookieConfig = (environment = process.env) => {
   const nodeEnvironment = String(environment.NODE_ENV || 'development').trim().toLowerCase()
   const crossSiteHttps = ['staging', 'production'].includes(nodeEnvironment)
@@ -87,5 +98,7 @@ export default {
     timeoutMs: process.env.MERCADOPAGO_TIMEOUT_MS
       ? Number(process.env.MERCADOPAGO_TIMEOUT_MS)
       : 10000
-  }
+  },
+
+  paymentReconciliation: resolvePaymentReconciliationConfig()
 }

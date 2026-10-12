@@ -7,6 +7,7 @@ import env from './config.js'
 import initializePassport from './config/passport.config.js'
 import passport from 'passport'
 import cookieParser from 'cookie-parser'
+import { connectMongo } from './config/mongoConnection.js'
 
 //Routers
 import UsersRouter from './routes/users.router.js'
@@ -36,10 +37,6 @@ import MessengerRouter from './routes/messenger.router.js'
 import FileAssetsRouter from './routes/fileAssets.router.js'
 
 const PORT = env.port
-
-const rutaMongo =
-  process.env.MONGO_URI ||
-  `mongodb+srv://${env.userMongo}:${env.passMongo}@${env.dbCluster}/${env.dbColecction}?retryWrites=true&w=majority`
 
 const app = express()
 
@@ -160,8 +157,7 @@ app.use(errorHandler)
 // --------------------------------------------------------------
 // ✅ Start server after DB
 // --------------------------------------------------------------
-mongoose
-  .connect(rutaMongo)
+connectMongo()
   .then(() => {
     console.log('conectado a mongo')
 

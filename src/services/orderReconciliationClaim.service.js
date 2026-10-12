@@ -122,6 +122,15 @@ class OrderReconciliationClaimService {
     })
   }
 
+  scheduleSuccess(orderId, ownerToken, nextAt, { now = new Date() } = {}) {
+    return this.orders.scheduleSuccessfulReconciliation({
+      orderId: this.#orderId(orderId),
+      ownerToken: this.#owner(ownerToken),
+      now: this.#date(now, 'now'),
+      nextAt: this.#date(nextAt, 'nextAt')
+    })
+  }
+
   markFailure(orderId, ownerToken, nextAt, { now = new Date() } = {}) {
     return this.orders.markReconciliationFailure({
       orderId: this.#orderId(orderId),

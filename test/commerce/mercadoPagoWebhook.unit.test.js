@@ -743,18 +743,41 @@ describe('Mercado Pago webhook orchestration (isolated)', () => {
 })
 
 describe('Mercado Pago authoritative reconciliation (isolated)', () => {
-  for (const status of ['created', 'processing', 'action_required']) {
+  for (const [status, remoteClassification] of [
+    ['created', 'PAYABLE'],
+    ['processing', 'PROCESSING'],
+    ['action_required', 'PAYABLE'],
+    ['failed', 'FAILED_UNCERTAIN']
+  ]) {
     it(`keeps local entities pending for provider status ${status}`, async () => {
       const { service, state } = createReconciliationHarness({
         providerOrder: { status, statusDetail: null, payments: [] }
       })
       const result = await service.reconcileProviderOrder(providerOrderId, { now })
       assert.equal(result.outcome, 'pending')
+      assert.equal(result.remoteClassification, remoteClassification)
       assert.equal(state.payment.normalizedStatus, 'pending')
       assert.equal(state.order.status, 'pending_payment')
       assert.equal(state.units[0].status, 'reserved')
     })
   }
+
+  it('returns terminal-unpaid classification without changing local financial state', async () => {
+    const { service, state } = createReconciliationHarness({
+      providerOrder: {
+        status: 'canceled',
+        statusDetail: null,
+        totalPaidAmount: '0.00',
+        payments: []
+      }
+    })
+    const result = await service.reconcileProviderOrder(providerOrderId, { now })
+    assert.equal(result.outcome, 'pending')
+    assert.equal(result.remoteClassification, 'TERMINAL_UNPAID')
+    assert.equal(state.payment.normalizedStatus, 'pending')
+    assert.equal(state.order.status, 'pending_payment')
+    assert.equal(state.units[0].status, 'reserved')
+  })
 
   it('atomically approves Payment, pays Order and sells all reserved units', async () => {
     const { service, state } = createReconciliationHarness()

@@ -252,6 +252,24 @@ class OrderManager {
     ).lean()
   }
 
+  async scheduleSuccessfulReconciliation({ orderId, ownerToken, now, nextAt }) {
+    return OrderModel.findOneAndUpdate(
+      {
+        _id: orderId,
+        status: 'pending_payment',
+        reconciliationLeaseOwner: ownerToken,
+        reconciliationLeaseUntil: { $gt: now }
+      },
+      {
+        $set: {
+          reconciliationNextAt: nextAt,
+          reconciliationFailures: 0
+        }
+      },
+      { new: true, runValidators: true }
+    ).lean()
+  }
+
   async markReconciliationFailure({ orderId, ownerToken, now, nextAt }) {
     return OrderModel.findOneAndUpdate(
       {

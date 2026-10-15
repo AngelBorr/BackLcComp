@@ -71,6 +71,7 @@ describe('Commerce domain foundation (isolated unit tests)', () => {
     const orderIndexes = OrderModel.schema.indexes()
     const paymentIndexes = PaymentModel.schema.indexes()
     const eventIndexes = PaymentEventModel.schema.indexes()
+    const productUnitIndexes = ProductUnitModel.schema.indexes()
 
     assert.ok(
       orderIndexes.some(
@@ -103,6 +104,12 @@ describe('Commerce domain foundation (isolated unit tests)', () => {
     )))
     assert.ok(paymentIndexes.some(([fields]) => (
       fields.orderId === 1 && fields.createdAt === -1 && fields._id === -1
+    )))
+    assert.ok(productUnitIndexes.some(([fields]) => (
+      fields.orderId === 1 && fields.createdAt === 1
+    )))
+    assert.ok(productUnitIndexes.some(([fields]) => (
+      fields.reservedByOrderId === 1 && fields.createdAt === 1
     )))
     assert.ok(paymentIndexes.some(([fields, options]) => (
       fields.provider === 1 &&

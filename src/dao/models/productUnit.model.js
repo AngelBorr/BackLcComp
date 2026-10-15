@@ -128,6 +128,8 @@ productUnitSchema.index(
 
 productUnitSchema.index({ productId: 1, status: 1, isDeleted: 1, createdAt: 1 })
 productUnitSchema.index({ status: 1, isDeleted: 1, reservationExpiresAt: 1 })
+productUnitSchema.index({ orderId: 1, createdAt: 1 })
+productUnitSchema.index({ reservedByOrderId: 1, createdAt: 1 })
 
 const ProductUnitModel = mongoose.model(productUnitCollectionName, productUnitSchema)
 

@@ -291,6 +291,45 @@ class PaymentManager {
       { new: true, session, runValidators: true }
     ).lean()
   }
+
+  async transitionPendingWithTerminalUnpaidObservation(
+    paymentId,
+    {
+      orderId,
+      providerOrderId,
+      observedAt,
+      nextStatus
+    },
+    { session } = {}
+  ) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        orderId,
+        provider: 'mercado_pago',
+        normalizedStatus: 'pending',
+        providerOrderId,
+        providerStatus: 'canceled',
+        lastProviderCheckAt: observedAt,
+        $and: [
+          {
+            $or: [
+              { providerPaymentId: null },
+              { providerPaymentId: { $exists: false } }
+            ]
+          },
+          {
+            $or: [
+              { approvedAt: null },
+              { approvedAt: { $exists: false } }
+            ]
+          }
+        ]
+      },
+      { $set: { normalizedStatus: nextStatus } },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
 }
 
 export { PaymentManager }

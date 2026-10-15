@@ -494,6 +494,127 @@ class ProductUnitService {
     }
   }
 
+  async releaseOrderReservationsForExpiration(
+    { orderId, expirationLimit } = {},
+    { session } = {}
+  ) {
+    if (!mongoose.Types.ObjectId.isValid(orderId)) {
+      throw new ServiceError('ID de orden inválido', 'INVALID_ORDER_ID', 400)
+    }
+
+    if (!session) {
+      throw new ServiceError(
+        'La liberación de reservas requiere una transacción interna activa',
+        'EXTERNAL_TRANSACTION_REQUIRED',
+        500
+      )
+    }
+
+    this.#assertActiveExternalSession(session)
+    const checkedAt = new Date(expirationLimit)
+
+    if (Number.isNaN(checkedAt.getTime())) {
+      throw new ServiceError('Fecha de expiración inválida', 'INVALID_EXPIRATION_DATE', 400)
+    }
+
+    const orderItems = await OrderItemManager.getByOrderId(orderId, { session })
+    const units = await ProductUnitManager.findUnitsByOrderReferences(orderId, { session })
+    const expectedByItem = new Map(
+      orderItems.map((item) => [String(item._id), {
+        quantity: Number(item.quantity),
+        productId: String(item.productId)
+      }])
+    )
+    const actualByItem = new Map()
+    let reason = orderItems.length ? null : 'ORDER_ITEMS_MISSING'
+
+    for (const item of orderItems) {
+      if (!Number.isInteger(Number(item.quantity)) || Number(item.quantity) <= 0) {
+        reason = 'RESERVATION_QUANTITY_MISMATCH'
+        break
+      }
+    }
+
+    for (const unit of units) {
+      const itemId = String(unit.orderItemId || '')
+      const expected = expectedByItem.get(itemId)
+      const unitExpiration = new Date(unit.reservationExpiresAt)
+
+      if (
+        !expected ||
+        unit.status !== 'reserved' ||
+        unit.isDeleted === true ||
+        String(unit.orderId || '') !== String(orderId) ||
+        String(unit.reservedByOrderId || '') !== String(orderId) ||
+        String(unit.productId || '') !== expected.productId ||
+        unit.soldByOrderId != null ||
+        unit.soldAt != null ||
+        Number.isNaN(unitExpiration.getTime()) ||
+        unitExpiration.getTime() > checkedAt.getTime()
+      ) {
+        reason = 'RESERVATION_INTEGRITY_CONFLICT'
+        break
+      }
+
+      actualByItem.set(itemId, (actualByItem.get(itemId) || 0) + 1)
+    }
+
+    if (!reason) {
+      for (const [itemId, expected] of expectedByItem.entries()) {
+        if (actualByItem.get(itemId) !== expected.quantity) {
+          reason = 'RESERVATION_QUANTITY_MISMATCH'
+          break
+        }
+      }
+    }
+
+    const expectedCount = orderItems.reduce((total, item) => total + Number(item.quantity), 0)
+    if (!reason && units.length !== expectedCount) {
+      reason = 'RESERVATION_QUANTITY_MISMATCH'
+    }
+
+    if (reason) {
+      return { valid: false, reason, expectedCount, units: [] }
+    }
+
+    const productIds = [...new Set(units.map((unit) => String(unit.productId)))].sort()
+
+    for (const productId of productIds) {
+      await this.#acquireProductInventoryGuard(productId, ['serialized'], session)
+    }
+
+    const unitIds = units.map((unit) => unit._id)
+    const updateResult = await ProductUnitManager.releaseReservedUnitsForOrder(
+      {
+        unitIds,
+        orderId,
+        expirationLimit: checkedAt
+      },
+      { session }
+    )
+
+    if (updateResult.modifiedCount !== expectedCount) {
+      throw new ServiceError(
+        'Las reservas cambiaron durante la liberación',
+        'RESERVATION_RELEASE_CONFLICT',
+        409
+      )
+    }
+
+    for (const productId of productIds) {
+      await this.recalculateProductStock(productId, { session })
+    }
+
+    return {
+      valid: true,
+      reason: null,
+      expectedCount,
+      releasedCount: updateResult.modifiedCount,
+      unitIds: unitIds.map(String),
+      productIds
+    }
+  }
+
   async confirmReservedUnitsSold(
     { orderId, paymentId, soldAt = new Date() } = {},
     { session } = {}

@@ -469,6 +469,84 @@ class OrderManager {
       { new: true, session, runValidators: true }
     ).lean()
   }
+
+  async expirePendingPaymentOrder(
+    orderId,
+    ownerToken,
+    { changedAt, reason },
+    { session } = {}
+  ) {
+    return OrderModel.findOneAndUpdate(
+      combineFilters(
+        {
+          _id: orderId,
+          status: 'pending_payment',
+          reservationExpiresAt: { $lte: changedAt },
+          reconciliationLeaseOwner: ownerToken,
+          reconciliationLeaseUntil: { $gt: changedAt }
+        },
+        fulfillmentFilter('pending')
+      ),
+      {
+        $set: {
+          status: 'expired',
+          fulfillmentStatus: 'cancelled',
+          expiredAt: changedAt,
+          reconciliationNextAt: null,
+          reconciliationLeaseOwner: null,
+          reconciliationLeaseUntil: null
+        },
+        $push: {
+          statusHistory: {
+            status: 'expired',
+            changedAt,
+            reason
+          },
+          fulfillmentHistory: {
+            status: 'cancelled',
+            changedAt,
+            changedBy: null,
+            reason
+          }
+        }
+      },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
+  async markExpirationIntegrityAttention(
+    orderId,
+    ownerToken,
+    { changedAt, reason },
+    { session } = {}
+  ) {
+    return OrderModel.findOneAndUpdate(
+      {
+        _id: orderId,
+        status: 'pending_payment',
+        reservationExpiresAt: { $lte: changedAt },
+        reconciliationLeaseOwner: ownerToken,
+        reconciliationLeaseUntil: { $gt: changedAt }
+      },
+      {
+        $set: {
+          status: 'requires_attention',
+          attentionReason: reason,
+          reconciliationNextAt: null,
+          reconciliationLeaseOwner: null,
+          reconciliationLeaseUntil: null
+        },
+        $push: {
+          statusHistory: {
+            status: 'requires_attention',
+            changedAt,
+            reason
+          }
+        }
+      },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
 }
 
 export { OrderManager, reconciliationCursorFilter }

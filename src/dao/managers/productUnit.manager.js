@@ -82,7 +82,7 @@ class ProductUnitManager {
       {
         $match: {
           productId,
-          isDeleted: false
+          isDeleted: { $ne: true }
         }
       },
       {
@@ -214,6 +214,43 @@ class ProductUnitManager {
     if (session) query.session(session)
 
     return query
+  }
+
+  async findUnitsByOrderReferences(orderId, { session } = {}) {
+    const query = ProductUnitModel.find({
+      $or: [{ orderId }, { reservedByOrderId: orderId }]
+    }).sort({ createdAt: 1 }).lean()
+
+    if (session) query.session(session)
+
+    return query
+  }
+
+  async releaseReservedUnitsForOrder(
+    { unitIds, orderId, expirationLimit },
+    { session } = {}
+  ) {
+    return ProductUnitModel.updateMany(
+      {
+        _id: { $in: unitIds },
+        status: 'reserved',
+        isDeleted: { $ne: true },
+        orderId,
+        reservedByOrderId: orderId,
+        reservationExpiresAt: { $lte: expirationLimit }
+      },
+      {
+        $set: {
+          status: 'available',
+          orderId: null,
+          orderItemId: null,
+          reservedByOrderId: null,
+          reservedAt: null,
+          reservationExpiresAt: null
+        }
+      },
+      { session }
+    )
   }
 
   async getAssignedByOrderId(orderId, { statuses, session } = {}) {

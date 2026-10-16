@@ -9,8 +9,6 @@ import {
   calculateProviderFailureBackoffMs
 } from '../../src/services/paymentReconciliationWorker.service.js'
 import { REMOTE_ORDER_CLASSIFICATIONS } from '../../src/services/mercadoPagoOrderClassification.service.js'
-import MercadoPagoOrderCancellationService from '../../src/services/mercadoPagoOrderCancellation.service.js'
-import ProductUnitService from '../../src/services/productUnit.service.js'
 
 const baseNow = new Date('2026-10-10T12:00:00.000Z')
 const fiveMinutes = 5 * 60 * 1000
@@ -33,7 +31,10 @@ const makePayment = (order, overrides = {}) => ({
   _id: `payment-${order._id}`,
   orderId: order._id,
   normalizedStatus: 'pending',
+  provider: 'mercado_pago',
   providerOrderId: `provider-${order._id}`,
+  providerStatus: null,
+  lastProviderCheckAt: null,
   providerAttemptStatus: 'succeeded',
   ...overrides
 })
@@ -44,10 +45,20 @@ const compareOrders = (left, right) => {
   return leftExpiry - rightExpiry || left._id.localeCompare(right._id)
 }
 
+const remoteStatusFor = (classification) => ({
+  [REMOTE_ORDER_CLASSIFICATIONS.PAYABLE]: 'created',
+  [REMOTE_ORDER_CLASSIFICATIONS.PROCESSING]: 'processing',
+  [REMOTE_ORDER_CLASSIFICATIONS.FAILED_UNCERTAIN]: 'failed',
+  [REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID]: 'canceled'
+})[classification] || null
+
 const makeHarness = ({
   orders = [makeOrder(1)],
   payments,
   reconcile,
+  cancel,
+  expire,
+  renewHook,
   claimFailure,
   releaseFailure,
   scheduleFailure,
@@ -62,6 +73,8 @@ const makeHarness = ({
     activeProviderCalls: 0,
     maxActiveProviderCalls: 0,
     cancelCalls: 0,
+    expirationCalls: [],
+    renewCalls: 0,
     releaseInventoryCalls: 0,
     units: [{ status: 'reserved' }],
     releaseAttempts: [],
@@ -124,6 +137,10 @@ const makeHarness = ({
       return { ...order }
     },
     async renew(orderId, ownerToken, { now }) {
+      state.renewCalls += 1
+      if (renewHook?.({ orderId, ownerToken, now, call: state.renewCalls, state }) === false) {
+        return null
+      }
       const order = findOrder(orderId)
       if (!owns(order, ownerToken, now)) return null
       order.reconciliationLeaseUntil = new Date(now.getTime() + leaseMs)
@@ -187,14 +204,56 @@ const makeHarness = ({
         state.activeProviderCalls
       )
       try {
-        if (reconcile) return await reconcile({ providerOrderId, options, state, findOrder })
-        return {
-          outcome: 'pending',
-          remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+        const result = reconcile
+          ? await reconcile({ providerOrderId, options, state, findOrder })
+          : {
+              outcome: 'pending',
+              remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+            }
+        if (result.outcome === 'pending') {
+          const order = state.orders.find((candidate) => (
+            state.payments.get(candidate._id)?.providerOrderId === providerOrderId
+          ))
+          const payment = order ? state.payments.get(order._id) : null
+          if (payment) {
+            payment.providerStatus = result.remoteStatus ||
+              remoteStatusFor(result.remoteClassification)
+            payment.lastProviderCheckAt = options.now
+            return { paymentId: payment._id, ...result }
+          }
         }
+        return result
       } finally {
         state.activeProviderCalls -= 1
       }
+    }
+  }
+  const cancellationService = {
+    async cancelPaymentOrder(paymentId, options) {
+      state.cancelCalls += 1
+      if (cancel) return cancel({ paymentId, options, state, findOrder })
+      return {
+        paymentId,
+        providerCancellationStatus: 'succeeded',
+        alreadyCompleted: false
+      }
+    }
+  }
+  const expirationService = {
+    async expirePendingOrderWithTerminalUnpaidEvidence(value) {
+      state.expirationCalls.push(value)
+      if (expire) return expire({ input: value, state, findOrder })
+
+      const order = findOrder(value.orderId)
+      const payment = state.payments.get(value.orderId)
+      order.status = 'expired'
+      order.reconciliationNextAt = null
+      order.reconciliationLeaseOwner = null
+      order.reconciliationLeaseUntil = null
+      payment.normalizedStatus = 'cancelled'
+      for (const unit of state.units) unit.status = 'available'
+      state.releaseInventoryCalls += 1
+      return { outcome: 'expired', releasedCount: state.units.length }
     }
   }
   const worker = new PaymentReconciliationWorkerService({
@@ -202,6 +261,8 @@ const makeHarness = ({
     paymentManager,
     claimService,
     reconciliationService,
+    cancellationService,
+    expirationService,
     clock,
     workerConfig: { batchSize: 20, maxOrdersPerRun: 100, concurrency: 2 },
     log(message, metadata) { state.logs.push({ message, metadata }) }
@@ -258,6 +319,498 @@ describe('P1B.2 autonomous reconcile-only worker (isolated)', () => {
     assert.equal(result.terminalUnpaid, 1)
     assert.equal(state.orders[0].status, 'pending_payment')
     assert.equal(state.releaseInventoryCalls, 0)
+    assert.equal(state.expirationCalls.length, 0)
+  })
+
+  it('cancels an expired PAYABLE Order, performs a second GET and expires once', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async ({ state }) => ({
+        outcome: 'pending',
+        remoteClassification: state.providerCalls === 1
+          ? REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+          : REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.expired, 1)
+    assert.equal(state.providerCalls, 2)
+    assert.equal(state.cancelCalls, 1)
+    assert.equal(state.expirationCalls.length, 1)
+    assert.equal(state.releaseInventoryCalls, 1)
+    assert.equal(state.orders[0].status, 'expired')
+    assert.equal(state.orders[0].reconciliationNextAt, null)
+    assert.equal(
+      state.expirationCalls[0].terminalEvidence.observedAt.getTime(),
+      state.payments.get(order._id).lastProviderCheckAt.getTime()
+    )
+  })
+
+  for (const { name, reservationExpiresAt } of [
+    { name: 'null', reservationExpiresAt: null },
+    { name: 'undefined', reservationExpiresAt: undefined },
+    { name: 'an invalid date', reservationExpiresAt: 'invalid-date' }
+  ]) {
+    it(`does not cancel or expire a PAYABLE Order when reservationExpiresAt is ${name}`, async () => {
+      const order = makeOrder(1, { reservationExpiresAt })
+      const { run, state } = makeHarness({ orders: [order] })
+
+      const result = await run()
+
+      assert.equal(result.stillPending, 1)
+      assert.equal(result.expired, 0)
+      assert.equal(result.alreadyExpired, 0)
+      assert.equal(state.providerCalls, 1)
+      assert.equal(state.cancelCalls, 0)
+      assert.equal(state.expirationCalls.length, 0)
+      assert.equal(state.releaseInventoryCalls, 0)
+      assert.equal(state.units[0].status, 'reserved')
+      assert.equal(state.orders[0].status, 'pending_payment')
+      assert.equal(state.orders[0].reservationExpiresAt, reservationExpiresAt)
+      assert.equal(
+        state.orders[0].reconciliationNextAt.toISOString(),
+        new Date(baseNow.getTime() + fiveMinutes).toISOString()
+      )
+    })
+  }
+
+  it('expires direct TERMINAL_UNPAID without POST cancel when the reservation expired', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.expired, 1)
+    assert.equal(state.providerCalls, 1)
+    assert.equal(state.cancelCalls, 0)
+    assert.equal(state.expirationCalls.length, 1)
+  })
+
+  it('does not expire direct TERMINAL_UNPAID while the reservation is active', async () => {
+    const { run, state } = makeHarness({
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.terminalUnpaid, 1)
+    assert.equal(state.cancelCalls, 0)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.units[0].status, 'reserved')
+  })
+
+  it('keeps stock reserved and backs off when cancellation is uncertain', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const timeout = Object.assign(new Error('timeout'), {
+      code: 'MERCADOPAGO_TIMEOUT',
+      status: 503
+    })
+    const { run, state } = makeHarness({
+      orders: [order],
+      cancel: async () => { throw timeout }
+    })
+
+    const result = await run()
+
+    assert.equal(result.cancelUncertain, 1)
+    assert.equal(state.cancelCalls, 1)
+    assert.equal(state.providerCalls, 1)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.units[0].status, 'reserved')
+    assert.equal(state.orders[0].reconciliationFailures, 1)
+  })
+
+  it('keeps stock reserved and backs off on definitive cancellation rejection', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const rejected = Object.assign(new Error('rejected'), {
+      code: 'MERCADOPAGO_CANCELLATION_REJECTED',
+      status: 409
+    })
+    const { run, state } = makeHarness({
+      orders: [order],
+      cancel: async () => { throw rejected }
+    })
+
+    const result = await run()
+
+    assert.equal(result.cancelRejected, 1)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.units[0].status, 'reserved')
+    assert.equal(state.orders[0].reconciliationFailures, 1)
+  })
+
+  it('never expires when the post-cancel GET discovers APPROVED', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async ({ state, findOrder }) => {
+        if (state.providerCalls === 1) {
+          return {
+            outcome: 'pending',
+            remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+          }
+        }
+        const current = findOrder(order._id)
+        current.status = 'paid'
+        state.payments.get(order._id).normalizedStatus = 'approved'
+        state.units[0].status = 'sold'
+        return { outcome: 'paid' }
+      }
+    })
+
+    const result = await run()
+
+    assert.equal(result.paid, 1)
+    assert.equal(state.providerCalls, 2)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.units[0].status, 'sold')
+  })
+
+  it('does not release when the post-cancel GET remains PROCESSING', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async ({ state }) => ({
+        outcome: 'pending',
+        remoteClassification: state.providerCalls === 1
+          ? REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+          : REMOTE_ORDER_CLASSIFICATIONS.PROCESSING
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.stillPending, 1)
+    assert.equal(state.providerCalls, 2)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.units[0].status, 'reserved')
+  })
+
+  it('does not release when the mandatory post-cancel GET is unavailable', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const unavailable = Object.assign(new Error('unavailable'), {
+      code: 'MERCADOPAGO_UNAVAILABLE',
+      status: 503
+    })
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async ({ state }) => {
+        if (state.providerCalls === 2) throw unavailable
+        return {
+          outcome: 'pending',
+          remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+        }
+      }
+    })
+
+    const result = await run()
+
+    assert.equal(result.providerUnavailable, 1)
+    assert.equal(state.providerCalls, 2)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.units[0].status, 'reserved')
+    assert.equal(state.orders[0].reconciliationFailures, 1)
+  })
+
+  it('does not POST cancel after losing the claim immediately before cancellation', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      renewHook: ({ call }) => call !== 2
+    })
+
+    const result = await run()
+
+    assert.equal(result.claimLost, 1)
+    assert.equal(state.cancelCalls, 0)
+    assert.equal(state.expirationCalls.length, 0)
+  })
+
+  it('lets a later worker converge after claim loss between cancel and the second GET', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const harness = makeHarness({
+      orders: [order],
+      renewHook: ({ call, state }) => {
+        if (call !== 3) return true
+        state.orders[0].reconciliationLeaseUntil = new Date(baseNow.getTime() - 1)
+        return false
+      },
+      reconcile: async ({ state }) => ({
+        outcome: 'pending',
+        remoteClassification: state.providerCalls === 1
+          ? REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+          : REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      })
+    })
+
+    const first = await harness.run({ runId: 'worker-before-loss' })
+    const second = await harness.run({ runId: 'worker-after-loss' })
+
+    assert.equal(first.claimLost, 1)
+    assert.equal(second.expired, 1)
+    assert.equal(harness.state.cancelCalls, 1)
+    assert.equal(harness.state.expirationCalls.length, 1)
+  })
+
+  it('does not call expiration after losing the claim immediately before it', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      renewHook: ({ call }) => call !== 2,
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.claimLost, 1)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.units[0].status, 'reserved')
+  })
+
+  it('converges to paid when a webhook approves between cancel and the second GET', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      cancel: async ({ state, findOrder, paymentId }) => {
+        findOrder(order._id).status = 'paid'
+        state.payments.get(order._id).normalizedStatus = 'approved'
+        state.units[0].status = 'sold'
+        return { paymentId, providerCancellationStatus: 'succeeded' }
+      },
+      reconcile: async ({ state }) => state.providerCalls === 1
+        ? {
+            outcome: 'pending',
+            remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+          }
+        : { outcome: 'paid' }
+    })
+
+    const result = await run()
+
+    assert.equal(result.paid, 1)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.units[0].status, 'sold')
+  })
+
+  it('fails closed when buyer recovery approves during OrderExpirationService', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const conflict = Object.assign(new Error('payment changed'), {
+      code: 'PAYMENT_EXPIRATION_CONFLICT'
+    })
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      }),
+      expire: async ({ state, findOrder }) => {
+        findOrder(order._id).status = 'paid'
+        state.payments.get(order._id).normalizedStatus = 'approved'
+        state.units[0].status = 'sold'
+        throw conflict
+      }
+    })
+
+    const result = await run()
+
+    assert.equal(result.errors, 1)
+    assert.equal(state.expirationCalls.length, 1)
+    assert.equal(state.units[0].status, 'sold')
+    assert.equal(state.units.some(({ status }) => status === 'available'), false)
+  })
+
+  it('rejects stale terminal evidence before calling expiration', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      renewHook: ({ call, state }) => {
+        if (call === 2) {
+          state.payments.get(order._id).lastProviderCheckAt = new Date(baseNow.getTime() + 1)
+        }
+        return true
+      },
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.errors, 1)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.units[0].status, 'reserved')
+    assert.equal(
+      state.logs.some(({ metadata }) => metadata.code === 'TERMINAL_EVIDENCE_STALE'),
+      true
+    )
+  })
+
+  it('does not reschedule an integrity-attention expiration outcome', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      }),
+      expire: async ({ state, findOrder }) => {
+        const current = findOrder(order._id)
+        current.status = 'requires_attention'
+        current.reconciliationNextAt = null
+        current.reconciliationLeaseOwner = null
+        current.reconciliationLeaseUntil = null
+        state.payments.get(order._id).normalizedStatus = 'requires_attention'
+        return { outcome: 'requires_attention', reason: 'RESERVATION_INTEGRITY_CONFLICT' }
+      }
+    })
+
+    const result = await run()
+
+    assert.equal(result.integrityAttention, 1)
+    assert.equal(state.orders[0].reconciliationNextAt, null)
+    assert.equal(state.units[0].status, 'reserved')
+  })
+
+  it('treats already_expired as an idempotent terminal outcome', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      }),
+      expire: async ({ findOrder }) => {
+        const current = findOrder(order._id)
+        current.status = 'expired'
+        current.reconciliationNextAt = null
+        current.reconciliationLeaseOwner = null
+        current.reconciliationLeaseUntil = null
+        return { outcome: 'already_expired' }
+      }
+    })
+
+    const result = await run()
+
+    assert.equal(result.alreadyExpired, 1)
+    assert.equal(state.orders[0].reconciliationNextAt, null)
+  })
+
+  it('expires when the post-cancel terminal observation occurs exactly at reservation expiry', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: baseNow })
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async ({ state }) => ({
+        outcome: 'pending',
+        remoteClassification: state.providerCalls === 1
+          ? REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+          : REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.expired, 1)
+    assert.equal(state.providerCalls, 2)
+    assert.equal(state.cancelCalls, 1)
+    assert.equal(state.expirationCalls.length, 1)
+    assert.equal(state.releaseInventoryCalls, 1)
+  })
+
+  it('allows only the current claim owner to expire under two concurrent workers', async () => {
+    let releaseProvider
+    const providerGate = new Promise((resolve) => { releaseProvider = resolve })
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const harness = makeHarness({
+      orders: [order],
+      reconcile: async () => {
+        await providerGate
+        return {
+          outcome: 'pending',
+          remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+        }
+      }
+    })
+
+    const first = harness.run({ runId: 'expiration-worker-a' })
+    await Promise.resolve()
+    const second = harness.run({ runId: 'expiration-worker-b' })
+    releaseProvider()
+    const [left, right] = await Promise.all([first, second])
+
+    assert.equal(left.expired + right.expired, 1)
+    assert.equal(harness.state.expirationCalls.length, 1)
+    assert.equal(harness.state.releaseInventoryCalls, 1)
+  })
+
+  it('reconciles after cancellation preflight discovers a non-cancelable approved state', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const notCancelable = Object.assign(new Error('approved'), {
+      code: 'MERCADOPAGO_ORDER_NOT_CANCELABLE',
+      details: { remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.APPROVED }
+    })
+    const { run, state } = makeHarness({
+      orders: [order],
+      cancel: async () => { throw notCancelable },
+      reconcile: async ({ state, findOrder }) => {
+        if (state.providerCalls === 1) {
+          return {
+            outcome: 'pending',
+            remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+          }
+        }
+        findOrder(order._id).status = 'paid'
+        state.payments.get(order._id).normalizedStatus = 'approved'
+        state.units[0].status = 'sold'
+        return { outcome: 'paid' }
+      }
+    })
+
+    const result = await run()
+
+    assert.equal(result.paid, 1)
+    assert.equal(state.providerCalls, 2)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.units[0].status, 'sold')
+  })
+
+  it('always performs a fresh reconciler GET when cancellation reports alreadyCanceled', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      cancel: async ({ paymentId }) => ({
+        paymentId,
+        outcome: 'terminal_unpaid',
+        alreadyCanceled: true
+      }),
+      reconcile: async ({ state }) => ({
+        outcome: 'pending',
+        remoteClassification: state.providerCalls === 1
+          ? REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+          : REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.expired, 1)
+    assert.equal(state.providerCalls, 2)
+    assert.equal(state.expirationCalls.length, 1)
   })
 
   for (const [name, error] of [
@@ -706,37 +1259,21 @@ describe('P1B.2 autonomous reconcile-only worker (isolated)', () => {
     assert.equal(state.maxActiveProviderCalls, 2)
   })
 
-  it('never calls automatic cancellation or inventory release', async () => {
-    const originalCancel = MercadoPagoOrderCancellationService.cancelPaymentOrder
-    const originalRelease = ProductUnitService.releaseExpiredReservations
-    let cancelCalls = 0
-    let releaseCalls = 0
-    MercadoPagoOrderCancellationService.cancelPaymentOrder = async () => { cancelCalls += 1 }
-    ProductUnitService.releaseExpiredReservations = async () => { releaseCalls += 1 }
-    const { run, state } = makeHarness({
-      reconcile: async () => ({
-        outcome: 'pending',
-        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
-      })
-    })
-    try {
-      await run()
-      assert.equal(cancelCalls, 0)
-      assert.equal(releaseCalls, 0)
-      assert.equal(state.cancelCalls, 0)
-      assert.equal(state.releaseInventoryCalls, 0)
-      assert.equal(state.units[0].status, 'reserved')
-      const source = await readFile(new URL('../../src/services/paymentReconciliationWorker.service.js', import.meta.url), 'utf8')
-      assert.equal(source.includes('.cancelPaymentOrder('), false)
-      assert.equal(source.includes('.cancelOrder('), false)
-      assert.equal(source.includes('releaseExpiredReservations'), false)
-      assert.equal(source.includes("nextStatus: 'expired'"), false)
-      assert.equal(source.includes("status: 'available'"), false)
-      assert.equal(source.includes('PaymentEvent'), false)
-    } finally {
-      MercadoPagoOrderCancellationService.cancelPaymentOrder = originalCancel
-      ProductUnitService.releaseExpiredReservations = originalRelease
-    }
+  it('uses the cancellation and expiration domain services without direct provider writes', async () => {
+    const source = await readFile(
+      new URL('../../src/services/paymentReconciliationWorker.service.js', import.meta.url),
+      'utf8'
+    )
+    assert.equal(source.includes('this.cancellation.cancelPaymentOrder('), true)
+    assert.equal(
+      source.includes('this.expiration.expirePendingOrderWithTerminalUnpaidEvidence('),
+      true
+    )
+    assert.equal(source.includes('.cancelOrder('), false)
+    assert.equal(source.includes('releaseExpiredReservations'), false)
+    assert.equal(source.includes("nextStatus: 'expired'"), false)
+    assert.equal(source.includes("status: 'available'"), false)
+    assert.equal(source.includes('PaymentEvent'), false)
   })
 
   it('exposes the expected claim-lost operational outcome', () => {

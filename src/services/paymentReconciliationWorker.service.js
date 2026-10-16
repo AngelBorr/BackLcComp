@@ -2,9 +2,12 @@ import OrderManager from '../dao/managers/order.manager.js'
 import PaymentManager from '../dao/managers/payment.manager.js'
 import env from '../config.js'
 import logger from '../utils/logger.js'
+import MercadoPagoOrderCancellationService from './mercadoPagoOrderCancellation.service.js'
 import MercadoPagoReconciliationService from './mercadoPagoReconciliation.service.js'
+import OrderExpirationService from './orderExpiration.service.js'
 import OrderReconciliationClaimService from './orderReconciliationClaim.service.js'
 import { REMOTE_ORDER_CLASSIFICATIONS } from './mercadoPagoOrderClassification.service.js'
+import { ServiceError } from './service.products.js'
 
 const MINUTE_MS = 60 * 1000
 const HOUR_MS = 60 * MINUTE_MS
@@ -16,6 +19,11 @@ const WORKER_OUTCOMES = Object.freeze({
   PROVIDER_UNAVAILABLE: 'provider_unavailable',
   UNCERTAIN: 'uncertain',
   TERMINAL_UNPAID: 'terminal_unpaid_observed',
+  CANCEL_UNCERTAIN: 'cancel_uncertain',
+  CANCEL_REJECTED: 'cancel_rejected',
+  EXPIRED: 'expired',
+  ALREADY_EXPIRED: 'already_expired',
+  INTEGRITY_ATTENTION: 'integrity_attention',
   IGNORED: 'ignored',
   CLAIM_LOST: 'claim_lost',
   CLAIM_RELEASE_FAILED: 'claim_release_failed',
@@ -66,6 +74,20 @@ const isProviderUnavailable = (error) => {
   ].includes(error?.code)
 }
 
+const isReservationExpired = (reservationExpiresAt, now) => {
+  if (reservationExpiresAt == null) return false
+  const expiration = asDate(reservationExpiresAt)
+  return Boolean(expiration && expiration.getTime() <= now.getTime())
+}
+
+const isCancellationRejected = (error) => (
+  error?.code === 'MERCADOPAGO_CANCELLATION_REJECTED'
+)
+
+const requiresCancellationFollowUp = (error) => (
+  error?.code === 'MERCADOPAGO_ORDER_NOT_CANCELABLE'
+)
+
 const noProviderOrderReason = (payment) => {
   if (!payment || !Object.hasOwn(payment, 'providerAttemptStatus')) {
     return 'LEGACY_PROVIDER_ATTEMPT_STATUS_MISSING'
@@ -92,6 +114,8 @@ class PaymentReconciliationWorkerService {
     paymentManager = PaymentManager,
     claimService = OrderReconciliationClaimService,
     reconciliationService = MercadoPagoReconciliationService,
+    cancellationService = MercadoPagoOrderCancellationService,
+    expirationService = OrderExpirationService,
     clock = () => new Date(),
     workerConfig = env.paymentReconciliation,
     log = (message, metadata) => logger.info(`${message} ${JSON.stringify(metadata)}`)
@@ -100,6 +124,8 @@ class PaymentReconciliationWorkerService {
     this.payments = paymentManager
     this.claims = claimService
     this.reconciliation = reconciliationService
+    this.cancellation = cancellationService
+    this.expiration = expirationService
     this.clock = clock
     this.config = workerConfig
     this.log = log
@@ -143,6 +169,185 @@ class PaymentReconciliationWorkerService {
     const nextAt = new Date(now.getTime() + calculateProviderFailureBackoffMs(failureNumber))
     const marked = await this.claims.markFailure(order._id, ownerToken, nextAt, { now })
     return marked ? { failureNumber, nextAt } : null
+  }
+
+  async #providerFailureResult(order, ownerToken, error, extra = {}) {
+    try {
+      await this.claims.assertOwnership(order._id, ownerToken, { now: this.#now() })
+    } catch (claimError) {
+      if (claimError?.code === 'RECONCILIATION_CLAIM_LOST') {
+        return { outcome: WORKER_OUTCOMES.CLAIM_LOST, order, ...extra }
+      }
+      throw claimError
+    }
+
+    const failure = await this.#markProviderFailure(order, ownerToken)
+    if (!failure) return { outcome: WORKER_OUTCOMES.CLAIM_LOST, order, ...extra }
+
+    return {
+      outcome: isProviderUnavailable(error)
+        ? WORKER_OUTCOMES.PROVIDER_UNAVAILABLE
+        : WORKER_OUTCOMES.ERROR,
+      code: error?.code || 'PAYMENT_RECONCILIATION_FAILED',
+      order,
+      ...failure,
+      ...extra
+    }
+  }
+
+  async #cancellationFailureResult(order, ownerToken, error) {
+    try {
+      await this.claims.assertOwnership(order._id, ownerToken, { now: this.#now() })
+    } catch (claimError) {
+      if (claimError?.code === 'RECONCILIATION_CLAIM_LOST') {
+        return {
+          outcome: WORKER_OUTCOMES.CLAIM_LOST,
+          order,
+          cancellationRequested: true
+        }
+      }
+      throw claimError
+    }
+
+    const failure = await this.#markProviderFailure(order, ownerToken)
+    if (!failure) {
+      return {
+        outcome: WORKER_OUTCOMES.CLAIM_LOST,
+        order,
+        cancellationRequested: true
+      }
+    }
+
+    return {
+      outcome: isCancellationRejected(error)
+        ? WORKER_OUTCOMES.CANCEL_REJECTED
+        : WORKER_OUTCOMES.CANCEL_UNCERTAIN,
+      code: error?.code || 'MERCADOPAGO_CANCELLATION_FAILED',
+      order,
+      cancellationRequested: true,
+      ...failure
+    }
+  }
+
+  async #scheduleObservedResult(order, ownerToken, result, extra = {}) {
+    try {
+      await this.claims.assertOwnership(order._id, ownerToken, { now: this.#now() })
+    } catch (error) {
+      if (error?.code === 'RECONCILIATION_CLAIM_LOST') {
+        return { outcome: WORKER_OUTCOMES.CLAIM_LOST, order, ...extra }
+      }
+      throw error
+    }
+
+    const nextAt = await this.#schedule(order, ownerToken, { providerSucceeded: true })
+    if (!nextAt) return { outcome: WORKER_OUTCOMES.CLAIM_LOST, order, ...extra }
+
+    if (result.outcome === 'ignored') {
+      return { outcome: WORKER_OUTCOMES.IGNORED, order, nextAt, ...extra }
+    }
+    if (result.remoteClassification === REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID) {
+      return { outcome: WORKER_OUTCOMES.TERMINAL_UNPAID, order, nextAt, ...extra }
+    }
+    return { outcome: WORKER_OUTCOMES.STILL_PENDING, order, nextAt, ...extra }
+  }
+
+  async #buildTerminalEvidence({
+    order,
+    paymentId,
+    providerOrderId,
+    reconciliationResult,
+    observedAt
+  }) {
+    const payment = await this.payments.getLatestByOrderId(order._id)
+    const persistedObservation = asDate(payment?.lastProviderCheckAt)
+
+    if (
+      reconciliationResult.remoteClassification !==
+        REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID ||
+      !payment ||
+      String(payment._id) !== String(paymentId) ||
+      (reconciliationResult.paymentId &&
+        String(reconciliationResult.paymentId) !== String(payment._id)) ||
+      payment.normalizedStatus !== 'pending' ||
+      String(payment.providerOrderId || '').trim() !== providerOrderId ||
+      String(payment.providerStatus || '').trim().toLowerCase() !== 'canceled' ||
+      !persistedObservation ||
+      persistedObservation.getTime() !== observedAt.getTime()
+    ) {
+      throw new ServiceError(
+        'La evidencia terminal persistida cambio antes de expirar la Order',
+        'TERMINAL_EVIDENCE_STALE',
+        409
+      )
+    }
+
+    return {
+      providerOrderId,
+      classification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID,
+      remoteStatus: 'canceled',
+      observedAt: persistedObservation,
+      orderId: String(order._id),
+      paymentId: String(payment._id)
+    }
+  }
+
+  async #expireTerminalOrder({
+    order,
+    payment,
+    ownerToken,
+    providerOrderId,
+    reconciliationResult,
+    observedAt,
+    extra = {}
+  }) {
+    const expirationNow = this.#now()
+    const renewed = await this.claims.renew(order._id, ownerToken, { now: expirationNow })
+    if (!renewed) return { outcome: WORKER_OUTCOMES.CLAIM_LOST, order, ...extra }
+
+    const terminalEvidence = await this.#buildTerminalEvidence({
+      order,
+      paymentId: payment._id,
+      providerOrderId,
+      reconciliationResult,
+      observedAt
+    })
+
+    let result
+    try {
+      result = await this.expiration.expirePendingOrderWithTerminalUnpaidEvidence({
+        orderId: order._id,
+        paymentId: payment._id,
+        ownerToken,
+        terminalEvidence,
+        now: expirationNow
+      })
+    } catch (error) {
+      if (error?.code === 'RECONCILIATION_CLAIM_LOST') {
+        return { outcome: WORKER_OUTCOMES.CLAIM_LOST, order, ...extra }
+      }
+      throw error
+    }
+
+    if (result.outcome === 'expired') {
+      return { outcome: WORKER_OUTCOMES.EXPIRED, order, ...extra }
+    }
+    if (result.outcome === 'already_expired') {
+      return { outcome: WORKER_OUTCOMES.ALREADY_EXPIRED, order, ...extra }
+    }
+    if (result.outcome === 'requires_attention') {
+      return {
+        outcome: WORKER_OUTCOMES.INTEGRITY_ATTENTION,
+        reason: result.reason || 'RESERVATION_INTEGRITY_CONFLICT',
+        order,
+        ...extra
+      }
+    }
+
+    throw new ServiceError(
+      'La expiracion devolvio un resultado no reconocido',
+      'ORDER_EXPIRATION_RESULT_INVALID',
+      500
+    )
   }
 
   async #processClaimedOrder(order, ownerToken) {
@@ -197,31 +402,16 @@ class PaymentReconciliationWorkerService {
     const renewed = await this.claims.renew(order._id, ownerToken, { now: this.#now() })
     if (!renewed) return { outcome: WORKER_OUTCOMES.CLAIM_LOST, order: current }
 
+    const firstObservedAt = this.#now()
     let result
     try {
       result = await this.reconciliation.reconcileProviderOrder(providerOrderId, {
-        now: this.#now()
+        now: firstObservedAt
       })
     } catch (error) {
-      try {
-        await this.claims.assertOwnership(order._id, ownerToken, { now: this.#now() })
-      } catch (claimError) {
-        if (claimError?.code === 'RECONCILIATION_CLAIM_LOST') {
-          return { outcome: WORKER_OUTCOMES.CLAIM_LOST, order: current }
-        }
-        throw claimError
-      }
-
-      const failure = await this.#markProviderFailure(current, ownerToken)
-      if (!failure) return { outcome: WORKER_OUTCOMES.CLAIM_LOST, order: current }
-      return {
-        outcome: isProviderUnavailable(error)
-          ? WORKER_OUTCOMES.PROVIDER_UNAVAILABLE
-          : WORKER_OUTCOMES.ERROR,
-        code: error?.code || 'PAYMENT_RECONCILIATION_FAILED',
-        order: current,
-        ...failure
-      }
+      return this.#providerFailureResult(current, ownerToken, error, {
+        providerCheckPhase: 'initial'
+      })
     }
 
     if (result.outcome === 'paid') {
@@ -231,25 +421,162 @@ class PaymentReconciliationWorkerService {
       return { outcome: WORKER_OUTCOMES.REQUIRES_ATTENTION, order: current }
     }
 
-    try {
-      await this.claims.assertOwnership(order._id, ownerToken, { now: this.#now() })
-    } catch (error) {
-      if (error?.code === 'RECONCILIATION_CLAIM_LOST') {
-        return { outcome: WORKER_OUTCOMES.CLAIM_LOST, order: current }
+    const decisionNow = this.#now()
+    const reservationExpired = isReservationExpired(current.reservationExpiresAt, decisionNow)
+
+    if (
+      result.remoteClassification === REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID &&
+      reservationExpired
+    ) {
+      return this.#expireTerminalOrder({
+        order: current,
+        payment,
+        ownerToken,
+        providerOrderId,
+        reconciliationResult: result,
+        observedAt: firstObservedAt,
+        extra: { providerCheckPhase: 'initial' }
+      })
+    }
+
+    if (
+      result.remoteClassification === REMOTE_ORDER_CLASSIFICATIONS.PAYABLE &&
+      reservationExpired
+    ) {
+      const cancellationNow = this.#now()
+      const cancellationClaim = await this.claims.renew(
+        order._id,
+        ownerToken,
+        { now: cancellationNow }
+      )
+      if (!cancellationClaim) {
+        return {
+          outcome: WORKER_OUTCOMES.CLAIM_LOST,
+          order: current,
+          cancellationRequested: false
+        }
       }
-      throw error
+
+      let cancellationResult
+      let cancellationFollowUpRequired = false
+      try {
+        cancellationResult = await this.cancellation.cancelPaymentOrder(payment._id, {
+          now: cancellationNow
+        })
+      } catch (error) {
+        if (!requiresCancellationFollowUp(error)) {
+          return this.#cancellationFailureResult(current, ownerToken, error)
+        }
+        cancellationFollowUpRequired = true
+      }
+
+      const cancellationCompleted =
+        cancellationFollowUpRequired ||
+        cancellationResult?.providerCancellationStatus === 'succeeded' ||
+        cancellationResult?.alreadyCompleted === true ||
+        cancellationResult?.alreadyCanceled === true ||
+        cancellationResult?.outcome === 'terminal_unpaid'
+
+      if (!cancellationCompleted) {
+        return this.#cancellationFailureResult(
+          current,
+          ownerToken,
+          new ServiceError(
+            'La cancelacion no produjo un resultado verificable',
+            'MERCADOPAGO_CANCELLATION_UNCONFIRMED',
+            409
+          )
+        )
+      }
+
+      const postCancelClaim = await this.claims.renew(
+        order._id,
+        ownerToken,
+        { now: this.#now() }
+      )
+      if (!postCancelClaim) {
+        const latest = await this.orders.getById(order._id)
+        if (latest?.status === 'paid') {
+          return {
+            outcome: WORKER_OUTCOMES.PAID,
+            order: latest,
+            cancellationRequested: true,
+            providerCheckPhase: 'post_cancel'
+          }
+        }
+        if (latest?.status === 'requires_attention') {
+          return {
+            outcome: WORKER_OUTCOMES.REQUIRES_ATTENTION,
+            order: latest,
+            cancellationRequested: true,
+            providerCheckPhase: 'post_cancel'
+          }
+        }
+        return {
+          outcome: WORKER_OUTCOMES.CLAIM_LOST,
+          order: current,
+          cancellationRequested: true,
+          providerCheckPhase: 'post_cancel'
+        }
+      }
+
+      const secondObservedAt = this.#now()
+      let secondResult
+      try {
+        secondResult = await this.reconciliation.reconcileProviderOrder(providerOrderId, {
+          now: secondObservedAt
+        })
+      } catch (error) {
+        return this.#providerFailureResult(current, ownerToken, error, {
+          cancellationRequested: true,
+          providerCheckPhase: 'post_cancel'
+        })
+      }
+
+      if (secondResult.outcome === 'paid') {
+        return {
+          outcome: WORKER_OUTCOMES.PAID,
+          order: current,
+          cancellationRequested: true,
+          providerCheckPhase: 'post_cancel'
+        }
+      }
+      if (secondResult.outcome === 'requires_attention') {
+        return {
+          outcome: WORKER_OUTCOMES.REQUIRES_ATTENTION,
+          order: current,
+          cancellationRequested: true,
+          providerCheckPhase: 'post_cancel'
+        }
+      }
+
+      if (
+        secondResult.remoteClassification === REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID &&
+        isReservationExpired(current.reservationExpiresAt, this.#now())
+      ) {
+        return this.#expireTerminalOrder({
+          order: current,
+          payment,
+          ownerToken,
+          providerOrderId,
+          reconciliationResult: secondResult,
+          observedAt: secondObservedAt,
+          extra: {
+            cancellationRequested: true,
+            providerCheckPhase: 'post_cancel'
+          }
+        })
+      }
+
+      return this.#scheduleObservedResult(current, ownerToken, secondResult, {
+        cancellationRequested: true,
+        providerCheckPhase: 'post_cancel'
+      })
     }
 
-    const nextAt = await this.#schedule(current, ownerToken, { providerSucceeded: true })
-    if (!nextAt) return { outcome: WORKER_OUTCOMES.CLAIM_LOST, order: current }
-
-    if (result.outcome === 'ignored') {
-      return { outcome: WORKER_OUTCOMES.IGNORED, order: current, nextAt }
-    }
-    if (result.remoteClassification === REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID) {
-      return { outcome: WORKER_OUTCOMES.TERMINAL_UNPAID, order: current, nextAt }
-    }
-    return { outcome: WORKER_OUTCOMES.STILL_PENDING, order: current, nextAt }
+    return this.#scheduleObservedResult(current, ownerToken, result, {
+      providerCheckPhase: 'initial'
+    })
   }
 
   async #processCandidate(candidate, runId) {
@@ -269,7 +596,9 @@ class PaymentReconciliationWorkerService {
         reason: result.reason || null,
         nextAt: result.nextAt?.toISOString() || null,
         failureNumber: result.failureNumber || null,
-        code: result.code || null
+        code: result.code || null,
+        cancellationRequested: result.cancellationRequested === true,
+        providerCheckPhase: result.providerCheckPhase || null
       })
       result = { claimed: true, ...result }
     } catch (error) {
@@ -336,6 +665,11 @@ class PaymentReconciliationWorkerService {
       providerUnavailable: 0,
       uncertain: 0,
       terminalUnpaid: 0,
+      cancelUncertain: 0,
+      cancelRejected: 0,
+      expired: 0,
+      alreadyExpired: 0,
+      integrityAttention: 0,
       ignored: 0,
       claimLost: 0,
       claimReleaseFailures: 0,
@@ -348,6 +682,11 @@ class PaymentReconciliationWorkerService {
       [WORKER_OUTCOMES.PROVIDER_UNAVAILABLE]: 'providerUnavailable',
       [WORKER_OUTCOMES.UNCERTAIN]: 'uncertain',
       [WORKER_OUTCOMES.TERMINAL_UNPAID]: 'terminalUnpaid',
+      [WORKER_OUTCOMES.CANCEL_UNCERTAIN]: 'cancelUncertain',
+      [WORKER_OUTCOMES.CANCEL_REJECTED]: 'cancelRejected',
+      [WORKER_OUTCOMES.EXPIRED]: 'expired',
+      [WORKER_OUTCOMES.ALREADY_EXPIRED]: 'alreadyExpired',
+      [WORKER_OUTCOMES.INTEGRITY_ATTENTION]: 'integrityAttention',
       [WORKER_OUTCOMES.IGNORED]: 'ignored',
       [WORKER_OUTCOMES.CLAIM_LOST]: 'claimLost',
       [WORKER_OUTCOMES.ERROR]: 'errors'

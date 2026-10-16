@@ -390,7 +390,7 @@ class MercadoPagoReconciliationService {
     }
 
     const expiration = new Date(context.order.reservationExpiresAt)
-    const expired = Number.isNaN(expiration.getTime()) || now.getTime() > expiration.getTime()
+    const expired = Number.isNaN(expiration.getTime()) || now.getTime() >= expiration.getTime()
     const inspection = context.order.status === 'pending_payment' && !expired
       ? await this.productUnits.inspectOrderReservation(
         { orderId: context.order._id },

@@ -861,6 +861,16 @@ describe('Mercado Pago authoritative reconciliation (isolated)', () => {
     assert.equal(state.units[0].status, 'reserved')
   })
 
+  it('treats a reservation expiring exactly at reconciliation time as expired', async () => {
+    const { service, state } = createReconciliationHarness({
+      order: { reservationExpiresAt: now }
+    })
+    await service.reconcileProviderOrder(providerOrderId, { now })
+    assert.equal(state.payment.normalizedStatus, 'approved')
+    assert.equal(state.order.status, 'requires_attention')
+    assert.equal(state.units[0].status, 'reserved')
+  })
+
   it('approves Payment but does not sell a unit already available', async () => {
     const units = [{
       _id: unitId, productId, orderId: null, orderItemId: null,

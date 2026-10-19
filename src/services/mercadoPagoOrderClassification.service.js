@@ -67,6 +67,18 @@ const hasPositivePaidAmount = (payments) => payments.some((payment) => {
   }
 })
 
+const hasExplicitNullPaidTotalWithEmptyPayments = (
+  providerOrder,
+  { statusDetail, payments }
+) => (
+  providerOrder.totalPaidAmount === null &&
+  statusDetail === 'canceled' &&
+  providerOrder.reconciliationSource?.totalPaidAmountPresent === true &&
+  providerOrder.reconciliationSource?.paymentsPresent === true &&
+  providerOrder.reconciliationSource?.paymentsIsArray === true &&
+  payments.length === 0
+)
+
 const classifyRemoteOrder = (providerOrder, expected = {}) => {
   if (!providerOrder || typeof providerOrder !== 'object' || Array.isArray(providerOrder)) {
     return REMOTE_ORDER_CLASSIFICATIONS.INCONSISTENT
@@ -101,15 +113,20 @@ const classifyRemoteOrder = (providerOrder, expected = {}) => {
     const currency = asText(providerOrder.currency)
     const totalAmount = providerOrder.totalAmount
     const totalPaidAmount = providerOrder.totalPaidAmount
+    const hasZeroPaidTotal = totalPaidAmount !== undefined &&
+      totalPaidAmount !== null &&
+      moneyMatches(totalPaidAmount, '0', 'MercadoPago.totalPaidAmount')
+    const hasExplicitEmptyUnpaidEvidence = hasExplicitNullPaidTotalWithEmptyPayments(
+      providerOrder,
+      { statusDetail, payments }
+    )
 
     if (
       !externalReference ||
       !currency ||
       totalAmount === undefined ||
       totalAmount === null ||
-      totalPaidAmount === undefined ||
-      totalPaidAmount === null ||
-      !moneyMatches(totalPaidAmount, '0', 'MercadoPago.totalPaidAmount') ||
+      (!hasZeroPaidTotal && !hasExplicitEmptyUnpaidEvidence) ||
       hasAccreditedPayment(payments) ||
       hasPositivePaidAmount(payments)
     ) return REMOTE_ORDER_CLASSIFICATIONS.INCONSISTENT

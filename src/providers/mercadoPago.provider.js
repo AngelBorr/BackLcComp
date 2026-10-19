@@ -159,6 +159,26 @@ const normalizeProviderPayments = (payments) => {
   }))
 }
 
+const reconciliationSourceFor = (payload) => {
+  const source = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? payload
+    : null
+  const transactions = source?.transactions
+  const transactionSource = transactions &&
+    typeof transactions === 'object' &&
+    !Array.isArray(transactions)
+    ? transactions
+    : null
+
+  return {
+    totalPaidAmountPresent: Boolean(source && Object.hasOwn(source, 'total_paid_amount')),
+    paymentsPresent: Boolean(
+      transactionSource && Object.hasOwn(transactionSource, 'payments')
+    ),
+    paymentsIsArray: Array.isArray(transactionSource?.payments)
+  }
+}
+
 const normalizeProviderOrder = (
   payload,
   { requireCheckoutUrl = false, includeReconciliation = false } = {}
@@ -202,6 +222,7 @@ const normalizeProviderOrder = (
     normalized.currency = optionalString(payload.currency)
     normalized.lastUpdatedDate = optionalString(payload.last_updated_date)
     normalized.payments = normalizeProviderPayments(payload.transactions?.payments)
+    normalized.reconciliationSource = reconciliationSourceFor(payload)
   }
 
   return normalized

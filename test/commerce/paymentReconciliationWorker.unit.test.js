@@ -432,6 +432,50 @@ describe('P1B.2 autonomous reconcile-only worker (isolated)', () => {
     assert.equal(state.orders[0].reconciliationFailures, 1)
   })
 
+  it('recovers an uncertain cancel when the next authoritative GET confirms terminal unpaid', async () => {
+    let currentNow = baseNow
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const timeout = Object.assign(new Error('timeout'), {
+      code: 'MERCADOPAGO_TIMEOUT',
+      status: 503
+    })
+    const harness = makeHarness({
+      orders: [order],
+      clock: () => currentNow,
+      reconcile: async ({ state }) => ({
+        outcome: 'pending',
+        remoteClassification: state.providerCalls === 1
+          ? REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+          : REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+      }),
+      cancel: async ({ state }) => {
+        state.payments.get(order._id).providerCancellationStatus = 'uncertain'
+        throw timeout
+      }
+    })
+
+    const first = await harness.run({ runId: 'cancel-uncertain' })
+    currentNow = new Date(baseNow.getTime() + fiveMinutes)
+    const second = await harness.run({
+      now: currentNow,
+      runId: 'terminal-unpaid-recovery'
+    })
+
+    assert.equal(first.cancelUncertain, 1)
+    assert.equal(second.expired, 1)
+    assert.equal(harness.state.providerCalls, 2)
+    assert.equal(harness.state.cancelCalls, 1)
+    assert.equal(harness.state.expirationCalls.length, 1)
+    assert.equal(harness.state.releaseInventoryCalls, 1)
+    assert.equal(harness.state.orders[0].status, 'expired')
+    assert.equal(harness.state.payments.get(order._id).normalizedStatus, 'cancelled')
+    assert.equal(
+      harness.state.payments.get(order._id).providerCancellationStatus,
+      'uncertain'
+    )
+    assert.equal(harness.state.units[0].status, 'available')
+  })
+
   it('keeps stock reserved and backs off on definitive cancellation rejection', async () => {
     const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
     const rejected = Object.assign(new Error('rejected'), {

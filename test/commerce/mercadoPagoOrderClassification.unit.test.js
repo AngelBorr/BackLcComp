@@ -24,6 +24,19 @@ const expected = {
   expectedCurrency: 'ARS'
 }
 
+const canceledWithExplicitNull = (overrides = {}) => baseOrder({
+  status: 'canceled',
+  statusDetail: 'canceled',
+  totalPaidAmount: null,
+  payments: [],
+  reconciliationSource: {
+    totalPaidAmountPresent: true,
+    paymentsPresent: true,
+    paymentsIsArray: true
+  },
+  ...overrides
+})
+
 describe('Mercado Pago remote Order financial classification (pure)', () => {
   for (const status of ['created', 'action_required']) {
     it(`classifies ${status} as PAYABLE`, () => {
@@ -60,6 +73,90 @@ describe('Mercado Pago remote Order financial classification (pure)', () => {
       CLASSIFICATION.TERMINAL_UNPAID
     )
   })
+
+  it('classifies canceled with explicit null paid total and explicit empty payments as TERMINAL_UNPAID', () => {
+    assert.equal(
+      classifyRemoteOrder(canceledWithExplicitNull(), expected),
+      CLASSIFICATION.TERMINAL_UNPAID
+    )
+  })
+
+  for (const { name, order } of [
+    {
+      name: 'missing total_paid_amount',
+      order: canceledWithExplicitNull({
+        reconciliationSource: {
+          totalPaidAmountPresent: false,
+          paymentsPresent: true,
+          paymentsIsArray: true
+        }
+      })
+    },
+    {
+      name: 'missing payments',
+      order: canceledWithExplicitNull({
+        reconciliationSource: {
+          totalPaidAmountPresent: true,
+          paymentsPresent: false,
+          paymentsIsArray: false
+        }
+      })
+    },
+    {
+      name: 'non-array payments',
+      order: canceledWithExplicitNull({
+        reconciliationSource: {
+          totalPaidAmountPresent: true,
+          paymentsPresent: true,
+          paymentsIsArray: false
+        }
+      })
+    },
+    {
+      name: 'a non-empty failed zero payment',
+      order: canceledWithExplicitNull({
+        payments: [{ status: 'failed', statusDetail: 'rejected', paidAmount: '0.00' }]
+      })
+    },
+    {
+      name: 'an accredited payment',
+      order: canceledWithExplicitNull({
+        payments: [{ status: 'processed', statusDetail: 'accredited', paidAmount: '0.00' }]
+      })
+    },
+    {
+      name: 'a positive paid amount',
+      order: canceledWithExplicitNull({
+        payments: [{ status: 'failed', statusDetail: 'rejected', paidAmount: '1.00' }]
+      })
+    },
+    {
+      name: 'a missing canceled status detail',
+      order: canceledWithExplicitNull({ statusDetail: null })
+    },
+    {
+      name: 'an incompatible status detail',
+      order: canceledWithExplicitNull({ statusDetail: 'unknown' })
+    }
+  ]) {
+    it(`keeps explicit null fail-closed with ${name}`, () => {
+      assert.equal(classifyRemoteOrder(order, expected), CLASSIFICATION.INCONSISTENT)
+    })
+  }
+
+  for (const { name, overrides } of [
+    { name: 'provider Order ID', overrides: { providerOrderId: 'ORD01OTHER' } },
+    { name: 'external reference', overrides: { externalReference: 'OTHER' } },
+    { name: 'currency', overrides: { currency: 'USD' } },
+    { name: 'total amount', overrides: { totalAmount: '1.00' } }
+  ]) {
+    it(`keeps explicit null fail-closed on ${name} mismatch`, () => {
+      assert.equal(
+        classifyRemoteOrder(canceledWithExplicitNull(overrides), expected),
+        CLASSIFICATION.INCONSISTENT
+      )
+    })
+  }
 
   it('rejects canceled with a positive paid amount as INCONSISTENT', () => {
     const order = baseOrder({

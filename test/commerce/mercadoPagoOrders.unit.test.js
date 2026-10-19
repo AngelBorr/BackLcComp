@@ -5,7 +5,8 @@ import PaymentModel from '../../src/dao/models/payment.model.js'
 import {
   MERCADOPAGO_API_URL,
   MercadoPagoProvider,
-  MercadoPagoProviderError
+  MercadoPagoProviderError,
+  normalizeProviderOrder
 } from '../../src/providers/mercadoPago.provider.js'
 import { MercadoPagoCheckoutService } from '../../src/services/mercadoPagoCheckout.service.js'
 import { PaymentService } from '../../src/services/payment.service.js'
@@ -609,6 +610,51 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.equal(result.checkoutUrl, null)
   })
 
+  it('preserves reconciliation source presence without treating missing fields as empty', () => {
+    const explicitEmpty = normalizeProviderOrder(providerPayload({
+      status: 'canceled',
+      total_paid_amount: null,
+      transactions: { payments: [] }
+    }), { includeReconciliation: true })
+    const missingTotal = normalizeProviderOrder(providerPayload({
+      status: 'canceled',
+      transactions: { payments: [] }
+    }), { includeReconciliation: true })
+    const missingPayments = normalizeProviderOrder(providerPayload({
+      status: 'canceled',
+      total_paid_amount: null
+    }), { includeReconciliation: true })
+    const nonArrayPayments = normalizeProviderOrder(providerPayload({
+      status: 'canceled',
+      total_paid_amount: null,
+      transactions: { payments: {} }
+    }), { includeReconciliation: true })
+
+    assert.deepEqual(explicitEmpty.reconciliationSource, {
+      totalPaidAmountPresent: true,
+      paymentsPresent: true,
+      paymentsIsArray: true
+    })
+    assert.deepEqual(missingTotal.reconciliationSource, {
+      totalPaidAmountPresent: false,
+      paymentsPresent: true,
+      paymentsIsArray: true
+    })
+    assert.equal(missingTotal.totalPaidAmount, null)
+    assert.deepEqual(missingPayments.reconciliationSource, {
+      totalPaidAmountPresent: true,
+      paymentsPresent: false,
+      paymentsIsArray: false
+    })
+    assert.deepEqual(missingPayments.payments, [])
+    assert.deepEqual(nonArrayPayments.reconciliationSource, {
+      totalPaidAmountPresent: true,
+      paymentsPresent: true,
+      paymentsIsArray: false
+    })
+    assert.deepEqual(nonArrayPayments.payments, [])
+  })
+
   it('cancels through POST /v1/orders/{id}/cancel with an isolated key and no body', async () => {
     let captured
     const cancellationKey = 'cancel-123e4567-e89b-42d3-a456-426614174000'
@@ -647,7 +693,12 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
       totalPaidAmount: '0.00',
       currency: 'ARS',
       lastUpdatedDate: null,
-      payments: []
+      payments: [],
+      reconciliationSource: {
+        totalPaidAmountPresent: true,
+        paymentsPresent: true,
+        paymentsIsArray: true
+      }
     })
   })
 

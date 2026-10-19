@@ -710,6 +710,24 @@ describe('Mercado Pago webhook orchestration (isolated)', () => {
     assert.equal(harness.events.get(providerEventId).processingStatus, 'ignored')
   })
 
+  it('processes a terminal-unpaid observation without inventing a webhook financial effect', async () => {
+    const harness = createWebhookHarness({
+      reconciliationResult: {
+        outcome: 'pending',
+        orderId,
+        paymentId,
+        providerPaymentId: null,
+        remoteClassification: 'TERMINAL_UNPAID'
+      }
+    })
+
+    await harness.service.handleWebhook(webhookInput(), { now })
+
+    assert.equal(harness.reconciliationCalls, 1)
+    assert.equal(harness.events.get(providerEventId).processingStatus, 'processed')
+    assert.equal(harness.events.get(providerEventId).providerPaymentId, null)
+  })
+
   it('allows only one concurrent webhook to run financial effects', async () => {
     let release
     const gate = new Promise((resolve) => { release = resolve })
@@ -776,6 +794,38 @@ describe('Mercado Pago authoritative reconciliation (isolated)', () => {
     assert.equal(result.remoteClassification, 'TERMINAL_UNPAID')
     assert.equal(state.payment.normalizedStatus, 'pending')
     assert.equal(state.order.status, 'pending_payment')
+    assert.equal(state.units[0].status, 'reserved')
+  })
+
+  it('observes the real canceled null-empty fixture without moving local financial state', async () => {
+    const expiredAt = new Date(now.getTime() - 1)
+    const { service, state } = createReconciliationHarness({
+      order: { reservationExpiresAt: expiredAt },
+      payment: { providerCancellationStatus: 'uncertain' },
+      providerOrder: {
+        status: 'canceled',
+        statusDetail: 'canceled',
+        totalPaidAmount: null,
+        payments: [],
+        reconciliationSource: {
+          totalPaidAmountPresent: true,
+          paymentsPresent: true,
+          paymentsIsArray: true
+        }
+      }
+    })
+
+    const result = await service.reconcileProviderOrder(providerOrderId, { now })
+
+    assert.equal(result.outcome, 'pending')
+    assert.equal(result.remoteClassification, 'TERMINAL_UNPAID')
+    assert.equal(state.payment.normalizedStatus, 'pending')
+    assert.equal(state.payment.providerStatus, 'canceled')
+    assert.equal(state.payment.providerStatusDetail, 'canceled')
+    assert.equal(state.payment.lastProviderCheckAt.getTime(), now.getTime())
+    assert.equal(state.payment.providerCancellationStatus, 'uncertain')
+    assert.equal(state.order.status, 'pending_payment')
+    assert.equal(state.order.reservationExpiresAt.getTime(), expiredAt.getTime())
     assert.equal(state.units[0].status, 'reserved')
   })
 

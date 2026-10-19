@@ -394,6 +394,32 @@ describe('Buyer payment reconciliation P1A (isolated)', () => {
     assert.equal(state.payment.providerOrderId, null)
   })
 
+  it('keeps buyer recovery pending after an authoritative terminal-unpaid observation', async () => {
+    const { service, state } = createHarness({
+      reconcile(current) {
+        current.payment.providerStatus = 'canceled'
+        current.payment.providerStatusDetail = 'canceled'
+        current.payment.lastProviderCheckAt = now
+        return {
+          outcome: 'pending',
+          orderId,
+          paymentId,
+          providerPaymentId: null,
+          remoteClassification: 'TERMINAL_UNPAID'
+        }
+      }
+    })
+
+    const result = await service.reconcileForBuyer({ orderNumber, userId, now })
+
+    assert.equal(result.outcome, 'pending')
+    assert.equal(state.providerCalls, 1)
+    assert.equal(state.order.status, 'pending_payment')
+    assert.equal(state.payment.normalizedStatus, 'pending')
+    assert.equal(state.payment.providerStatus, 'canceled')
+    assert.equal(state.productUnits[0].status, 'reserved')
+  })
+
   it('does not reopen a terminal unpaid Order', async () => {
     const { service, state } = createHarness({
       order: { status: 'expired', fulfillmentStatus: 'cancelled' },

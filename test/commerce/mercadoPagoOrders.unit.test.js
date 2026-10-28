@@ -629,30 +629,46 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
       total_paid_amount: null,
       transactions: { payments: {} }
     }), { includeReconciliation: true })
+    const omittedPaymentAggregates = normalizeProviderOrder(providerPayload({
+      status: 'canceled',
+      status_detail: 'canceled'
+    }), { includeReconciliation: true })
 
     assert.deepEqual(explicitEmpty.reconciliationSource, {
       totalPaidAmountPresent: true,
+      transactionsPresent: true,
       paymentsPresent: true,
       paymentsIsArray: true
     })
     assert.deepEqual(missingTotal.reconciliationSource, {
       totalPaidAmountPresent: false,
+      transactionsPresent: true,
       paymentsPresent: true,
       paymentsIsArray: true
     })
     assert.equal(missingTotal.totalPaidAmount, null)
     assert.deepEqual(missingPayments.reconciliationSource, {
       totalPaidAmountPresent: true,
+      transactionsPresent: false,
       paymentsPresent: false,
       paymentsIsArray: false
     })
     assert.deepEqual(missingPayments.payments, [])
     assert.deepEqual(nonArrayPayments.reconciliationSource, {
       totalPaidAmountPresent: true,
+      transactionsPresent: true,
       paymentsPresent: true,
       paymentsIsArray: false
     })
     assert.deepEqual(nonArrayPayments.payments, [])
+    assert.equal(omittedPaymentAggregates.totalPaidAmount, null)
+    assert.deepEqual(omittedPaymentAggregates.payments, [])
+    assert.deepEqual(omittedPaymentAggregates.reconciliationSource, {
+      totalPaidAmountPresent: false,
+      transactionsPresent: false,
+      paymentsPresent: false,
+      paymentsIsArray: false
+    })
   })
 
   it('cancels through POST /v1/orders/{id}/cancel with an isolated key and no body', async () => {
@@ -696,6 +712,7 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
       payments: [],
       reconciliationSource: {
         totalPaidAmountPresent: true,
+        transactionsPresent: true,
         paymentsPresent: true,
         paymentsIsArray: true
       }

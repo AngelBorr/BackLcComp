@@ -728,6 +728,24 @@ describe('Mercado Pago webhook orchestration (isolated)', () => {
     assert.equal(harness.events.get(providerEventId).providerPaymentId, null)
   })
 
+  it('processes omitted canceled aggregates without granting webhook expiration authority', async () => {
+    const harness = createWebhookHarness({
+      reconciliationResult: {
+        outcome: 'pending',
+        orderId,
+        paymentId,
+        providerPaymentId: null,
+        remoteClassification: 'CANCELED_PAYMENT_AGGREGATES_OMITTED'
+      }
+    })
+
+    await harness.service.handleWebhook(webhookInput(), { now })
+
+    assert.equal(harness.reconciliationCalls, 1)
+    assert.equal(harness.events.get(providerEventId).processingStatus, 'processed')
+    assert.equal(harness.events.get(providerEventId).providerPaymentId, null)
+  })
+
   it('allows only one concurrent webhook to run financial effects', async () => {
     let release
     const gate = new Promise((resolve) => { release = resolve })
@@ -809,6 +827,7 @@ describe('Mercado Pago authoritative reconciliation (isolated)', () => {
         payments: [],
         reconciliationSource: {
           totalPaidAmountPresent: true,
+          transactionsPresent: true,
           paymentsPresent: true,
           paymentsIsArray: true
         }
@@ -826,6 +845,44 @@ describe('Mercado Pago authoritative reconciliation (isolated)', () => {
     assert.equal(state.payment.providerCancellationStatus, 'uncertain')
     assert.equal(state.order.status, 'pending_payment')
     assert.equal(state.order.reservationExpiresAt.getTime(), expiredAt.getTime())
+    assert.equal(state.units[0].status, 'reserved')
+  })
+
+  it('keeps canceled with omitted payment aggregates descriptive and non-terminal', async () => {
+    const { service, state } = createReconciliationHarness({
+      payment: {
+        providerCancellationIdempotencyKey: 'cancel-worker-only',
+        providerCancellationStatus: 'uncertain',
+        providerCancellationAttemptedAt: new Date(now.getTime() - 1000),
+        providerCancellationPayableStatus: 'created',
+        providerCancellationPayableObservedAt: new Date(now.getTime() - 2000)
+      },
+      providerOrder: {
+        status: 'canceled',
+        statusDetail: 'canceled',
+        totalPaidAmount: null,
+        payments: [],
+        reconciliationSource: {
+          totalPaidAmountPresent: false,
+          transactionsPresent: false,
+          paymentsPresent: false,
+          paymentsIsArray: false
+        }
+      }
+    })
+
+    const result = await service.reconcileProviderOrder(providerOrderId, { now })
+
+    assert.equal(result.outcome, 'pending')
+    assert.equal(result.remoteClassification, 'CANCELED_PAYMENT_AGGREGATES_OMITTED')
+    assert.deepEqual(result.verifiedProviderContext, {
+      providerOrderId,
+      externalReference: 'LC-2026-000001',
+      totalAmount: '154500.00',
+      currency: 'ARS'
+    })
+    assert.equal(state.payment.normalizedStatus, 'pending')
+    assert.equal(state.order.status, 'pending_payment')
     assert.equal(state.units[0].status, 'reserved')
   })
 

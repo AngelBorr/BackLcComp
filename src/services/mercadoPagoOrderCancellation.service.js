@@ -232,7 +232,11 @@ class MercadoPagoOrderCancellationService {
     payment = await this.payments.markProviderCancellationAttempt(
       payment._id,
       attempt.idempotencyKey,
-      attemptedAt
+      attemptedAt,
+      {
+        payableStatus: asText(remoteCheck.status).toLowerCase(),
+        payableObservedAt: attemptedAt
+      }
     )
 
     if (!payment) {

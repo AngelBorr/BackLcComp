@@ -327,7 +327,13 @@ class MercadoPagoReconciliationService {
         orderId: context.order._id,
         paymentId: payment._id,
         providerPaymentId: payment.providerPaymentId || null,
-        remoteClassification
+        remoteClassification,
+        verifiedProviderContext: {
+          providerOrderId: providerOrder.providerOrderId,
+          externalReference: providerOrder.externalReference,
+          totalAmount: providerOrder.totalAmount,
+          currency: providerOrder.currency
+        }
       }
     }
 

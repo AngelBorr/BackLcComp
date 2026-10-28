@@ -164,6 +164,8 @@ describe('Commerce domain foundation (isolated unit tests)', () => {
     assert.equal(payment.providerCancellationStatus, null)
     assert.equal(payment.providerCancellationAttemptedAt, null)
     assert.equal(payment.providerCancellationCompletedAt, null)
+    assert.equal(payment.providerCancellationPayableStatus, null)
+    assert.equal(payment.providerCancellationPayableObservedAt, null)
     assert.equal(event.processingStatus, 'received')
   })
 
@@ -211,6 +213,29 @@ describe('Commerce domain foundation (isolated unit tests)', () => {
     await assert.rejects(
       new PaymentModel({ ...paymentData, providerCancellationStatus: 'conflict' }).validate(),
       (error) => error?.errors?.providerCancellationStatus?.kind === 'enum'
+    )
+  })
+
+  it('accepts only PAYABLE statuses as persisted pre-cancellation evidence', async () => {
+    const paymentData = {
+      orderId,
+      externalReference: 'LC-2026-000010',
+      amountArs: '150000.00'
+    }
+
+    for (const providerCancellationPayableStatus of [null, 'created', 'action_required']) {
+      await new PaymentModel({
+        ...paymentData,
+        providerCancellationPayableStatus
+      }).validate()
+    }
+
+    await assert.rejects(
+      new PaymentModel({
+        ...paymentData,
+        providerCancellationPayableStatus: 'processing'
+      }).validate(),
+      (error) => error?.errors?.providerCancellationPayableStatus?.kind === 'enum'
     )
   })
 
@@ -264,6 +289,39 @@ describe('Commerce domain foundation (isolated unit tests)', () => {
     assert.equal(captured.update.$set.providerCancellationStatus, 'prepared')
     assert.equal(captured.options.runValidators, true)
     assert.equal(payment.providerCancellationStatus, 'prepared')
+  })
+
+  it('persists the PAYABLE observation and cancellation attempt in one fenced CAS', async () => {
+    const payments = new PaymentManager()
+    const key = 'cancel-123e4567-e89b-42d3-a456-426614174000'
+    const attemptedAt = new Date('2026-10-27T12:00:00.000Z')
+    const payableObservedAt = new Date('2026-10-27T11:59:59.000Z')
+    let captured
+
+    stub(PaymentModel, 'findOneAndUpdate', (filter, update, options) => {
+      captured = { filter, update, options }
+      return queryResult({ _id: paymentId })
+    })
+
+    await payments.markProviderCancellationAttempt(
+      paymentId,
+      key,
+      attemptedAt,
+      { payableStatus: 'created', payableObservedAt }
+    )
+
+    assert.equal(captured.filter.normalizedStatus, 'pending')
+    assert.equal(captured.filter.providerCancellationIdempotencyKey, key)
+    assert.deepEqual(captured.filter.providerCancellationStatus.$in, ['prepared', 'uncertain'])
+    assert.equal(JSON.stringify(captured.filter.$and).includes('providerPaymentId'), true)
+    assert.equal(JSON.stringify(captured.filter.$and).includes('approvedAt'), true)
+    assert.equal(captured.update.$set.providerCancellationAttemptedAt, attemptedAt)
+    assert.equal(captured.update.$set.providerCancellationPayableStatus, 'created')
+    assert.equal(
+      captured.update.$set.providerCancellationPayableObservedAt,
+      payableObservedAt
+    )
+    assert.equal(captured.options.runValidators, true)
   })
 
   it('marks the provider attempt prepared only with its request snapshot', async () => {

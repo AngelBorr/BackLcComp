@@ -5,6 +5,7 @@ import ProductUnitManager from '../dao/managers/productUnit.manager.js'
 import ProductUnitService from './productUnit.service.js'
 import { REMOTE_ORDER_CLASSIFICATIONS } from './mercadoPagoOrderClassification.service.js'
 import { ServiceError } from './service.products.js'
+import { toMinorUnits } from '../utils/commerceMoney.js'
 import { error as logError, secureLog } from '../utils/logger.js'
 
 const TRANSACTION_OPTIONS = Object.freeze({
@@ -14,9 +15,17 @@ const TRANSACTION_OPTIONS = Object.freeze({
 
 const EXPIRATION_REASON = 'PAYMENT_WINDOW_EXPIRED_UNPAID'
 const INTEGRITY_REASON = 'RESERVATION_INTEGRITY_CONFLICT'
+const CONTEXTUAL_CANCELLATION_SOURCE = 'worker_cancellation_chain'
 
 const asText = (value) => String(value ?? '').trim()
 const sameId = (left, right) => String(left ?? '') === String(right ?? '')
+const sameMoney = (left, right) => {
+  try {
+    return toMinorUnits(left) === toMinorUnits(right)
+  } catch {
+    return false
+  }
+}
 
 class OrderExpirationService {
   constructor({
@@ -80,13 +89,71 @@ class OrderExpirationService {
       )
     }
 
+    let cancellationContext = null
+
+    if (value.source === CONTEXTUAL_CANCELLATION_SOURCE) {
+      const context = value.cancellationContext
+      const attemptedAt = context?.providerCancellationAttemptedAt == null
+        ? null
+        : new Date(context.providerCancellationAttemptedAt)
+      const payableObservedAt = context?.providerCancellationPayableObservedAt == null
+        ? null
+        : new Date(context.providerCancellationPayableObservedAt)
+      const idempotencyKey = asText(context?.providerCancellationIdempotencyKey)
+      const cancellationStatus = asText(context?.providerCancellationStatus)
+      const payableStatus = asText(context?.providerCancellationPayableStatus).toLowerCase()
+      const verifiedExternalReference = asText(context?.verifiedExternalReference)
+      const verifiedAmountArs = asText(context?.verifiedAmountArs)
+      const verifiedCurrency = asText(context?.verifiedCurrency).toUpperCase()
+
+      if (
+        !idempotencyKey ||
+        idempotencyKey.length > 128 ||
+        !['uncertain', 'succeeded'].includes(cancellationStatus) ||
+        !['created', 'action_required'].includes(payableStatus) ||
+        !verifiedExternalReference ||
+        !verifiedAmountArs ||
+        verifiedCurrency !== 'ARS' ||
+        !attemptedAt ||
+        !payableObservedAt ||
+        Number.isNaN(attemptedAt.getTime()) ||
+        Number.isNaN(payableObservedAt.getTime()) ||
+        payableObservedAt.getTime() > attemptedAt.getTime() ||
+        observedAt.getTime() < attemptedAt.getTime()
+      ) {
+        throw new ServiceError(
+          'La evidencia contextual de cancelacion es invalida',
+          'INVALID_TERMINAL_UNPAID_EVIDENCE',
+          409
+        )
+      }
+
+      cancellationContext = {
+        providerCancellationIdempotencyKey: idempotencyKey,
+        providerCancellationStatus: cancellationStatus,
+        providerCancellationAttemptedAt: attemptedAt,
+        providerCancellationPayableStatus: payableStatus,
+        providerCancellationPayableObservedAt: payableObservedAt,
+        verifiedExternalReference,
+        verifiedAmountArs,
+        verifiedCurrency
+      }
+    } else if (value.source != null) {
+      throw new ServiceError(
+        'La fuente de evidencia terminal es invalida',
+        'INVALID_TERMINAL_UNPAID_EVIDENCE',
+        409
+      )
+    }
+
     return {
       providerOrderId,
       classification: value.classification,
       remoteStatus,
       observedAt,
       orderId: String(orderId),
-      paymentId: String(paymentId)
+      paymentId: String(paymentId),
+      cancellationContext
     }
   }
 
@@ -134,6 +201,28 @@ class OrderExpirationService {
 
   #assertPaymentEvidence(payment, { orderId, paymentId, evidence }) {
     const observedAt = new Date(payment?.lastProviderCheckAt)
+    const context = evidence.cancellationContext
+    const attemptedAt = payment?.providerCancellationAttemptedAt == null
+      ? null
+      : new Date(payment.providerCancellationAttemptedAt)
+    const payableObservedAt = payment?.providerCancellationPayableObservedAt == null
+      ? null
+      : new Date(payment.providerCancellationPayableObservedAt)
+    const contextualEvidenceMismatch = Boolean(context && (
+      payment.providerCancellationIdempotencyKey !==
+        context.providerCancellationIdempotencyKey ||
+      payment.providerCancellationStatus !== context.providerCancellationStatus ||
+      !attemptedAt ||
+      attemptedAt.getTime() !== context.providerCancellationAttemptedAt.getTime() ||
+      payment.providerCancellationPayableStatus !==
+        context.providerCancellationPayableStatus ||
+      !payableObservedAt ||
+      payableObservedAt.getTime() !==
+        context.providerCancellationPayableObservedAt.getTime() ||
+      asText(payment.externalReference) !== context.verifiedExternalReference ||
+      !sameMoney(payment.amountArs, context.verifiedAmountArs) ||
+      asText(payment.currency).toUpperCase() !== context.verifiedCurrency
+    ))
 
     if (
       !payment ||
@@ -146,7 +235,8 @@ class OrderExpirationService {
       payment.approvedAt != null ||
       asText(payment.providerStatus).toLowerCase() !== evidence.remoteStatus ||
       Number.isNaN(observedAt.getTime()) ||
-      observedAt.getTime() !== evidence.observedAt.getTime()
+      observedAt.getTime() !== evidence.observedAt.getTime() ||
+      contextualEvidenceMismatch
     ) {
       throw new ServiceError(
         'El pago cambió o ya no coincide con la evidencia terminal',
@@ -163,7 +253,8 @@ class OrderExpirationService {
         orderId,
         providerOrderId: evidence.providerOrderId,
         observedAt: evidence.observedAt,
-        nextStatus
+        nextStatus,
+        cancellationContext: evidence.cancellationContext
       },
       { session }
     )
@@ -253,6 +344,21 @@ class OrderExpirationService {
           throw new ServiceError(
             'La reserva de la orden todavía no venció',
             'ORDER_RESERVATION_NOT_EXPIRED',
+            409
+          )
+        }
+
+        if (evidence.cancellationContext && (
+          asText(order.orderNumber) !==
+            evidence.cancellationContext.verifiedExternalReference ||
+          !sameMoney(
+            order.totals?.totalArs,
+            evidence.cancellationContext.verifiedAmountArs
+          )
+        )) {
+          throw new ServiceError(
+            'La identidad monetaria de la orden cambio antes de expirar',
+            'PAYMENT_EXPIRATION_CONFLICT',
             409
           )
         }

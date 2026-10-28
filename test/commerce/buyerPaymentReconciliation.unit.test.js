@@ -226,6 +226,27 @@ describe('Buyer payment reconciliation P1A (isolated)', () => {
     assert.equal(state.providerCalls, 1)
   })
 
+  it('keeps omitted canceled aggregates pending without worker expiration authority', async () => {
+    const { service, state } = createHarness({
+      reconcile() {
+        return {
+          outcome: 'pending',
+          orderId,
+          paymentId,
+          remoteClassification: 'CANCELED_PAYMENT_AGGREGATES_OMITTED'
+        }
+      }
+    })
+
+    const result = await service.reconcileForBuyer({ orderNumber, userId, now })
+
+    assert.equal(result.outcome, 'pending')
+    assert.equal(result.orderStatus, 'pending_payment')
+    assert.equal(result.paymentStatus, 'pending')
+    assert.equal(state.productUnits[0].status, 'reserved')
+    assert.equal(state.financialTransitions, 0)
+  })
+
   it('fails closed with 503 when the provider is unavailable', async () => {
     const providerError = new ServiceError('provider internals', 'MERCADOPAGO_TIMEOUT', 503)
     const { service, state } = createHarness({ reconciliationError: providerError })

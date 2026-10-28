@@ -47,6 +47,8 @@ const makeHarness = ({
       providerCancellationIdempotencyKey: null,
       providerCancellationStatus: null,
       providerCancellationAttemptedAt: null,
+      providerCancellationPayableStatus: null,
+      providerCancellationPayableObservedAt: null,
       providerCancellationCompletedAt: null,
       ...paymentOverrides
     },
@@ -74,7 +76,12 @@ const makeHarness = ({
       state.payment.providerCancellationStatus = 'prepared'
       return { ...state.payment }
     },
-    async markProviderCancellationAttempt(_paymentId, key, attemptedAt) {
+    async markProviderCancellationAttempt(
+      _paymentId,
+      key,
+      attemptedAt,
+      { payableStatus, payableObservedAt }
+    ) {
       if (
         state.payment.providerCancellationIdempotencyKey !== key ||
         !['prepared', 'uncertain'].includes(state.payment.providerCancellationStatus)
@@ -82,6 +89,8 @@ const makeHarness = ({
 
       state.attempts += 1
       state.payment.providerCancellationAttemptedAt = attemptedAt
+      state.payment.providerCancellationPayableStatus = payableStatus
+      state.payment.providerCancellationPayableObservedAt = payableObservedAt
       return { ...state.payment }
     },
     async updateProviderCancellationStatus(_paymentId, key, status, { completedAt = null } = {}) {
@@ -131,6 +140,11 @@ describe('Mercado Pago idempotent Order cancellation (isolated)', () => {
     assert.deepEqual(state.providerCalls, [{ id: providerOrderId, idempotencyKey: cancellationKey }])
     assert.equal(state.payment.providerCancellationStatus, 'succeeded')
     assert.equal(state.payment.providerCancellationAttemptedAt.toISOString(), now.toISOString())
+    assert.equal(state.payment.providerCancellationPayableStatus, 'created')
+    assert.equal(
+      state.payment.providerCancellationPayableObservedAt.toISOString(),
+      now.toISOString()
+    )
     assert.equal(state.payment.providerCancellationCompletedAt.toISOString(), now.toISOString())
     assert.equal(result.providerCancellationStatus, 'succeeded')
   })
@@ -143,6 +157,7 @@ describe('Mercado Pago idempotent Order cancellation (isolated)', () => {
     assert.deepEqual(state.providerGetCalls, [providerOrderId])
     assert.equal(state.providerCalls.length, 1)
     assert.equal(state.payment.providerCancellationStatus, 'succeeded')
+    assert.equal(state.payment.providerCancellationPayableStatus, 'action_required')
   })
 
   for (const [name, remoteOrder] of [
@@ -359,6 +374,34 @@ describe('Mercado Pago idempotent Order cancellation (isolated)', () => {
     assert.equal(state.payment.providerCancellationStatus, 'uncertain')
   })
 
+  it('persists PAYABLE evidence but keeps canceled with omitted aggregates uncertain', async () => {
+    const { service, state } = makeHarness({
+      cancelResult: {
+        ...canceledOrder(),
+        totalPaidAmount: null,
+        reconciliationSource: {
+          totalPaidAmountPresent: false,
+          transactionsPresent: false,
+          paymentsPresent: false,
+          paymentsIsArray: false
+        }
+      }
+    })
+
+    await assert.rejects(
+      service.cancelPaymentOrder(paymentId, { now }),
+      (error) => error.code === 'MERCADOPAGO_CANCELLATION_UNCONFIRMED'
+    )
+
+    assert.equal(state.payment.providerCancellationStatus, 'uncertain')
+    assert.equal(state.payment.providerCancellationPayableStatus, 'created')
+    assert.equal(
+      state.payment.providerCancellationPayableObservedAt.toISOString(),
+      now.toISOString()
+    )
+    assert.equal(state.payment.providerCancellationAttemptedAt.toISOString(), now.toISOString())
+  })
+
   for (const [name, cancelResult] of [
     ['created', payableOrder('created')],
     ['action_required', payableOrder('action_required')],
@@ -413,12 +456,19 @@ describe('Mercado Pago idempotent Order cancellation (isolated)', () => {
         state.payment.providerCancellationStatus = 'prepared'
         return { ...state.payment }
       },
-      async markProviderCancellationAttempt(_paymentId, key, attemptedAt) {
+      async markProviderCancellationAttempt(
+        _paymentId,
+        key,
+        attemptedAt,
+        { payableStatus, payableObservedAt }
+      ) {
         if (
           state.payment.providerCancellationIdempotencyKey !== key ||
           !['prepared', 'uncertain'].includes(state.payment.providerCancellationStatus)
         ) return null
         state.payment.providerCancellationAttemptedAt = attemptedAt
+        state.payment.providerCancellationPayableStatus = payableStatus
+        state.payment.providerCancellationPayableObservedAt = payableObservedAt
         return { ...state.payment }
       },
       async updateProviderCancellationStatus(_paymentId, key, status, { completedAt = null } = {}) {

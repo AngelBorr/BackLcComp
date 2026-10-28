@@ -172,6 +172,7 @@ const reconciliationSourceFor = (payload) => {
 
   return {
     totalPaidAmountPresent: Boolean(source && Object.hasOwn(source, 'total_paid_amount')),
+    transactionsPresent: Boolean(source && Object.hasOwn(source, 'transactions')),
     paymentsPresent: Boolean(
       transactionSource && Object.hasOwn(transactionSource, 'payments')
     ),

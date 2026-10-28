@@ -245,7 +245,8 @@ class PaymentManager {
   async markProviderCancellationAttempt(
     paymentId,
     providerCancellationIdempotencyKey,
-    attemptedAt
+    attemptedAt,
+    { payableStatus, payableObservedAt }
   ) {
     return PaymentModel.findOneAndUpdate(
       {
@@ -253,9 +254,29 @@ class PaymentManager {
         provider: 'mercado_pago',
         normalizedStatus: 'pending',
         providerCancellationIdempotencyKey,
-        providerCancellationStatus: { $in: ['prepared', 'uncertain'] }
+        providerCancellationStatus: { $in: ['prepared', 'uncertain'] },
+        $and: [
+          {
+            $or: [
+              { providerPaymentId: null },
+              { providerPaymentId: { $exists: false } }
+            ]
+          },
+          {
+            $or: [
+              { approvedAt: null },
+              { approvedAt: { $exists: false } }
+            ]
+          }
+        ]
       },
-      { $set: { providerCancellationAttemptedAt: attemptedAt } },
+      {
+        $set: {
+          providerCancellationAttemptedAt: attemptedAt,
+          providerCancellationPayableStatus: payableStatus,
+          providerCancellationPayableObservedAt: payableObservedAt
+        }
+      },
       { new: true, runValidators: true }
     ).lean()
   }
@@ -298,7 +319,8 @@ class PaymentManager {
       orderId,
       providerOrderId,
       observedAt,
-      nextStatus
+      nextStatus,
+      cancellationContext = null
     },
     { session } = {}
   ) {
@@ -311,6 +333,19 @@ class PaymentManager {
         providerOrderId,
         providerStatus: 'canceled',
         lastProviderCheckAt: observedAt,
+        ...(cancellationContext && {
+          providerCancellationIdempotencyKey:
+            cancellationContext.providerCancellationIdempotencyKey,
+          providerCancellationStatus: cancellationContext.providerCancellationStatus,
+          providerCancellationAttemptedAt: cancellationContext.providerCancellationAttemptedAt,
+          providerCancellationPayableStatus:
+            cancellationContext.providerCancellationPayableStatus,
+          providerCancellationPayableObservedAt:
+            cancellationContext.providerCancellationPayableObservedAt,
+          externalReference: cancellationContext.verifiedExternalReference,
+          amountArs: cancellationContext.verifiedAmountArs,
+          currency: cancellationContext.verifiedCurrency
+        }),
         $and: [
           {
             $or: [

@@ -203,6 +203,30 @@ describe('CheckoutFinancialGuardService P0 (isolated unit tests)', () => {
     )
   })
 
+  it('keeps omitted canceled aggregates blocked outside the worker-only path', async () => {
+    const order = makeOrder({ status: 'pending_payment' })
+    const payment = makePayment(order, {
+      normalizedStatus: 'pending',
+      providerCancellationIdempotencyKey: 'cancel-worker-only',
+      providerCancellationStatus: 'uncertain'
+    })
+    const { service } = makeHarness({
+      operations: [{ order, payment }],
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: 'CANCELED_PAYMENT_AGGREGATES_OMITTED'
+      })
+    })
+
+    await assert.rejects(
+      service.assertCanCreateCheckout(userId, { now, reconcile: true }),
+      (error) => error.code === 'CHECKOUT_PRIOR_PAYMENT_UNCERTAIN'
+    )
+
+    assert.equal(order.status, 'pending_payment')
+    assert.equal(payment.normalizedStatus, 'pending')
+  })
+
   it('fails closed without exposing provider identifiers when reconciliation is unavailable', async () => {
     const order = makeOrder({ status: 'pending_payment' })
     const payment = makePayment(order, { normalizedStatus: 'pending' })

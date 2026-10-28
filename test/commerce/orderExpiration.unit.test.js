@@ -16,6 +16,9 @@ import { ServiceError } from '../../src/services/service.products.js'
 
 const now = new Date('2026-10-12T12:00:00.000Z')
 const observedAt = new Date('2026-10-12T11:59:00.000Z')
+const cancellationAttemptedAt = new Date('2026-10-12T11:58:00.000Z')
+const payableObservedAt = new Date('2026-10-12T11:57:59.000Z')
+const cancellationKey = 'cancel-worker-context'
 const ids = {
   order: new mongoose.Types.ObjectId().toString(),
   payment: new mongoose.Types.ObjectId().toString(),
@@ -34,6 +37,7 @@ const baseState = () => ({
   order: {
     _id: ids.order,
     orderNumber: 'LC-2026-000100',
+    totals: { totalArs: '154500.00' },
     status: 'pending_payment',
     fulfillmentStatus: 'pending',
     reservationExpiresAt: new Date(now.getTime() - 1),
@@ -52,7 +56,10 @@ const baseState = () => ({
     providerPaymentId: null,
     providerStatus: 'canceled',
     approvedAt: null,
-    lastProviderCheckAt: observedAt
+    lastProviderCheckAt: observedAt,
+    externalReference: 'LC-2026-000100',
+    amountArs: '154500.00',
+    currency: 'ARS'
   },
   items: [{ _id: ids.item, orderId: ids.order, productId: ids.product, quantity: 1 }],
   units: [{
@@ -82,6 +89,29 @@ const evidence = (overrides = {}) => ({
   paymentId: ids.payment,
   ...overrides
 })
+
+const cancellationContext = (overrides = {}) => ({
+  providerCancellationIdempotencyKey: cancellationKey,
+  providerCancellationStatus: 'uncertain',
+  providerCancellationAttemptedAt: cancellationAttemptedAt,
+  providerCancellationPayableStatus: 'created',
+  providerCancellationPayableObservedAt: payableObservedAt,
+  verifiedExternalReference: 'LC-2026-000100',
+  verifiedAmountArs: '154500.00',
+  verifiedCurrency: 'ARS',
+  ...overrides
+})
+
+const workerCancellationEvidence = (overrides = {}) => evidence({
+  source: 'worker_cancellation_chain',
+  cancellationContext: cancellationContext(),
+  ...overrides
+})
+
+const withWorkerCancellationState = (state = baseState(), overrides = {}) => {
+  Object.assign(state.payment, cancellationContext(), overrides)
+  return state
+}
 
 const input = (overrides = {}) => ({
   orderId: ids.order,
@@ -192,7 +222,13 @@ const createHarness = ({ state: suppliedState, hooks = {} } = {}) => {
     },
     async transitionPendingWithTerminalUnpaidObservation(
       paymentId,
-      { orderId, providerOrderId, observedAt: expectedObservation, nextStatus }
+      {
+        orderId,
+        providerOrderId,
+        observedAt: expectedObservation,
+        nextStatus,
+        cancellationContext: expectedCancellationContext = null
+      }
     ) {
       hooks.beforePaymentTransition?.(state)
       const payment = state.payment
@@ -206,7 +242,22 @@ const createHarness = ({ state: suppliedState, hooks = {} } = {}) => {
         payment.providerStatus !== 'canceled' ||
         payment.providerPaymentId != null ||
         payment.approvedAt != null ||
-        new Date(payment.lastProviderCheckAt).getTime() !== expectedObservation.getTime()
+        new Date(payment.lastProviderCheckAt).getTime() !== expectedObservation.getTime() ||
+        (expectedCancellationContext && (
+          payment.providerCancellationIdempotencyKey !==
+            expectedCancellationContext.providerCancellationIdempotencyKey ||
+          payment.providerCancellationStatus !==
+            expectedCancellationContext.providerCancellationStatus ||
+          new Date(payment.providerCancellationAttemptedAt).getTime() !==
+            expectedCancellationContext.providerCancellationAttemptedAt.getTime() ||
+          payment.providerCancellationPayableStatus !==
+            expectedCancellationContext.providerCancellationPayableStatus ||
+          new Date(payment.providerCancellationPayableObservedAt).getTime() !==
+            expectedCancellationContext.providerCancellationPayableObservedAt.getTime() ||
+          payment.externalReference !== expectedCancellationContext.verifiedExternalReference ||
+          payment.amountArs !== expectedCancellationContext.verifiedAmountArs ||
+          payment.currency !== expectedCancellationContext.verifiedCurrency
+        ))
       ) return null
       payment.normalizedStatus = nextStatus
       return clone(payment)
@@ -319,6 +370,125 @@ describe('P1B.3a safe Order expiration domain command', () => {
     assert.equal(state.products[ids.product].prodStock, 1)
     assert.equal(state.order.statusHistory.at(-1).reason, 'PAYMENT_WINDOW_EXPIRED_UNPAID')
   })
+
+  it('expires through the worker-only cancellation chain with persisted contextual evidence', async () => {
+    const state = withWorkerCancellationState()
+    const { service } = createHarness({ state })
+
+    const result = await service.expirePendingOrderWithTerminalUnpaidEvidence(input({
+      terminalEvidence: workerCancellationEvidence()
+    }))
+
+    assert.equal(result.outcome, 'expired')
+    assert.equal(state.payment.normalizedStatus, 'cancelled')
+    assert.equal(state.order.status, 'expired')
+    assert.equal(state.units[0].status, 'available')
+    assert.equal(state.products[ids.product].prodStock, 1)
+  })
+
+  for (const [name, contextOverrides] of [
+    ['missing PAYABLE status', { providerCancellationPayableStatus: null }],
+    ['missing PAYABLE observation', { providerCancellationPayableObservedAt: null }],
+    ['PAYABLE observation after cancellation attempt', {
+      providerCancellationPayableObservedAt: new Date(cancellationAttemptedAt.getTime() + 1)
+    }],
+    ['prepared cancellation status', { providerCancellationStatus: 'prepared' }],
+    ['rejected cancellation status', { providerCancellationStatus: 'rejected' }],
+    ['empty cancellation key', { providerCancellationIdempotencyKey: '' }]
+  ]) {
+    it(`rejects worker-only evidence with ${name}`, async () => {
+      const state = withWorkerCancellationState()
+      const { service } = createHarness({ state })
+
+      await assert.rejects(
+        service.expirePendingOrderWithTerminalUnpaidEvidence(input({
+          terminalEvidence: workerCancellationEvidence({
+            cancellationContext: cancellationContext(contextOverrides)
+          })
+        })),
+        (error) => error.code === 'INVALID_TERMINAL_UNPAID_EVIDENCE'
+      )
+
+      assert.equal(state.payment.normalizedStatus, 'pending')
+      assert.equal(state.order.status, 'pending_payment')
+      assert.equal(state.units[0].status, 'reserved')
+      assert.equal(state.products[ids.product].prodStock, 99)
+    })
+  }
+
+  for (const [name, mutate] of [
+    ['cancellation key', (payment) => {
+      payment.providerCancellationIdempotencyKey = 'cancel-concurrent-mutation'
+    }],
+    ['cancellation status', (payment) => {
+      payment.providerCancellationStatus = 'rejected'
+    }],
+    ['cancellation attempt date', (payment) => {
+      payment.providerCancellationAttemptedAt = new Date(cancellationAttemptedAt.getTime() + 1)
+    }],
+    ['PAYABLE status', (payment) => {
+      payment.providerCancellationPayableStatus = 'action_required'
+    }],
+    ['PAYABLE observation date', (payment) => {
+      payment.providerCancellationPayableObservedAt = new Date(payableObservedAt.getTime() + 1)
+    }],
+    ['external reference', (payment) => {
+      payment.externalReference = 'LC-CONCURRENT-MUTATION'
+    }],
+    ['amount', (payment) => {
+      payment.amountArs = '1.00'
+    }],
+    ['currency', (payment) => {
+      payment.currency = 'USD'
+    }]
+  ]) {
+    it(`rolls back inventory when the contextual ${name} changes before Payment CAS`, async () => {
+      const state = withWorkerCancellationState()
+      const { service } = createHarness({
+        state,
+        hooks: {
+          beforePaymentTransition(current) {
+            mutate(current.payment)
+          }
+        }
+      })
+
+      await assert.rejects(
+        service.expirePendingOrderWithTerminalUnpaidEvidence(input({
+          terminalEvidence: workerCancellationEvidence()
+        })),
+        (error) => error.code === 'PAYMENT_EXPIRATION_CONFLICT'
+      )
+
+      assert.equal(state.payment.normalizedStatus, 'pending')
+      assert.equal(state.order.status, 'pending_payment')
+      assert.equal(state.units[0].status, 'reserved')
+      assert.equal(state.products[ids.product].prodStock, 99)
+    })
+  }
+
+  for (const [name, mutate] of [
+    ['Order external reference', (order) => { order.orderNumber = 'LC-OTHER' }],
+    ['Order total', (order) => { order.totals.totalArs = '1.00' }]
+  ]) {
+    it(`rejects contextual evidence when ${name} no longer matches`, async () => {
+      const state = withWorkerCancellationState()
+      mutate(state.order)
+      const { service } = createHarness({ state })
+
+      await assert.rejects(
+        service.expirePendingOrderWithTerminalUnpaidEvidence(input({
+          terminalEvidence: workerCancellationEvidence()
+        })),
+        (error) => error.code === 'PAYMENT_EXPIRATION_CONFLICT'
+      )
+
+      assert.equal(state.payment.normalizedStatus, 'pending')
+      assert.equal(state.order.status, 'pending_payment')
+      assert.equal(state.units[0].status, 'reserved')
+      assert.equal(state.products[ids.product].prodStock, 99)
+    })
+  }
 
   for (const [name, invalidEvidence] of [
     ['classification', { classification: REMOTE_ORDER_CLASSIFICATIONS.PAYABLE }],
@@ -906,6 +1076,52 @@ describe('P1B.3a expiration persistence fences', () => {
     assert.equal(JSON.stringify(captured.filter.$and).includes('providerPaymentId'), true)
     assert.equal(JSON.stringify(captured.filter.$and).includes('approvedAt'), true)
     assert.deepEqual(captured.update, { $set: { normalizedStatus: 'cancelled' } })
+  })
+
+  it('fences every persisted worker-cancellation field in the Payment CAS', async () => {
+    let captured
+    const context = cancellationContext()
+    stub(PaymentModel, 'findOneAndUpdate', (filter, update, options) => {
+      captured = { filter, update, options }
+      return { lean: async () => ({ _id: ids.payment }) }
+    })
+
+    await PaymentManager.transitionPendingWithTerminalUnpaidObservation(
+      ids.payment,
+      {
+        orderId: ids.order,
+        providerOrderId: 'ORD-TERMINAL-1',
+        observedAt,
+        nextStatus: 'cancelled',
+        cancellationContext: context
+      },
+      { session: 'session' }
+    )
+
+    assert.equal(
+      captured.filter.providerCancellationIdempotencyKey,
+      context.providerCancellationIdempotencyKey
+    )
+    assert.equal(
+      captured.filter.providerCancellationStatus,
+      context.providerCancellationStatus
+    )
+    assert.equal(
+      captured.filter.providerCancellationAttemptedAt,
+      context.providerCancellationAttemptedAt
+    )
+    assert.equal(
+      captured.filter.providerCancellationPayableStatus,
+      context.providerCancellationPayableStatus
+    )
+    assert.equal(
+      captured.filter.providerCancellationPayableObservedAt,
+      context.providerCancellationPayableObservedAt
+    )
+    assert.equal(captured.filter.externalReference, context.verifiedExternalReference)
+    assert.equal(captured.filter.amountArs, context.verifiedAmountArs)
+    assert.equal(captured.filter.currency, context.verifiedCurrency)
+    assert.equal(captured.options.session, 'session')
   })
 
   it('expires Order and clears only the current owner claim in the same CAS', async () => {

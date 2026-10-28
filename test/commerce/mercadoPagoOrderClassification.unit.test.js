@@ -31,8 +31,23 @@ const canceledWithExplicitNull = (overrides = {}) => baseOrder({
   payments: [],
   reconciliationSource: {
     totalPaidAmountPresent: true,
+    transactionsPresent: true,
     paymentsPresent: true,
     paymentsIsArray: true
+  },
+  ...overrides
+})
+
+const canceledWithOmittedPaymentAggregates = (overrides = {}) => baseOrder({
+  status: 'canceled',
+  statusDetail: 'canceled',
+  totalPaidAmount: null,
+  payments: [],
+  reconciliationSource: {
+    totalPaidAmountPresent: false,
+    transactionsPresent: false,
+    paymentsPresent: false,
+    paymentsIsArray: false
   },
   ...overrides
 })
@@ -81,12 +96,51 @@ describe('Mercado Pago remote Order financial classification (pure)', () => {
     )
   })
 
+  it('classifies canceled with omitted payment aggregates as descriptive non-terminal evidence', () => {
+    assert.equal(
+      classifyRemoteOrder(canceledWithOmittedPaymentAggregates(), expected),
+      CLASSIFICATION.CANCELED_PAYMENT_AGGREGATES_OMITTED
+    )
+  })
+
+  for (const { name, overrides } of [
+    { name: 'a positive paid total', overrides: { totalPaidAmount: '1.00' } },
+    {
+      name: 'an accredited payment',
+      overrides: {
+        payments: [{ status: 'processed', statusDetail: 'accredited', paidAmount: '1.00' }]
+      }
+    }
+  ]) {
+    it(`keeps omitted aggregate provenance fail-closed with ${name}`, () => {
+      assert.equal(
+        classifyRemoteOrder(canceledWithOmittedPaymentAggregates(overrides), expected),
+        CLASSIFICATION.INCONSISTENT
+      )
+    })
+  }
+
+  for (const { name, overrides } of [
+    { name: 'provider Order ID', overrides: { providerOrderId: 'ORD01OTHER' } },
+    { name: 'external reference', overrides: { externalReference: 'OTHER' } },
+    { name: 'currency', overrides: { currency: 'USD' } },
+    { name: 'total amount', overrides: { totalAmount: '1.00' } }
+  ]) {
+    it(`keeps omitted payment aggregates fail-closed on ${name} mismatch`, () => {
+      assert.equal(
+        classifyRemoteOrder(canceledWithOmittedPaymentAggregates(overrides), expected),
+        CLASSIFICATION.INCONSISTENT
+      )
+    })
+  }
+
   for (const { name, order } of [
     {
       name: 'missing total_paid_amount',
       order: canceledWithExplicitNull({
         reconciliationSource: {
           totalPaidAmountPresent: false,
+          transactionsPresent: true,
           paymentsPresent: true,
           paymentsIsArray: true
         }
@@ -97,6 +151,7 @@ describe('Mercado Pago remote Order financial classification (pure)', () => {
       order: canceledWithExplicitNull({
         reconciliationSource: {
           totalPaidAmountPresent: true,
+          transactionsPresent: false,
           paymentsPresent: false,
           paymentsIsArray: false
         }
@@ -107,6 +162,7 @@ describe('Mercado Pago remote Order financial classification (pure)', () => {
       order: canceledWithExplicitNull({
         reconciliationSource: {
           totalPaidAmountPresent: true,
+          transactionsPresent: true,
           paymentsPresent: true,
           paymentsIsArray: false
         }

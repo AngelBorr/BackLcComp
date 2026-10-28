@@ -8,9 +8,13 @@ import OrderExpirationService from './orderExpiration.service.js'
 import OrderReconciliationClaimService from './orderReconciliationClaim.service.js'
 import { REMOTE_ORDER_CLASSIFICATIONS } from './mercadoPagoOrderClassification.service.js'
 import { ServiceError } from './service.products.js'
+import { toMinorUnits } from '../utils/commerceMoney.js'
 
 const MINUTE_MS = 60 * 1000
 const HOUR_MS = 60 * MINUTE_MS
+const CONTEXTUAL_CANCELLATION_SOURCE = 'worker_cancellation_chain'
+const CANCELLATION_PAYABLE_STATUSES = new Set(['created', 'action_required'])
+const CANCELLATION_EVIDENCE_STATUSES = new Set(['uncertain', 'succeeded'])
 
 const WORKER_OUTCOMES = Object.freeze({
   PAID: 'paid',
@@ -78,6 +82,64 @@ const isReservationExpired = (reservationExpiresAt, now) => {
   if (reservationExpiresAt == null) return false
   const expiration = asDate(reservationExpiresAt)
   return Boolean(expiration && expiration.getTime() <= now.getTime())
+}
+
+const sameMoney = (left, right) => {
+  try {
+    return toMinorUnits(left) === toMinorUnits(right)
+  } catch {
+    return false
+  }
+}
+
+const contextualCancellationFor = (payment, providerOrderId, verifiedProviderContext) => {
+  const idempotencyKey = String(payment?.providerCancellationIdempotencyKey || '').trim()
+  const payableStatus = String(payment?.providerCancellationPayableStatus || '')
+    .trim()
+    .toLowerCase()
+  const payableObservedAt = asDate(payment?.providerCancellationPayableObservedAt)
+  const attemptedAt = asDate(payment?.providerCancellationAttemptedAt)
+  const verifiedProviderOrderId = String(
+    verifiedProviderContext?.providerOrderId || ''
+  ).trim()
+  const verifiedExternalReference = String(
+    verifiedProviderContext?.externalReference || ''
+  ).trim()
+  const verifiedCurrency = String(verifiedProviderContext?.currency || '').trim().toUpperCase()
+  const paymentExternalReference = String(payment?.externalReference || '').trim()
+  const paymentCurrency = String(payment?.currency || '').trim().toUpperCase()
+
+  if (
+    !payment ||
+    payment.normalizedStatus !== 'pending' ||
+    String(payment.providerOrderId || '').trim() !== providerOrderId ||
+    verifiedProviderOrderId !== providerOrderId ||
+    !verifiedExternalReference ||
+    verifiedExternalReference !== paymentExternalReference ||
+    !sameMoney(verifiedProviderContext?.totalAmount, payment.amountArs) ||
+    !verifiedCurrency ||
+    verifiedCurrency !== paymentCurrency ||
+    payment.providerPaymentId != null ||
+    payment.approvedAt != null ||
+    !idempotencyKey ||
+    idempotencyKey.length > 128 ||
+    !CANCELLATION_PAYABLE_STATUSES.has(payableStatus) ||
+    !CANCELLATION_EVIDENCE_STATUSES.has(payment.providerCancellationStatus) ||
+    !payableObservedAt ||
+    !attemptedAt ||
+    payableObservedAt.getTime() > attemptedAt.getTime()
+  ) return null
+
+  return {
+    providerCancellationIdempotencyKey: idempotencyKey,
+    providerCancellationStatus: payment.providerCancellationStatus,
+    providerCancellationAttemptedAt: attemptedAt,
+    providerCancellationPayableStatus: payableStatus,
+    providerCancellationPayableObservedAt: payableObservedAt,
+    verifiedExternalReference,
+    verifiedAmountArs: payment.amountArs,
+    verifiedCurrency
+  }
 }
 
 const isCancellationRejected = (error) => (
@@ -256,14 +318,44 @@ class PaymentReconciliationWorkerService {
     paymentId,
     providerOrderId,
     reconciliationResult,
-    observedAt
+    observedAt,
+    cancellationContext = null
   }) {
     const payment = await this.payments.getLatestByOrderId(order._id)
     const persistedObservation = asDate(payment?.lastProviderCheckAt)
+    const persistedCancellationContext = contextualCancellationFor(
+      payment,
+      providerOrderId,
+      reconciliationResult.verifiedProviderContext
+    )
+    const directTerminal = reconciliationResult.remoteClassification ===
+      REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+    const contextualTerminal = Boolean(
+      cancellationContext &&
+      reconciliationResult.remoteClassification ===
+        REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED &&
+      persistedCancellationContext &&
+      persistedCancellationContext.providerCancellationIdempotencyKey ===
+        cancellationContext.providerCancellationIdempotencyKey &&
+      persistedCancellationContext.providerCancellationStatus ===
+        cancellationContext.providerCancellationStatus &&
+      persistedCancellationContext.providerCancellationAttemptedAt.getTime() ===
+        cancellationContext.providerCancellationAttemptedAt.getTime() &&
+      persistedCancellationContext.providerCancellationPayableStatus ===
+        cancellationContext.providerCancellationPayableStatus &&
+      persistedCancellationContext.providerCancellationPayableObservedAt.getTime() ===
+        cancellationContext.providerCancellationPayableObservedAt.getTime() &&
+      persistedCancellationContext.verifiedExternalReference ===
+        cancellationContext.verifiedExternalReference &&
+      persistedCancellationContext.verifiedAmountArs ===
+        cancellationContext.verifiedAmountArs &&
+      persistedCancellationContext.verifiedCurrency === cancellationContext.verifiedCurrency &&
+      observedAt.getTime() >=
+        persistedCancellationContext.providerCancellationAttemptedAt.getTime()
+    )
 
     if (
-      reconciliationResult.remoteClassification !==
-        REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID ||
+      (!directTerminal && !contextualTerminal) ||
       !payment ||
       String(payment._id) !== String(paymentId) ||
       (reconciliationResult.paymentId &&
@@ -287,7 +379,11 @@ class PaymentReconciliationWorkerService {
       remoteStatus: 'canceled',
       observedAt: persistedObservation,
       orderId: String(order._id),
-      paymentId: String(payment._id)
+      paymentId: String(payment._id),
+      ...(contextualTerminal && {
+        source: CONTEXTUAL_CANCELLATION_SOURCE,
+        cancellationContext: persistedCancellationContext
+      })
     }
   }
 
@@ -298,6 +394,7 @@ class PaymentReconciliationWorkerService {
     providerOrderId,
     reconciliationResult,
     observedAt,
+    cancellationContext = null,
     extra = {}
   }) {
     const expirationNow = this.#now()
@@ -309,7 +406,8 @@ class PaymentReconciliationWorkerService {
       paymentId: payment._id,
       providerOrderId,
       reconciliationResult,
-      observedAt
+      observedAt,
+      cancellationContext
     })
 
     let result
@@ -423,6 +521,14 @@ class PaymentReconciliationWorkerService {
 
     const decisionNow = this.#now()
     const reservationExpired = isReservationExpired(current.reservationExpiresAt, decisionNow)
+    const cancellationContext = result.remoteClassification ===
+      REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED
+      ? contextualCancellationFor(
+        await this.payments.getLatestByOrderId(order._id),
+        providerOrderId,
+        result.verifiedProviderContext
+      )
+      : null
 
     if (
       result.remoteClassification === REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID &&
@@ -436,6 +542,22 @@ class PaymentReconciliationWorkerService {
         reconciliationResult: result,
         observedAt: firstObservedAt,
         extra: { providerCheckPhase: 'initial' }
+      })
+    }
+
+    if (cancellationContext && reservationExpired) {
+      return this.#expireTerminalOrder({
+        order: current,
+        payment,
+        ownerToken,
+        providerOrderId,
+        reconciliationResult: result,
+        observedAt: firstObservedAt,
+        cancellationContext,
+        extra: {
+          cancellationRequested: true,
+          providerCheckPhase: 'initial'
+        }
       })
     }
 
@@ -566,6 +688,35 @@ class PaymentReconciliationWorkerService {
             providerCheckPhase: 'post_cancel'
           }
         })
+      }
+
+      if (
+        secondResult.remoteClassification ===
+          REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED &&
+        isReservationExpired(current.reservationExpiresAt, this.#now())
+      ) {
+        const postCancelPayment = await this.payments.getLatestByOrderId(order._id)
+        const postCancelContext = contextualCancellationFor(
+          postCancelPayment,
+          providerOrderId,
+          secondResult.verifiedProviderContext
+        )
+
+        if (postCancelContext) {
+          return this.#expireTerminalOrder({
+            order: current,
+            payment,
+            ownerToken,
+            providerOrderId,
+            reconciliationResult: secondResult,
+            observedAt: secondObservedAt,
+            cancellationContext: postCancelContext,
+            extra: {
+              cancellationRequested: true,
+              providerCheckPhase: 'post_cancel'
+            }
+          })
+        }
       }
 
       return this.#scheduleObservedResult(current, ownerToken, secondResult, {
@@ -739,6 +890,7 @@ export {
   calculateCandidateLimit,
   calculateNextReconciliationAt,
   calculateProviderFailureBackoffMs,
+  contextualCancellationFor,
   isProviderUnavailable
 }
 export default new PaymentReconciliationWorkerService()

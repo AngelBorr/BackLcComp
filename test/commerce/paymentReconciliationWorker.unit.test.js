@@ -36,7 +36,24 @@ const makePayment = (order, overrides = {}) => ({
   providerStatus: null,
   lastProviderCheckAt: null,
   providerAttemptStatus: 'succeeded',
+  externalReference: order.orderNumber,
+  amountArs: '154500.00',
+  currency: 'ARS',
+  providerPaymentId: null,
+  approvedAt: null,
+  providerCancellationIdempotencyKey: null,
+  providerCancellationStatus: null,
+  providerCancellationAttemptedAt: null,
+  providerCancellationPayableStatus: null,
+  providerCancellationPayableObservedAt: null,
   ...overrides
+})
+
+const verifiedProviderContextFor = (order) => ({
+  providerOrderId: `provider-${order._id}`,
+  externalReference: order.orderNumber,
+  totalAmount: '154500.00',
+  currency: 'ARS'
 })
 
 const compareOrders = (left, right) => {
@@ -49,7 +66,8 @@ const remoteStatusFor = (classification) => ({
   [REMOTE_ORDER_CLASSIFICATIONS.PAYABLE]: 'created',
   [REMOTE_ORDER_CLASSIFICATIONS.PROCESSING]: 'processing',
   [REMOTE_ORDER_CLASSIFICATIONS.FAILED_UNCERTAIN]: 'failed',
-  [REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID]: 'canceled'
+  [REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID]: 'canceled',
+  [REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED]: 'canceled'
 })[classification] || null
 
 const makeHarness = ({
@@ -474,6 +492,269 @@ describe('P1B.2 autonomous reconcile-only worker (isolated)', () => {
       'uncertain'
     )
     assert.equal(harness.state.units[0].status, 'available')
+  })
+
+  it('expires worker-only when its persisted cancellation chain precedes omitted aggregates', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const cancellationKey = 'cancel-worker-only-chain'
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async ({ state }) => ({
+        outcome: 'pending',
+        remoteClassification: state.providerCalls === 1
+          ? REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+          : REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED,
+        verifiedProviderContext: verifiedProviderContextFor(order)
+      }),
+      cancel: async ({ paymentId, state }) => {
+        Object.assign(state.payments.get(order._id), {
+          providerCancellationIdempotencyKey: cancellationKey,
+          providerCancellationStatus: 'succeeded',
+          providerCancellationAttemptedAt: baseNow,
+          providerCancellationPayableStatus: 'created',
+          providerCancellationPayableObservedAt: baseNow
+        })
+        return { paymentId, providerCancellationStatus: 'succeeded' }
+      }
+    })
+
+    const result = await run()
+
+    assert.equal(result.expired, 1)
+    assert.equal(state.providerCalls, 2)
+    assert.equal(state.cancelCalls, 1)
+    assert.equal(state.expirationCalls.length, 1)
+    assert.equal(state.expirationCalls[0].terminalEvidence.source, 'worker_cancellation_chain')
+    assert.equal(
+      state.expirationCalls[0].terminalEvidence.cancellationContext
+        .providerCancellationIdempotencyKey,
+      cancellationKey
+    )
+    assert.equal(state.releaseInventoryCalls, 1)
+  })
+
+  it('reconstructs an uncertain cancellation chain after a crash before expiration', async () => {
+    let currentNow = baseNow
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const cancellationKey = 'cancel-crash-recovery-chain'
+    const unconfirmed = Object.assign(new Error('cancel result omitted aggregates'), {
+      code: 'MERCADOPAGO_CANCELLATION_UNCONFIRMED',
+      status: 409
+    })
+    const harness = makeHarness({
+      orders: [order],
+      clock: () => currentNow,
+      reconcile: async ({ state }) => ({
+        outcome: 'pending',
+        remoteClassification: state.providerCalls === 1
+          ? REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+          : REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED,
+        verifiedProviderContext: verifiedProviderContextFor(order)
+      }),
+      cancel: async ({ state }) => {
+        Object.assign(state.payments.get(order._id), {
+          providerCancellationIdempotencyKey: cancellationKey,
+          providerCancellationStatus: 'uncertain',
+          providerCancellationAttemptedAt: baseNow,
+          providerCancellationPayableStatus: 'created',
+          providerCancellationPayableObservedAt: baseNow
+        })
+        throw unconfirmed
+      }
+    })
+
+    const first = await harness.run({ runId: 'before-crash' })
+    currentNow = new Date(baseNow.getTime() + fiveMinutes)
+    const second = await harness.run({ now: currentNow, runId: 'after-crash' })
+
+    assert.equal(first.cancelUncertain, 1)
+    assert.equal(second.expired, 1)
+    assert.equal(harness.state.cancelCalls, 1)
+    assert.equal(harness.state.providerCalls, 2)
+    assert.equal(harness.state.expirationCalls.length, 1)
+    assert.equal(
+      harness.state.expirationCalls[0].terminalEvidence.source,
+      'worker_cancellation_chain'
+    )
+    assert.equal(harness.state.releaseInventoryCalls, 1)
+  })
+
+  it('keeps generic canceled omitted aggregates fail-closed without worker evidence', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.stillPending, 1)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.releaseInventoryCalls, 0)
+    assert.equal(state.units[0].status, 'reserved')
+  })
+
+  for (const { name, paymentOverrides } of [
+    {
+      name: 'missing PAYABLE metadata',
+      paymentOverrides: {
+        providerCancellationPayableStatus: null,
+        providerCancellationPayableObservedAt: null
+      }
+    },
+    {
+      name: 'PAYABLE observed after cancellation attempt',
+      paymentOverrides: {
+        providerCancellationPayableObservedAt: new Date(baseNow.getTime() + 1)
+      }
+    },
+    {
+      name: 'prepared cancellation status',
+      paymentOverrides: { providerCancellationStatus: 'prepared' }
+    },
+    {
+      name: 'rejected cancellation status',
+      paymentOverrides: { providerCancellationStatus: 'rejected' }
+    },
+    {
+      name: 'provider payment identity',
+      paymentOverrides: { providerPaymentId: 'PAY-UNEXPECTED' }
+    },
+    {
+      name: 'local approval timestamp',
+      paymentOverrides: { approvedAt: baseNow }
+    },
+    {
+      name: 'external reference mismatch',
+      paymentOverrides: { externalReference: 'LC-OTHER' }
+    },
+    {
+      name: 'amount mismatch',
+      paymentOverrides: { amountArs: '1.00' }
+    },
+    {
+      name: 'currency mismatch',
+      paymentOverrides: { currency: 'USD' }
+    }
+  ]) {
+    it(`does not elevate omitted aggregates with ${name}`, async () => {
+      const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+      const payment = makePayment(order, {
+        providerCancellationIdempotencyKey: 'cancel-invalid-context',
+        providerCancellationStatus: 'uncertain',
+        providerCancellationAttemptedAt: baseNow,
+        providerCancellationPayableStatus: 'created',
+        providerCancellationPayableObservedAt: baseNow,
+        ...paymentOverrides
+      })
+      const { run, state } = makeHarness({
+        orders: [order],
+        payments: { [order._id]: payment },
+        reconcile: async () => ({
+          outcome: 'pending',
+          remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED,
+          verifiedProviderContext: verifiedProviderContextFor(order)
+        })
+      })
+
+      const result = await run()
+
+      assert.equal(result.stillPending, 1)
+      assert.equal(state.expirationCalls.length, 0)
+      assert.equal(state.releaseInventoryCalls, 0)
+      assert.equal(state.units[0].status, 'reserved')
+    })
+  }
+
+  it('rejects a concurrent cancellation-key mutation before expiration', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const payment = makePayment(order, {
+      providerCancellationIdempotencyKey: 'cancel-original',
+      providerCancellationStatus: 'uncertain',
+      providerCancellationAttemptedAt: baseNow,
+      providerCancellationPayableStatus: 'created',
+      providerCancellationPayableObservedAt: baseNow
+    })
+    const { run, state } = makeHarness({
+      orders: [order],
+      payments: { [order._id]: payment },
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED,
+        verifiedProviderContext: verifiedProviderContextFor(order)
+      }),
+      renewHook: ({ call, state }) => {
+        if (call === 2) {
+          state.payments.get(order._id).providerCancellationIdempotencyKey = 'cancel-mutated'
+        }
+        return true
+      }
+    })
+
+    const result = await run()
+
+    assert.equal(result.errors, 1)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.releaseInventoryCalls, 0)
+    assert.equal(state.units[0].status, 'reserved')
+  })
+
+  it('rejects canceled evidence observed before the persisted cancellation attempt', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const payment = makePayment(order, {
+      providerCancellationIdempotencyKey: 'cancel-future-attempt',
+      providerCancellationStatus: 'uncertain',
+      providerCancellationAttemptedAt: new Date(baseNow.getTime() + 1),
+      providerCancellationPayableStatus: 'created',
+      providerCancellationPayableObservedAt: baseNow
+    })
+    const { run, state } = makeHarness({
+      orders: [order],
+      payments: { [order._id]: payment },
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED,
+        verifiedProviderContext: verifiedProviderContextFor(order)
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.errors, 1)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.releaseInventoryCalls, 0)
+    assert.equal(state.units[0].status, 'reserved')
+  })
+
+  it('does not release contextual cancellation evidence after losing the claim', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const payment = makePayment(order, {
+      providerCancellationIdempotencyKey: 'cancel-claim-lost',
+      providerCancellationStatus: 'uncertain',
+      providerCancellationAttemptedAt: baseNow,
+      providerCancellationPayableStatus: 'created',
+      providerCancellationPayableObservedAt: baseNow
+    })
+    const { run, state } = makeHarness({
+      orders: [order],
+      payments: { [order._id]: payment },
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED,
+        verifiedProviderContext: verifiedProviderContextFor(order)
+      }),
+      renewHook: ({ call }) => call !== 2
+    })
+
+    const result = await run()
+
+    assert.equal(result.claimLost, 1)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.releaseInventoryCalls, 0)
+    assert.equal(state.units[0].status, 'reserved')
   })
 
   it('keeps stock reserved and backs off on definitive cancellation rejection', async () => {

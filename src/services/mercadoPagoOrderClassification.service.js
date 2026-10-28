@@ -5,6 +5,7 @@ const REMOTE_ORDER_CLASSIFICATIONS = Object.freeze({
   PAYABLE: 'PAYABLE',
   PROCESSING: 'PROCESSING',
   TERMINAL_UNPAID: 'TERMINAL_UNPAID',
+  CANCELED_PAYMENT_AGGREGATES_OMITTED: 'CANCELED_PAYMENT_AGGREGATES_OMITTED',
   REFUNDED: 'REFUNDED',
   FAILED_UNCERTAIN: 'FAILED_UNCERTAIN',
   INCONSISTENT: 'INCONSISTENT'
@@ -79,6 +80,19 @@ const hasExplicitNullPaidTotalWithEmptyPayments = (
   payments.length === 0
 )
 
+const hasOmittedPaymentAggregates = (
+  providerOrder,
+  { statusDetail, payments }
+) => (
+  providerOrder.totalPaidAmount === null &&
+  statusDetail === 'canceled' &&
+  providerOrder.reconciliationSource?.totalPaidAmountPresent === false &&
+  providerOrder.reconciliationSource?.transactionsPresent === false &&
+  providerOrder.reconciliationSource?.paymentsPresent === false &&
+  providerOrder.reconciliationSource?.paymentsIsArray === false &&
+  payments.length === 0
+)
+
 const classifyRemoteOrder = (providerOrder, expected = {}) => {
   if (!providerOrder || typeof providerOrder !== 'object' || Array.isArray(providerOrder)) {
     return REMOTE_ORDER_CLASSIFICATIONS.INCONSISTENT
@@ -120,16 +134,27 @@ const classifyRemoteOrder = (providerOrder, expected = {}) => {
       providerOrder,
       { statusDetail, payments }
     )
+    const hasOmittedAggregates = hasOmittedPaymentAggregates(
+      providerOrder,
+      { statusDetail, payments }
+    )
 
     if (
       !externalReference ||
       !currency ||
       totalAmount === undefined ||
       totalAmount === null ||
-      (!hasZeroPaidTotal && !hasExplicitEmptyUnpaidEvidence) ||
       hasAccreditedPayment(payments) ||
       hasPositivePaidAmount(payments)
     ) return REMOTE_ORDER_CLASSIFICATIONS.INCONSISTENT
+
+    if (hasOmittedAggregates) {
+      return REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED
+    }
+
+    if (!hasZeroPaidTotal && !hasExplicitEmptyUnpaidEvidence) {
+      return REMOTE_ORDER_CLASSIFICATIONS.INCONSISTENT
+    }
 
     return REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
   }

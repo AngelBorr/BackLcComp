@@ -66,6 +66,12 @@ const paymentSchema = new mongoose.Schema(
     },
     providerCancellationAttemptedAt: { type: Date, default: null },
     providerCancellationCompletedAt: { type: Date, default: null },
+    providerCancellationPayableStatus: {
+      type: String,
+      enum: [null, 'created', 'action_required'],
+      default: null
+    },
+    providerCancellationPayableObservedAt: { type: Date, default: null },
     providerPaymentId: { type: String, trim: true, default: null },
     externalReference: { type: String, required: true, trim: true },
     providerStatus: { type: String, trim: true, default: null },

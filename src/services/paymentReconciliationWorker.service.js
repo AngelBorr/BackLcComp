@@ -318,11 +318,15 @@ class PaymentReconciliationWorkerService {
     paymentId,
     providerOrderId,
     reconciliationResult,
-    observedAt,
     cancellationContext = null
   }) {
     const payment = await this.payments.getLatestByOrderId(order._id)
-    const persistedObservation = asDate(payment?.lastProviderCheckAt)
+    const persistedObservation = payment?.lastProviderCheckAt == null
+      ? null
+      : asDate(payment.lastProviderCheckAt)
+    const reconciledObservation = reconciliationResult?.observedAt == null
+      ? null
+      : asDate(reconciliationResult.observedAt)
     const persistedCancellationContext = contextualCancellationFor(
       payment,
       providerOrderId,
@@ -350,7 +354,8 @@ class PaymentReconciliationWorkerService {
       persistedCancellationContext.verifiedAmountArs ===
         cancellationContext.verifiedAmountArs &&
       persistedCancellationContext.verifiedCurrency === cancellationContext.verifiedCurrency &&
-      observedAt.getTime() >=
+      reconciledObservation &&
+      reconciledObservation.getTime() >=
         persistedCancellationContext.providerCancellationAttemptedAt.getTime()
     )
 
@@ -363,8 +368,9 @@ class PaymentReconciliationWorkerService {
       payment.normalizedStatus !== 'pending' ||
       String(payment.providerOrderId || '').trim() !== providerOrderId ||
       String(payment.providerStatus || '').trim().toLowerCase() !== 'canceled' ||
+      !reconciledObservation ||
       !persistedObservation ||
-      persistedObservation.getTime() !== observedAt.getTime()
+      persistedObservation.getTime() !== reconciledObservation.getTime()
     ) {
       throw new ServiceError(
         'La evidencia terminal persistida cambio antes de expirar la Order',
@@ -393,7 +399,6 @@ class PaymentReconciliationWorkerService {
     ownerToken,
     providerOrderId,
     reconciliationResult,
-    observedAt,
     cancellationContext = null,
     extra = {}
   }) {
@@ -406,7 +411,6 @@ class PaymentReconciliationWorkerService {
       paymentId: payment._id,
       providerOrderId,
       reconciliationResult,
-      observedAt,
       cancellationContext
     })
 
@@ -540,7 +544,6 @@ class PaymentReconciliationWorkerService {
         ownerToken,
         providerOrderId,
         reconciliationResult: result,
-        observedAt: firstObservedAt,
         extra: { providerCheckPhase: 'initial' }
       })
     }
@@ -552,7 +555,6 @@ class PaymentReconciliationWorkerService {
         ownerToken,
         providerOrderId,
         reconciliationResult: result,
-        observedAt: firstObservedAt,
         cancellationContext,
         extra: {
           cancellationRequested: true,
@@ -682,7 +684,6 @@ class PaymentReconciliationWorkerService {
           ownerToken,
           providerOrderId,
           reconciliationResult: secondResult,
-          observedAt: secondObservedAt,
           extra: {
             cancellationRequested: true,
             providerCheckPhase: 'post_cancel'
@@ -709,7 +710,6 @@ class PaymentReconciliationWorkerService {
             ownerToken,
             providerOrderId,
             reconciliationResult: secondResult,
-            observedAt: secondObservedAt,
             cancellationContext: postCancelContext,
             extra: {
               cancellationRequested: true,

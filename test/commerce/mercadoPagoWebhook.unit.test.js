@@ -875,6 +875,7 @@ describe('Mercado Pago authoritative reconciliation (isolated)', () => {
 
     assert.equal(result.outcome, 'pending')
     assert.equal(result.remoteClassification, 'CANCELED_PAYMENT_AGGREGATES_OMITTED')
+    assert.equal(result.observedAt.getTime(), now.getTime())
     assert.deepEqual(result.verifiedProviderContext, {
       providerOrderId,
       externalReference: 'LC-2026-000001',

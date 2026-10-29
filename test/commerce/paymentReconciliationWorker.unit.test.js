@@ -236,8 +236,12 @@ const makeHarness = ({
           if (payment) {
             payment.providerStatus = result.remoteStatus ||
               remoteStatusFor(result.remoteClassification)
-            payment.lastProviderCheckAt = options.now
-            return { paymentId: payment._id, ...result }
+            payment.lastProviderCheckAt = result.observedAt || options.now
+            return {
+              paymentId: payment._id,
+              ...result,
+              observedAt: payment.lastProviderCheckAt
+            }
           }
         }
         return result
@@ -983,6 +987,63 @@ describe('P1B.2 autonomous reconcile-only worker (isolated)', () => {
     assert.equal(
       state.logs.some(({ metadata }) => metadata.code === 'TERMINAL_EVIDENCE_STALE'),
       true
+    )
+  })
+
+  it('uses the reconciler persisted observation instead of the worker request timestamp', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const persistedObservation = new Date(baseNow.getTime() + 250)
+    const { run, state } = makeHarness({
+      orders: [order],
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID,
+        observedAt: persistedObservation
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.expired, 1)
+    assert.equal(state.expirationCalls.length, 1)
+    assert.equal(
+      state.expirationCalls[0].terminalEvidence.observedAt.getTime(),
+      persistedObservation.getTime()
+    )
+  })
+
+  it('uses the persisted canceled observation for a recovered worker cancellation chain', async () => {
+    const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const attemptedAt = new Date(baseNow.getTime() - 1000)
+    const persistedObservation = new Date(baseNow.getTime() + 250)
+    const payment = makePayment(order, {
+      providerCancellationIdempotencyKey: 'cancel-e2e-recovery',
+      providerCancellationStatus: 'uncertain',
+      providerCancellationAttemptedAt: attemptedAt,
+      providerCancellationPayableStatus: 'created',
+      providerCancellationPayableObservedAt: attemptedAt
+    })
+    const { run, state } = makeHarness({
+      orders: [order],
+      payments: { [order._id]: payment },
+      reconcile: async () => ({
+        outcome: 'pending',
+        remoteClassification:
+          REMOTE_ORDER_CLASSIFICATIONS.CANCELED_PAYMENT_AGGREGATES_OMITTED,
+        observedAt: persistedObservation,
+        verifiedProviderContext: verifiedProviderContextFor(order)
+      })
+    })
+
+    const result = await run()
+
+    assert.equal(result.expired, 1)
+    assert.equal(state.cancelCalls, 0)
+    assert.equal(state.releaseInventoryCalls, 1)
+    assert.equal(state.expirationCalls[0].terminalEvidence.source, 'worker_cancellation_chain')
+    assert.equal(
+      state.expirationCalls[0].terminalEvidence.observedAt.getTime(),
+      persistedObservation.getTime()
     )
   })
 

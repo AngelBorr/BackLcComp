@@ -351,8 +351,10 @@ class PaymentReconciliationWorkerService {
         cancellationContext.providerCancellationPayableObservedAt.getTime() &&
       persistedCancellationContext.verifiedExternalReference ===
         cancellationContext.verifiedExternalReference &&
-      persistedCancellationContext.verifiedAmountArs ===
-        cancellationContext.verifiedAmountArs &&
+      sameMoney(
+        persistedCancellationContext.verifiedAmountArs,
+        cancellationContext.verifiedAmountArs
+      ) &&
       persistedCancellationContext.verifiedCurrency === cancellationContext.verifiedCurrency &&
       reconciledObservation &&
       reconciledObservation.getTime() >=

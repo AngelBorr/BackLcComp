@@ -1,6 +1,7 @@
 /* eslint-env mocha */
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
+import mongoose from 'mongoose'
 import {
   PaymentReconciliationWorkerService,
   WORKER_OUTCOMES,
@@ -47,6 +48,16 @@ const makePayment = (order, overrides = {}) => ({
   providerCancellationPayableStatus: null,
   providerCancellationPayableObservedAt: null,
   ...overrides
+})
+
+const clonePaymentRead = (payment) => ({
+  ...payment,
+  ...(payment.lastProviderCheckAt instanceof Date && {
+    lastProviderCheckAt: new Date(payment.lastProviderCheckAt.getTime())
+  }),
+  ...(payment.amountArs?._bsontype === 'Decimal128' && {
+    amountArs: mongoose.Types.Decimal128.fromString(payment.amountArs.toString())
+  })
 })
 
 const verifiedProviderContextFor = (order) => ({
@@ -210,7 +221,7 @@ const makeHarness = ({
   const paymentManager = {
     async getLatestByOrderId(id) {
       const payment = state.payments.get(id)
-      return payment ? { ...payment } : null
+      return payment ? clonePaymentRead(payment) : null
     }
   }
   const reconciliationService = {
@@ -236,11 +247,12 @@ const makeHarness = ({
           if (payment) {
             payment.providerStatus = result.remoteStatus ||
               remoteStatusFor(result.remoteClassification)
-            payment.lastProviderCheckAt = result.observedAt || options.now
+            const observedAt = new Date(result.observedAt || options.now)
+            payment.lastProviderCheckAt = observedAt
             return {
               paymentId: payment._id,
               ...result,
-              observedAt: payment.lastProviderCheckAt
+              observedAt: new Date(observedAt.getTime())
             }
           }
         }
@@ -963,19 +975,23 @@ describe('P1B.2 autonomous reconcile-only worker (isolated)', () => {
     assert.equal(state.units.some(({ status }) => status === 'available'), false)
   })
 
-  it('rejects stale terminal evidence before calling expiration', async () => {
+  it('rejects terminal evidence when the persisted observation differs by exactly 1ms', async () => {
     const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
+    const returnedObservation = new Date('2026-10-29T02:44:05.366Z')
     const { run, state } = makeHarness({
       orders: [order],
       renewHook: ({ call, state }) => {
         if (call === 2) {
-          state.payments.get(order._id).lastProviderCheckAt = new Date(baseNow.getTime() + 1)
+          state.payments.get(order._id).lastProviderCheckAt = new Date(
+            returnedObservation.getTime() + 1
+          )
         }
         return true
       },
       reconcile: async () => ({
         outcome: 'pending',
-        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID
+        remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID,
+        observedAt: returnedObservation
       })
     })
 
@@ -990,20 +1006,23 @@ describe('P1B.2 autonomous reconcile-only worker (isolated)', () => {
     )
   })
 
-  it('uses the reconciler persisted observation instead of the worker request timestamp', async () => {
+  it('accepts different Date instances representing the exact same millisecond', async () => {
     const order = makeOrder(1, { reservationExpiresAt: new Date(baseNow.getTime() - 1) })
-    const persistedObservation = new Date(baseNow.getTime() + 250)
+    const returnedObservation = new Date('2026-10-29T02:44:05.366Z')
     const { run, state } = makeHarness({
       orders: [order],
       reconcile: async () => ({
         outcome: 'pending',
         remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.TERMINAL_UNPAID,
-        observedAt: persistedObservation
+        observedAt: returnedObservation
       })
     })
 
     const result = await run()
+    const persistedObservation = state.payments.get(order._id).lastProviderCheckAt
 
+    assert.notEqual(persistedObservation, returnedObservation)
+    assert.equal(persistedObservation.getTime(), returnedObservation.getTime())
     assert.equal(result.expired, 1)
     assert.equal(state.expirationCalls.length, 1)
     assert.equal(
@@ -1017,6 +1036,7 @@ describe('P1B.2 autonomous reconcile-only worker (isolated)', () => {
     const attemptedAt = new Date(baseNow.getTime() - 1000)
     const persistedObservation = new Date(baseNow.getTime() + 250)
     const payment = makePayment(order, {
+      amountArs: mongoose.Types.Decimal128.fromString('154500.00'),
       providerCancellationIdempotencyKey: 'cancel-e2e-recovery',
       providerCancellationStatus: 'uncertain',
       providerCancellationAttemptedAt: attemptedAt,

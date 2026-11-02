@@ -35,16 +35,33 @@ class OrderAttentionResolutionManager {
     return query
   }
 
+  async claimPreparedResolutionAttempt(resolutionId, attemptToken, { session } = {}) {
+    return this.Model.findOneAndUpdate(
+      {
+        _id: resolutionId,
+        status: 'prepared',
+        activeAttemptToken: null
+      },
+      { $set: { activeAttemptToken: attemptToken } },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
   async completePreparedResolution(
     resolutionId,
-    { completedAt, providerEvidence, finalProductUnits, finalResult },
+    { completedAt, providerEvidence, finalProductUnits, finalResult, expectedAttemptToken },
     { session } = {}
   ) {
     return this.Model.findOneAndUpdate(
-      { _id: resolutionId, status: 'prepared' },
+      {
+        _id: resolutionId,
+        status: 'prepared',
+        ...(expectedAttemptToken && { activeAttemptToken: expectedAttemptToken })
+      },
       {
         $set: {
           status: 'completed',
+          activeAttemptToken: null,
           completedAt,
           providerEvidence,
           finalProductUnits,
@@ -62,7 +79,7 @@ class OrderAttentionResolutionManager {
     { session } = {}
   ) {
     return this.Model.findOneAndUpdate(
-      { _id: resolutionId, status: 'prepared' },
+      { _id: resolutionId, status: 'prepared', activeAttemptToken: null },
       {
         $set: {
           status: 'failed',

@@ -189,28 +189,51 @@ const classifyAttention = ({ order, payment }) => {
   }
 }
 
-const buildAllowedActions = ({ reservationIntegrity }) => {
+const buildAllowedActions = ({
+  order,
+  payment,
+  classification,
+  reservationIntegrity,
+  resolutions = []
+}) => {
+  const completeSaleBlockers = []
+
+  if (classification.attentionCategory !== ATTENTION_CATEGORIES.APPROVED_INVENTORY) {
+    completeSaleBlockers.push('ATTENTION_CATEGORY_NOT_ELIGIBLE')
+  }
+  if (!approvedPaymentEvidenceIsComplete(payment)) {
+    completeSaleBlockers.push('APPROVED_PAYMENT_EVIDENCE_INCOMPLETE')
+  }
+  if (asText(order?.fulfillmentStatus) !== 'pending') {
+    completeSaleBlockers.push('FULFILLMENT_NOT_PENDING')
+  }
+  if (!reservationIntegrity.valid) {
+    completeSaleBlockers.push('RESERVATION_INTEGRITY_INVALID')
+  }
+  if (resolutions.some((resolution) => resolution?.status === 'completed')) {
+    completeSaleBlockers.push('ATTENTION_ALREADY_RESOLVED')
+  }
+
   const commonBlockers = ['P1C_ACTION_NOT_IMPLEMENTED']
-  const inventoryBlockers = reservationIntegrity.valid
-    ? commonBlockers
-    : [...commonBlockers, 'RESERVATION_INTEGRITY_INVALID']
 
   return {
-    canCompleteExistingReservationSale: false,
+    canCompleteExistingReservationSale: completeSaleBlockers.length === 0,
     canCloseTerminalUnpaid: false,
     canReassignInventory: false,
     canRefund: false,
     blockers: {
-      completeExistingReservationSale: inventoryBlockers,
+      completeExistingReservationSale: completeSaleBlockers,
       closeTerminalUnpaid: commonBlockers,
-      reassignInventory: inventoryBlockers,
+      reassignInventory: reservationIntegrity.valid
+        ? commonBlockers
+        : [...commonBlockers, 'RESERVATION_INTEGRITY_INVALID'],
       refund: commonBlockers
     }
   }
 }
 
 class OrderAttentionService {
-  buildReadModel({ order, payment, orderItems = [], productUnits = [] }) {
+  buildReadModel({ order, payment, orderItems = [], productUnits = [], resolutions = [] }) {
     const reservationIntegrity = inspectReservationIntegrity({
       order,
       orderItems,
@@ -222,7 +245,13 @@ class OrderAttentionService {
       ...classification,
       originalAttentionReason: asText(order?.attentionReason),
       reservationIntegrity,
-      allowedActions: buildAllowedActions({ reservationIntegrity })
+      allowedActions: buildAllowedActions({
+        order,
+        payment,
+        classification,
+        reservationIntegrity,
+        resolutions
+      })
     }
   }
 }

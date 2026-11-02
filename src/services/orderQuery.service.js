@@ -163,8 +163,20 @@ const providerEvidenceDto = (evidence) => evidence
       providerStatus: evidence.providerStatus || null,
       providerStatusDetail: evidence.providerStatusDetail || null,
       amountArs: evidence.amountArs || null,
+      totalAmount: evidence.totalAmount || null,
+      totalPaidAmount: evidence.totalPaidAmount || null,
       currency: evidence.currency || null,
-      observedAt: toIsoString(evidence.observedAt)
+      observedAt: toIsoString(evidence.observedAt),
+      remoteClassification: evidence.remoteClassification || null,
+      accreditedPayment: evidence.accreditedPayment
+        ? {
+            providerPaymentId: evidence.accreditedPayment.providerPaymentId || null,
+            status: evidence.accreditedPayment.status || null,
+            statusDetail: evidence.accreditedPayment.statusDetail || null,
+            amount: evidence.accreditedPayment.amount || null,
+            paidAmount: evidence.accreditedPayment.paidAmount || null
+          }
+        : null
     }
   : null
 
@@ -174,7 +186,9 @@ const resolutionStateDto = (state) => state
       paymentStatus: state.paymentStatus || null,
       fulfillmentStatus: state.fulfillmentStatus || null,
       attentionReason: state.attentionReason || '',
-      attentionResolutionVersion: Number(state.attentionResolutionVersion || 0)
+      attentionResolutionVersion: Number(state.attentionResolutionVersion || 0),
+      paymentApprovedAt: toIsoString(state.paymentApprovedAt),
+      paymentLastProviderCheckAt: toIsoString(state.paymentLastProviderCheckAt)
     }
   : null
 
@@ -187,7 +201,8 @@ const resolutionResultDto = (result) => result
       fulfillmentStatus: result.fulfillmentStatus || null,
       attentionResolutionVersion: Number.isInteger(result.attentionResolutionVersion)
         ? result.attentionResolutionVersion
-        : null
+        : null,
+      soldCount: Number.isInteger(result.soldCount) ? result.soldCount : 0
     }
   : null
 
@@ -440,7 +455,8 @@ class OrderQueryService {
         order,
         payment,
         orderItems: items,
-        productUnits: units
+        productUnits: units,
+        resolutions
       })
       : null
     const attentionResolutionVersion = Number.isInteger(order.attentionResolutionVersion)

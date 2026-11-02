@@ -215,7 +215,8 @@ describe('P1C-0 Order attention foundation (isolated)', () => {
     assert.equal(result.attentionCategory, ATTENTION_CATEGORIES.APPROVED_INVENTORY)
     assert.equal(result.financialRisk, 'approved_money_inventory_unresolved')
     assert.equal(result.reservationIntegrity.valid, true)
-    assert.equal(result.allowedActions.canCompleteExistingReservationSale, false)
+    assert.equal(result.allowedActions.canCompleteExistingReservationSale, true)
+    assert.deepEqual(result.allowedActions.blockers.completeExistingReservationSale, [])
   })
 
   it('classifies provider mismatch as a financial inconsistency', () => {
@@ -277,6 +278,21 @@ describe('P1C-0 Order attention foundation (isolated)', () => {
       'RESERVATION_INTEGRITY_INVALID'
     ))
     assert.equal(Object.values(result.allowedActions).includes(true), false)
+  })
+
+  it('blocks completion after a prior completed resolution', () => {
+    const result = new OrderAttentionService().buildReadModel({
+      order: makeOrder(),
+      payment: makePayment(),
+      orderItems: [orderItem],
+      productUnits: [makeReservedUnit()],
+      resolutions: [{ status: 'completed', action: 'complete_existing_reservation_sale' }]
+    })
+
+    assert.equal(result.allowedActions.canCompleteExistingReservationSale, false)
+    assert.ok(result.allowedActions.blockers.completeExistingReservationSale.includes(
+      'ATTENTION_ALREADY_RESOLVED'
+    ))
   })
 
   it('reports a unit sold by another Order as invalid integrity', () => {
@@ -368,6 +384,35 @@ describe('P1C-0 Order attention foundation (isolated)', () => {
 
     assert.deepEqual(captured.filter, { _id: resolutionId, status: 'prepared' })
     assert.equal(captured.update.$set.status, 'completed')
+    assert.equal(captured.options.runValidators, true)
+    assert.equal(result, expected)
+  })
+
+  it('fences concurrent attempts by writing a unique token on the prepared resolution', async () => {
+    let captured
+    const expected = { _id: new mongoose.Types.ObjectId(), status: 'prepared' }
+    const manager = new OrderAttentionResolutionManager({
+      model: {
+        findOneAndUpdate(filter, update, options) {
+          captured = { filter, update, options }
+          return { lean: async () => expected }
+        }
+      }
+    })
+    const resolutionId = new mongoose.Types.ObjectId()
+    const result = await manager.claimPreparedResolutionAttempt(
+      resolutionId,
+      'unique-attempt-token'
+    )
+
+    assert.deepEqual(captured.filter, {
+      _id: resolutionId,
+      status: 'prepared',
+      activeAttemptToken: null
+    })
+    assert.deepEqual(captured.update, {
+      $set: { activeAttemptToken: 'unique-attempt-token' }
+    })
     assert.equal(captured.options.runValidators, true)
     assert.equal(result, expected)
   })

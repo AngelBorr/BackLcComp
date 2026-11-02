@@ -22,8 +22,24 @@ const providerEvidenceSchema = new mongoose.Schema(
     providerStatus: { type: String, trim: true, maxlength: 100, default: null },
     providerStatusDetail: { type: String, trim: true, maxlength: 200, default: null },
     amountArs: { type: String, trim: true, maxlength: 100, default: null },
+    totalAmount: { type: String, trim: true, maxlength: 100, default: null },
+    totalPaidAmount: { type: String, trim: true, maxlength: 100, default: null },
     currency: { type: String, trim: true, maxlength: 10, default: null },
-    observedAt: { type: Date, default: null }
+    observedAt: { type: Date, default: null },
+    remoteClassification: { type: String, trim: true, maxlength: 100, default: null },
+    accreditedPayment: {
+      type: new mongoose.Schema(
+        {
+          providerPaymentId: { type: String, trim: true, maxlength: 200, default: null },
+          status: { type: String, trim: true, maxlength: 100, default: null },
+          statusDetail: { type: String, trim: true, maxlength: 200, default: null },
+          amount: { type: String, trim: true, maxlength: 100, default: null },
+          paidAmount: { type: String, trim: true, maxlength: 100, default: null }
+        },
+        { _id: false }
+      ),
+      default: null
+    }
   },
   { _id: false }
 )
@@ -34,7 +50,9 @@ const stateSnapshotSchema = new mongoose.Schema(
     paymentStatus: { type: String, trim: true, maxlength: 100, default: null },
     fulfillmentStatus: { type: String, trim: true, maxlength: 100, default: null },
     attentionReason: { type: String, trim: true, maxlength: 500, default: '' },
-    attentionResolutionVersion: { type: Number, min: 0, default: 0 }
+    attentionResolutionVersion: { type: Number, min: 0, default: 0 },
+    paymentApprovedAt: { type: Date, default: null },
+    paymentLastProviderCheckAt: { type: Date, default: null }
   },
   { _id: false }
 )
@@ -64,7 +82,8 @@ const finalResultSchema = new mongoose.Schema(
     orderStatus: { type: String, trim: true, maxlength: 100, default: null },
     paymentStatus: { type: String, trim: true, maxlength: 100, default: null },
     fulfillmentStatus: { type: String, trim: true, maxlength: 100, default: null },
-    attentionResolutionVersion: { type: Number, min: 0, default: null }
+    attentionResolutionVersion: { type: Number, min: 0, default: null },
+    soldCount: { type: Number, min: 0, default: 0 }
   },
   { _id: false }
 )
@@ -131,6 +150,7 @@ const orderAttentionResolutionSchema = new mongoose.Schema(
       enum: ORDER_ATTENTION_RESOLUTION_STATUSES,
       default: 'prepared'
     },
+    activeAttemptToken: { type: String, trim: true, maxlength: 128, default: null },
     providerEvidence: { type: providerEvidenceSchema, default: null },
     previousState: { type: stateSnapshotSchema, default: null },
     previousProductUnits: { type: [productUnitSnapshotSchema], default: [] },

@@ -298,10 +298,12 @@ describe('Order administration queries and routes (isolated)', () => {
     }, { listCustomer() {}, getCustomer() {} })
     registerAdminOrderRoutes({
       get(path, policies, handler) { adminRoutes.push({ method: 'get', path, policies, handler }) },
+      post(path, policies, handler) { adminRoutes.push({ method: 'post', path, policies, handler }) },
       patch(path, policies, handler) { adminRoutes.push({ method: 'patch', path, policies, handler }) }
     }, {
       queryController: { listAdmin() {}, getAdmin() {} },
-      fulfillmentController: { update() {} }
+      fulfillmentController: { update() {} },
+      attentionController: { completeExistingReservationSale() {} }
     })
 
     assert.deepEqual(customerRoutes.map(({ method, path, policies }) => ({ method, path, policies })), [
@@ -311,6 +313,11 @@ describe('Order administration queries and routes (isolated)', () => {
     assert.deepEqual(adminRoutes.map(({ method, path, policies }) => ({ method, path, policies })), [
       { method: 'get', path: '/', policies: ['ADMIN'] },
       { method: 'get', path: '/:orderNumber', policies: ['ADMIN'] },
+      {
+        method: 'post',
+        path: '/:orderNumber/attention/complete-existing-reservation-sale',
+        policies: ['ADMIN']
+      },
       { method: 'patch', path: '/:orderNumber/fulfillment', policies: ['ADMIN'] }
     ])
   })
@@ -445,7 +452,7 @@ describe('Order administration queries and routes (isolated)', () => {
 
     assert.equal(result.attention.attentionCategory, 'APPROVED_INVENTORY_ATTENTION')
     assert.equal(result.attention.reservationIntegrity.valid, true)
-    assert.equal(result.attention.allowedActions.canCompleteExistingReservationSale, false)
+    assert.equal(result.attention.allowedActions.canCompleteExistingReservationSale, true)
     assert.equal(result.order.attentionResolutionVersion, 0)
     assert.equal(result.payment.amountArs, '150000.00')
     assert.equal(result.payment.currency, 'ARS')

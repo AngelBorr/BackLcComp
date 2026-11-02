@@ -109,7 +109,8 @@ class OrderAttentionResolutionService {
       completedAt = new Date(),
       providerEvidence = null,
       finalProductUnits = [],
-      finalResult = null
+      finalResult = null,
+      expectedAttemptToken = null
     },
     { session } = {}
   ) {
@@ -124,7 +125,13 @@ class OrderAttentionResolutionService {
 
     const resolution = await this.resolutions.completePreparedResolution(
       resolutionId,
-      { completedAt: completed, providerEvidence, finalProductUnits, finalResult },
+      {
+        completedAt: completed,
+        providerEvidence,
+        finalProductUnits,
+        finalResult,
+        expectedAttemptToken
+      },
       { session }
     )
 

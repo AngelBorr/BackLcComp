@@ -313,6 +313,59 @@ class PaymentManager {
     ).lean()
   }
 
+  async confirmApprovedAttentionEvidence(
+    paymentId,
+    {
+      orderId,
+      providerOrderId,
+      providerPaymentId,
+      approvedAt,
+      amountArs,
+      currency,
+      expectedLastProviderCheckAt,
+      observedAt,
+      providerStatus,
+      providerStatusDetail
+    },
+    { session } = {}
+  ) {
+    const lastProviderCheckFilter = expectedLastProviderCheckAt == null
+      ? {
+          $or: [
+            { lastProviderCheckAt: null },
+            { lastProviderCheckAt: { $exists: false } }
+          ]
+        }
+      : { lastProviderCheckAt: expectedLastProviderCheckAt }
+
+    return PaymentModel.findOneAndUpdate(
+      {
+        $and: [
+          {
+            _id: paymentId,
+            orderId,
+            provider: 'mercado_pago',
+            normalizedStatus: 'approved',
+            providerOrderId,
+            providerPaymentId,
+            approvedAt,
+            amountArs,
+            currency
+          },
+          lastProviderCheckFilter
+        ]
+      },
+      {
+        $set: {
+          providerStatus,
+          providerStatusDetail,
+          lastProviderCheckAt: observedAt
+        }
+      },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
   async transitionPendingWithTerminalUnpaidObservation(
     paymentId,
     {

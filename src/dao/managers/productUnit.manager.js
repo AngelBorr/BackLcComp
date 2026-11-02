@@ -303,6 +303,35 @@ class ProductUnitManager {
     )
   }
 
+  async markExactReservedUnitsSold(units, orderId, soldAt, { session } = {}) {
+    const operations = units.map((unit) => ({
+      updateOne: {
+        filter: {
+          _id: unit.productUnitId || unit._id,
+          status: 'reserved',
+          isDeleted: { $ne: true },
+          orderId,
+          reservedByOrderId: orderId,
+          orderItemId: unit.orderItemId,
+          productId: unit.productId,
+          soldByOrderId: null,
+          soldAt: null
+        },
+        update: {
+          $set: {
+            status: 'sold',
+            soldByOrderId: orderId,
+            soldAt
+          }
+        }
+      }
+    }))
+
+    if (!operations.length) return { matchedCount: 0, modifiedCount: 0 }
+
+    return ProductUnitModel.bulkWrite(operations, { ordered: true, session })
+  }
+
   async getByIds(unitIds, { session } = {}) {
     const query = ProductUnitModel.find({
       _id: { $in: unitIds },

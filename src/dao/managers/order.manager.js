@@ -470,6 +470,63 @@ class OrderManager {
     ).lean()
   }
 
+  async completeExistingReservationSaleAttention(
+    orderId,
+    {
+      expectedAttentionReason,
+      expectedAttentionResolutionVersion,
+      paidAt,
+      changedAt,
+      changedBy,
+      reason
+    },
+    { session } = {}
+  ) {
+    const versionFilter = expectedAttentionResolutionVersion === 0
+      ? {
+          $or: [
+            { attentionResolutionVersion: 0 },
+            { attentionResolutionVersion: null },
+            { attentionResolutionVersion: { $exists: false } }
+          ]
+        }
+      : { attentionResolutionVersion: expectedAttentionResolutionVersion }
+
+    return OrderModel.findOneAndUpdate(
+      combineFilters(
+        {
+          _id: orderId,
+          status: 'requires_attention',
+          attentionReason: expectedAttentionReason,
+          fulfillmentStatus: 'pending'
+        },
+        versionFilter
+      ),
+      {
+        $set: {
+          status: 'paid',
+          paidAt,
+          fulfillmentStatus: 'preparing'
+        },
+        $inc: { attentionResolutionVersion: 1 },
+        $push: {
+          statusHistory: {
+            status: 'paid',
+            changedAt,
+            reason
+          },
+          fulfillmentHistory: {
+            status: 'preparing',
+            changedAt,
+            changedBy,
+            reason
+          }
+        }
+      },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
   async expirePendingPaymentOrder(
     orderId,
     ownerToken,

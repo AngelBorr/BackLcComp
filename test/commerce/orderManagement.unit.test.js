@@ -4,6 +4,7 @@ import request from 'supertest'
 import OrderModel from '../../src/dao/models/order.model.js'
 import { OrderManager } from '../../src/dao/managers/order.manager.js'
 import { OrderQueryService } from '../../src/services/orderQuery.service.js'
+import { OrderQueryController } from '../../src/controllers/orderQuery.controller.js'
 import { OrderFulfillmentService } from '../../src/services/orderFulfillment.service.js'
 import { OrderService } from '../../src/services/order.service.js'
 import { OrderFulfillmentController } from '../../src/controllers/orderFulfillment.controller.js'
@@ -82,6 +83,8 @@ const payment = {
   providerIdempotencyKey: 'provider-key-secret',
   providerRequestSnapshot: { payer: { email: 'private@example.com' } },
   providerCheckoutUrl: 'https://checkout.example/secret',
+  amountArs: '150000.00',
+  currency: 'ARS',
   approvedAt,
   lastProviderCheckAt: approvedAt
 }
@@ -99,7 +102,7 @@ const soldUnit = {
   soldAt: approvedAt
 }
 
-const makeQueryHarness = ({ order = makeOrder(), units = [soldUnit] } = {}) => {
+const makeQueryHarness = ({ order = makeOrder(), units = [soldUnit], resolutions = [] } = {}) => {
   const state = { customerListCalls: [], adminListCalls: [], unitCalls: [] }
   const service = new OrderQueryService({
     orderManager: {
@@ -133,7 +136,14 @@ const makeQueryHarness = ({ order = makeOrder(), units = [soldUnit] } = {}) => {
         return options.statuses
           ? units.filter((unit) => options.statuses.includes(unit.status))
           : units
+      },
+      async getRelatedByOrderId(receivedOrderId) {
+        state.unitCalls.push({ receivedOrderId, options: { includeDeleted: true } })
+        return units
       }
+    },
+    attentionResolutionManager: {
+      async getOrderResolutionHistory() { return resolutions }
     }
   })
   return { service, state }
@@ -316,13 +326,15 @@ describe('Order administration queries and routes (isolated)', () => {
 
   it('forwards all supported admin filters with parsed date boundaries', async () => {
     const { service, state } = makeQueryHarness()
-    await service.listAdminOrders({ filters: {
-      status: 'paid',
-      paymentStatus: 'approved',
-      fulfillmentStatus: 'preparing',
-      dateFrom: '2026-09-01',
-      dateTo: '2026-09-30'
-    } })
+    await service.listAdminOrders({
+      filters: {
+        status: 'paid',
+        paymentStatus: 'approved',
+        fulfillmentStatus: 'preparing',
+        dateFrom: '2026-09-01',
+        dateTo: '2026-09-30'
+      }
+    })
     const filters = state.adminListCalls[0]
     assert.equal(filters.status, 'paid')
     assert.equal(filters.paymentStatus, 'approved')
@@ -388,6 +400,104 @@ describe('Order administration queries and routes (isolated)', () => {
       assert.equal(serialized.includes(forbidden), false)
     }
   })
+
+  it('returns a fail-closed attention diagnosis, full safe units and sanitized history', async () => {
+    const reservedUnit = {
+      ...soldUnit,
+      status: 'reserved',
+      soldAt: null,
+      soldByOrderId: null,
+      reservedByOrderId: orderId
+    }
+    const attentionOrder = makeOrder({
+      status: 'requires_attention',
+      fulfillmentStatus: 'pending',
+      attentionReason: 'RESERVATION_EXPIRED',
+      reservationExpiresAt: new Date('2026-09-29T11:59:00.000Z'),
+      attentionResolutionVersion: undefined
+    })
+    const resolution = {
+      _id: '507f1f77bcf86cd799439077',
+      orderId,
+      paymentId: payment._id,
+      idempotencyKey: 'must-not-leak-resolution-key',
+      action: 'complete_existing_reservation_sale',
+      originalAttentionReason: 'RESERVATION_EXPIRED',
+      actorUserId: adminUserId,
+      actorRole: 'ADMIN',
+      note: 'Auditoria segura',
+      requestedAt: createdAt,
+      completedAt: null,
+      status: 'prepared',
+      providerEvidence: null,
+      previousState: { attentionResolutionVersion: 0 },
+      previousProductUnits: [],
+      finalProductUnits: [],
+      finalResult: null,
+      sanitizedError: null
+    }
+    const { service } = makeQueryHarness({
+      order: attentionOrder,
+      units: [reservedUnit],
+      resolutions: [resolution]
+    })
+    const result = await service.getAdminOrder({ orderNumber })
+
+    assert.equal(result.attention.attentionCategory, 'APPROVED_INVENTORY_ATTENTION')
+    assert.equal(result.attention.reservationIntegrity.valid, true)
+    assert.equal(result.attention.allowedActions.canCompleteExistingReservationSale, false)
+    assert.equal(result.order.attentionResolutionVersion, 0)
+    assert.equal(result.payment.amountArs, '150000.00')
+    assert.equal(result.payment.currency, 'ARS')
+    assert.deepEqual(
+      Object.keys(result.items[0].productUnits[0]).sort(),
+      [
+        '_id',
+        'isDeleted',
+        'orderId',
+        'orderItemId',
+        'productId',
+        'reservationExpiresAt',
+        'reservedAt',
+        'reservedByOrderId',
+        'serialNumber',
+        'soldAt',
+        'soldByOrderId',
+        'status'
+      ].sort()
+    )
+    assert.equal(result.resolutions.length, 1)
+    assert.equal(result.resolutions[0].status, 'prepared')
+    assert.equal(JSON.stringify(result).includes('must-not-leak-resolution-key'), false)
+  })
+
+  for (const role of ['USER', 'PREMIUM']) {
+    it(`denies ${role} access to administrative attention detail`, async () => {
+      let queried = false
+      const controller = new OrderQueryController({
+        orderQueryService: {
+          async getAdminOrder() {
+            queried = true
+            return { attention: { attentionCategory: 'SHOULD_NOT_LEAK' } }
+          }
+        }
+      })
+      const response = await new Promise((resolve) => {
+        controller.getAdmin(
+          {
+            user: { id: userId, role },
+            params: { orderNumber }
+          },
+          { status() { throw new Error('response must not be written') } },
+          resolve
+        )
+      })
+
+      assert.equal(response.code, 'ORDERS_ADMIN_FORBIDDEN')
+      assert.equal(response.status, 403)
+      assert.equal(queried, false)
+    })
+  }
 })
 
 const makeFulfillmentHarness = ({ initialStatus = 'preparing', updateResults } = {}) => {
@@ -512,7 +622,6 @@ describe('Order fulfillment workflow (isolated)', () => {
     })
     app.patch('/api/admin/orders/:orderNumber/fulfillment', controller.update)
     app.use((error, _req, res, _next) => {
-      void _next
       const mapped = mapServiceErrorToHttp(error)
       res.status(mapped.status).json({ status: 'error', message: mapped.message })
     })

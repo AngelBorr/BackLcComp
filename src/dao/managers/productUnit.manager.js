@@ -270,6 +270,19 @@ class ProductUnitManager {
     return query
   }
 
+  async getRelatedByOrderId(orderId, { session } = {}) {
+    const query = ProductUnitModel.find({
+      $or: [
+        { orderId },
+        { reservedByOrderId: orderId },
+        { soldByOrderId: orderId }
+      ]
+    }).sort({ createdAt: 1 }).lean()
+
+    if (session) query.session(session)
+    return query
+  }
+
   async markReservedUnitsSold(unitIds, orderId, soldAt, { session } = {}) {
     return ProductUnitModel.updateMany(
       {

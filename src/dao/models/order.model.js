@@ -184,6 +184,15 @@ const orderSchema = new mongoose.Schema(
     pickedUpAt: { type: Date, default: null },
     cancellationReason: { type: String, trim: true, maxlength: 500, default: '' },
     attentionReason: { type: String, trim: true, maxlength: 500, default: '' },
+    attentionResolutionVersion: {
+      type: Number,
+      min: 0,
+      default: 0,
+      validate: {
+        validator: Number.isInteger,
+        message: 'La version de resolucion debe ser un entero'
+      }
+    },
     statusHistory: {
       type: [statusHistorySchema],
       default: []

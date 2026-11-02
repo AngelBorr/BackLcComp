@@ -3,9 +3,11 @@ import OrderManager from '../dao/managers/order.manager.js'
 import OrderItemManager from '../dao/managers/orderItem.manager.js'
 import PaymentManager from '../dao/managers/payment.manager.js'
 import ProductUnitManager from '../dao/managers/productUnit.manager.js'
+import OrderAttentionResolutionManager from '../dao/managers/orderAttentionResolution.manager.js'
 import { ORDER_STATUSES, ORDER_FULFILLMENT_STATUSES } from '../dao/models/order.model.js'
 import { PAYMENT_STATUSES } from '../dao/models/payment.model.js'
 import { ServiceError } from './service.products.js'
+import OrderAttentionService from './orderAttention.service.js'
 import { getEffectiveFulfillmentStatus } from '../utils/orderFulfillment.js'
 
 const ORDER_NUMBER_PATTERN = /^LC-\d{4}-\d{6,}$/
@@ -137,6 +139,82 @@ const fulfillmentHistoryDto = (entries = []) => entries.map((entry) => ({
   reason: entry.reason || ''
 }))
 
+const productUnitAdminDto = (unit) => ({
+  _id: idToString(unit._id || unit.productUnitId),
+  serialNumber: unit.serialNumber,
+  status: unit.status,
+  productId: idToString(unit.productId),
+  orderId: idToString(unit.orderId),
+  orderItemId: idToString(unit.orderItemId),
+  reservedByOrderId: idToString(unit.reservedByOrderId),
+  reservedAt: toIsoString(unit.reservedAt),
+  reservationExpiresAt: toIsoString(unit.reservationExpiresAt),
+  soldByOrderId: idToString(unit.soldByOrderId),
+  soldAt: toIsoString(unit.soldAt),
+  isDeleted: unit.isDeleted === true
+})
+
+const providerEvidenceDto = (evidence) => evidence
+  ? {
+      provider: evidence.provider || '',
+      providerOrderId: evidence.providerOrderId || null,
+      providerPaymentId: evidence.providerPaymentId || null,
+      externalReference: evidence.externalReference || null,
+      providerStatus: evidence.providerStatus || null,
+      providerStatusDetail: evidence.providerStatusDetail || null,
+      amountArs: evidence.amountArs || null,
+      currency: evidence.currency || null,
+      observedAt: toIsoString(evidence.observedAt)
+    }
+  : null
+
+const resolutionStateDto = (state) => state
+  ? {
+      orderStatus: state.orderStatus || null,
+      paymentStatus: state.paymentStatus || null,
+      fulfillmentStatus: state.fulfillmentStatus || null,
+      attentionReason: state.attentionReason || '',
+      attentionResolutionVersion: Number(state.attentionResolutionVersion || 0)
+    }
+  : null
+
+const resolutionResultDto = (result) => result
+  ? {
+      outcome: result.outcome || '',
+      reason: result.reason || '',
+      orderStatus: result.orderStatus || null,
+      paymentStatus: result.paymentStatus || null,
+      fulfillmentStatus: result.fulfillmentStatus || null,
+      attentionResolutionVersion: Number.isInteger(result.attentionResolutionVersion)
+        ? result.attentionResolutionVersion
+        : null
+    }
+  : null
+
+const resolutionDto = (resolution) => ({
+  _id: idToString(resolution._id),
+  paymentId: idToString(resolution.paymentId),
+  action: resolution.action,
+  originalAttentionReason: resolution.originalAttentionReason,
+  actorUserId: idToString(resolution.actorUserId),
+  actorRole: resolution.actorRole,
+  note: resolution.note || '',
+  requestedAt: toIsoString(resolution.requestedAt),
+  completedAt: toIsoString(resolution.completedAt),
+  status: resolution.status,
+  providerEvidence: providerEvidenceDto(resolution.providerEvidence),
+  previousState: resolutionStateDto(resolution.previousState),
+  previousProductUnits: (resolution.previousProductUnits || []).map(productUnitAdminDto),
+  finalProductUnits: (resolution.finalProductUnits || []).map(productUnitAdminDto),
+  finalResult: resolutionResultDto(resolution.finalResult),
+  sanitizedError: resolution.sanitizedError
+    ? {
+        code: resolution.sanitizedError.code || '',
+        message: resolution.sanitizedError.message || ''
+      }
+    : null
+})
+
 const buildTimeline = ({ order, payment, units }) => {
   const events = []
   const push = (type, at, label) => {
@@ -186,12 +264,16 @@ class OrderQueryService {
     orderManager = OrderManager,
     orderItemManager = OrderItemManager,
     paymentManager = PaymentManager,
-    productUnitManager = ProductUnitManager
+    productUnitManager = ProductUnitManager,
+    attentionResolutionManager = OrderAttentionResolutionManager,
+    orderAttentionService = OrderAttentionService
   } = {}) {
     this.orders = orderManager
     this.orderItems = orderItemManager
     this.payments = paymentManager
     this.productUnits = productUnitManager
+    this.attentionResolutions = attentionResolutionManager
+    this.orderAttention = orderAttentionService
   }
 
   #parsePagination(filters = {}) {
@@ -335,10 +417,13 @@ class OrderQueryService {
     const order = await this.orders.getByOrderNumber(normalizedOrderNumber)
     if (!order) throw new ServiceError('Orden no encontrada', 'ORDER_NOT_FOUND', 404)
 
-    const [items, payment, units] = await Promise.all([
+    const [items, payment, units, resolutions] = await Promise.all([
       this.orderItems.getByOrderId(order._id),
       this.payments.getLatestByOrderId(order._id),
-      this.productUnits.getAssignedByOrderId(order._id)
+      order.status === 'requires_attention'
+        ? this.productUnits.getRelatedByOrderId(order._id)
+        : this.productUnits.getAssignedByOrderId(order._id),
+      this.attentionResolutions.getOrderResolutionHistory(order._id)
     ])
     const unitsByOrderItem = new Map()
 
@@ -346,15 +431,21 @@ class OrderQueryService {
       if (!unit.orderItemId) continue
       const key = String(unit.orderItemId)
       const grouped = unitsByOrderItem.get(key) || []
-      grouped.push({
-        serialNumber: unit.serialNumber,
-        status: unit.status,
-        reservedAt: toIsoString(unit.reservedAt),
-        soldAt: toIsoString(unit.soldAt),
-        reservationExpiresAt: toIsoString(unit.reservationExpiresAt)
-      })
+      grouped.push(productUnitAdminDto(unit))
       unitsByOrderItem.set(key, grouped)
     }
+
+    const attention = order.status === 'requires_attention'
+      ? this.orderAttention.buildReadModel({
+        order,
+        payment,
+        orderItems: items,
+        productUnits: units
+      })
+      : null
+    const attentionResolutionVersion = Number.isInteger(order.attentionResolutionVersion)
+      ? order.attentionResolutionVersion
+      : 0
 
     return {
       order: {
@@ -370,7 +461,9 @@ class OrderQueryService {
         expiredAt: toIsoString(order.expiredAt),
         readyForPickupAt: toIsoString(order.readyForPickupAt),
         pickedUpAt: toIsoString(order.pickedUpAt),
-        attentionReason: order.attentionReason || ''
+        attentionReason: order.attentionReason || '',
+        reservationExpiresAt: toIsoString(order.reservationExpiresAt),
+        attentionResolutionVersion
       },
       buyer: {
         firstName: order.buyerSnapshot?.firstName || '',
@@ -403,10 +496,14 @@ class OrderQueryService {
             providerStatusDetail: payment.providerStatusDetail,
             providerOrderId: payment.providerOrderId,
             providerPaymentId: payment.providerPaymentId,
+            amountArs: decimalToString(payment.amountArs),
+            currency: payment.currency,
             approvedAt: toIsoString(payment.approvedAt),
             lastProviderCheckAt: toIsoString(payment.lastProviderCheckAt)
           }
         : null,
+      attention,
+      resolutions: resolutions.map(resolutionDto),
       timeline: buildTimeline({ order, payment, units })
     }
   }

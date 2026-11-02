@@ -30,6 +30,16 @@ import {
   MercadoPagoProviderError,
   normalizeProviderOrder
 } from '../../src/providers/mercadoPago.provider.js'
+import {
+  APPROVED_PROVIDER_PAYMENT_ID,
+  FAILED_PROVIDER_PAYMENT_ID,
+  RETRY_ORDER_NUMBER,
+  RETRY_PROVIDER_ORDER_ID,
+  RETRY_TOTAL_ARS,
+  approvedProviderPayload,
+  normalizeRetryPayload,
+  retryableProviderPayload
+} from './mercadoPagoPaymentRetry.fixture.js'
 
 const secret = 'synthetic-webhook-secret'
 const timestamp = '1742505638'
@@ -143,12 +153,16 @@ const createTransactionHarness = (state) => ({
 })
 
 const createReconciliationHarness = (overrides = {}) => {
+  const expectedProviderOrderId = overrides.expectedProviderOrderId || providerOrderId
+  const expectedOrderNumber = overrides.orderNumber || 'LC-2026-000001'
+  const expectedTotalAmount = overrides.totalAmount || '154500.00'
+  const providerOrders = overrides.providerOrders?.map((order) => clone(order)) || null
   const state = {
     order: {
       _id: orderId,
-      orderNumber: 'LC-2026-000001',
+      orderNumber: expectedOrderNumber,
       status: 'pending_payment',
-      totals: { totalArs: '154500.00' },
+      totals: { totalArs: expectedTotalAmount },
       reservationExpiresAt: new Date('2026-09-29T18:00:00.000Z'),
       statusHistory: [],
       fulfillmentStatus: 'pending',
@@ -158,13 +172,13 @@ const createReconciliationHarness = (overrides = {}) => {
       _id: paymentId,
       orderId,
       provider: 'mercado_pago',
-      providerOrderId,
+      providerOrderId: expectedProviderOrderId,
       providerPaymentId: null,
       providerStatus: 'created',
       providerStatusDetail: null,
-      externalReference: 'LC-2026-000001',
+      externalReference: expectedOrderNumber,
       normalizedStatus: 'pending',
-      amountArs: '154500.00',
+      amountArs: expectedTotalAmount,
       approvedAt: null
     },
     units: [
@@ -277,7 +291,7 @@ const createReconciliationHarness = (overrides = {}) => {
         units: clone(reserved)
       }
     },
-    async confirmReservedUnitsSold(_input, { session }) {
+    async confirmReservedUnitsSold(input, { session }) {
       state.confirmCalls += 1
       assert.equal(session.inTransaction(), true)
       assert.equal(state.payment.normalizedStatus, 'approved')
@@ -289,9 +303,11 @@ const createReconciliationHarness = (overrides = {}) => {
       for (const unit of state.units) {
         if (unit.status === 'reserved' && unit.orderId === orderId) {
           unit.status = 'sold'
-          unit.soldAt = now
+          unit.soldAt = input.soldAt
+          unit.soldByOrderId = input.orderId
         }
       }
+      state.prodStock = state.units.filter((unit) => unit.status === 'available').length
       return { soldCount: 1 }
     }
   }
@@ -300,7 +316,10 @@ const createReconciliationHarness = (overrides = {}) => {
     async getOrder(id) {
       state.providerCalls += 1
       if (overrides.providerError) throw overrides.providerError
-      assert.equal(id, providerOrderId)
+      assert.equal(id, expectedProviderOrderId)
+      if (providerOrders) {
+        return clone(providerOrders[Math.min(state.providerCalls - 1, providerOrders.length - 1)])
+      }
       return providerOrder(overrides.providerOrder || {})
     }
   }
@@ -320,6 +339,7 @@ const createWebhookHarness = (overrides = {}) => {
   const events = new Map()
   let reconciliationCalls = 0
   let createdEvents = 0
+  const expectedProviderOrderId = overrides.providerOrderId || providerOrderId
 
   if (overrides.existingEvent) {
     events.set(providerEventId, clone(overrides.existingEvent))
@@ -362,11 +382,14 @@ const createWebhookHarness = (overrides = {}) => {
     }
   }
   const reconciliationService = {
-    async reconcileProviderOrder(id) {
+    async reconcileProviderOrder(id, options) {
       reconciliationCalls += 1
-      assert.equal(id, providerOrderId)
+      assert.equal(id, expectedProviderOrderId)
       if (overrides.reconciliationGate) await overrides.reconciliationGate()
       if (overrides.reconciliationError) throw overrides.reconciliationError
+      if (overrides.reconciliationService) {
+        return overrides.reconciliationService.reconcileProviderOrder(id, options)
+      }
       return overrides.reconciliationResult || {
         outcome: 'paid',
         orderId,
@@ -746,6 +769,34 @@ describe('Mercado Pago webhook orchestration (isolated)', () => {
     assert.equal(harness.events.get(providerEventId).providerPaymentId, null)
   })
 
+  it('processes waiting_retry with a failed child without changing financial state', async () => {
+    const reconciliation = createReconciliationHarness({
+      expectedProviderOrderId: RETRY_PROVIDER_ORDER_ID,
+      orderNumber: RETRY_ORDER_NUMBER,
+      totalAmount: RETRY_TOTAL_ARS,
+      providerOrders: [normalizeRetryPayload(retryableProviderPayload())]
+    })
+    const harness = createWebhookHarness({
+      providerOrderId: RETRY_PROVIDER_ORDER_ID,
+      reconciliationService: reconciliation.service
+    })
+
+    await harness.service.handleWebhook(webhookInput({
+      query: { 'data.id': RETRY_PROVIDER_ORDER_ID },
+      headers: { xSignature: signatureFor(RETRY_PROVIDER_ORDER_ID) },
+      body: { data: { id: RETRY_PROVIDER_ORDER_ID }, action: 'order.updated' }
+    }), { now })
+
+    assert.equal(harness.events.get(providerEventId).processingStatus, 'processed')
+    assert.equal(harness.events.get(providerEventId).providerPaymentId, null)
+    assert.equal(reconciliation.state.payment.normalizedStatus, 'pending')
+    assert.equal(reconciliation.state.payment.providerPaymentId, null)
+    assert.equal(reconciliation.state.order.status, 'pending_payment')
+    assert.equal(reconciliation.state.order.fulfillmentStatus, 'pending')
+    assert.equal(reconciliation.state.units[0].status, 'reserved')
+    assert.equal(reconciliation.state.confirmCalls, 0)
+  })
+
   it('allows only one concurrent webhook to run financial effects', async () => {
     let release
     const gate = new Promise((resolve) => { release = resolve })
@@ -904,6 +955,110 @@ describe('Mercado Pago authoritative reconciliation (isolated)', () => {
     assert.equal(state.units[0].status, 'sold')
     assert.deepEqual(state.units[0].soldAt, now)
     assert.equal(state.prodStock, 0)
+  })
+
+  it('keeps a failed attempt payable and sells once when attempt two is accredited', async () => {
+    const retryableRaw = retryableProviderPayload()
+    const approvedRaw = approvedProviderPayload()
+    const retryableOrder = normalizeRetryPayload(retryableRaw)
+    const approvedOrder = normalizeRetryPayload(approvedRaw)
+    const accreditedPayments = approvedOrder.payments.filter((payment) => (
+      payment.status === 'processed' && payment.statusDetail === 'accredited'
+    ))
+    const availableUnitId = new mongoose.Types.ObjectId().toString()
+    const approvalNow = new Date(now.getTime() + 60_000)
+    const reservedUnit = {
+      _id: unitId,
+      productId,
+      orderId,
+      orderItemId,
+      reservedByOrderId: orderId,
+      status: 'reserved',
+      isDeleted: false,
+      soldAt: null,
+      soldByOrderId: null
+    }
+    const availableUnit = {
+      _id: availableUnitId,
+      productId,
+      orderId: null,
+      orderItemId: null,
+      reservedByOrderId: null,
+      status: 'available',
+      isDeleted: false,
+      soldAt: null,
+      soldByOrderId: null
+    }
+    const { service, state } = createReconciliationHarness({
+      expectedProviderOrderId: RETRY_PROVIDER_ORDER_ID,
+      orderNumber: RETRY_ORDER_NUMBER,
+      totalAmount: RETRY_TOTAL_ARS,
+      providerOrders: [
+        retryableOrder,
+        approvedOrder
+      ],
+      units: [reservedUnit, availableUnit],
+      state: { prodStock: 1 }
+    })
+
+    assert.equal(retryableRaw.transactions.payments[0].attempt_number, 1)
+    assert.deepEqual(
+      approvedRaw.transactions.payments.map((payment) => payment.attempt_number),
+      [1, 2]
+    )
+    assert.equal(approvedOrder.payments[0].providerPaymentId, FAILED_PROVIDER_PAYMENT_ID)
+    assert.equal(accreditedPayments.length, 1)
+    assert.equal(accreditedPayments[0].providerPaymentId, APPROVED_PROVIDER_PAYMENT_ID)
+    assert.equal(accreditedPayments[0].amount, '20763.6')
+    assert.equal(accreditedPayments[0].paidAmount, '20763.6')
+
+    const first = await service.reconcileProviderOrder(RETRY_PROVIDER_ORDER_ID, { now })
+
+    assert.equal(first.outcome, 'pending')
+    assert.equal(first.remoteClassification, 'PAYABLE')
+    assert.equal(state.payment.providerStatus, 'action_required')
+    assert.equal(state.payment.providerStatusDetail, 'waiting_retry')
+    assert.equal(state.payment.normalizedStatus, 'pending')
+    assert.equal(state.payment.providerPaymentId, null)
+    assert.equal(state.order.status, 'pending_payment')
+    assert.equal(state.order.fulfillmentStatus, 'pending')
+    assert.deepEqual(state.units.map(({ status }) => status), ['reserved', 'available'])
+    assert.equal(state.prodStock, 1)
+    assert.equal(state.confirmCalls, 0)
+
+    const second = await service.reconcileProviderOrder(
+      RETRY_PROVIDER_ORDER_ID,
+      { now: approvalNow }
+    )
+
+    assert.equal(second.outcome, 'paid')
+    assert.equal(second.providerPaymentId, APPROVED_PROVIDER_PAYMENT_ID)
+    assert.notEqual(second.providerPaymentId, FAILED_PROVIDER_PAYMENT_ID)
+    assert.equal(state.payment.normalizedStatus, 'approved')
+    assert.equal(state.payment.providerStatus, 'processed')
+    assert.equal(state.payment.providerStatusDetail, 'accredited')
+    assert.equal(state.payment.providerPaymentId, APPROVED_PROVIDER_PAYMENT_ID)
+    assert.equal(state.order.status, 'paid')
+    assert.equal(state.order.fulfillmentStatus, 'preparing')
+    assert.deepEqual(state.units.map(({ status }) => status), ['sold', 'available'])
+    assert.equal(state.units[0].soldByOrderId, orderId)
+    assert.equal(state.prodStock, 1)
+    assert.equal(state.confirmCalls, 1)
+
+    const soldByOrderId = state.units[0].soldByOrderId
+    const third = await service.reconcileProviderOrder(
+      RETRY_PROVIDER_ORDER_ID,
+      { now: new Date(approvalNow.getTime() + 60_000) }
+    )
+
+    assert.equal(third.outcome, 'paid')
+    assert.equal(third.providerPaymentId, APPROVED_PROVIDER_PAYMENT_ID)
+    assert.equal(state.confirmCalls, 1)
+    assert.equal(state.units[0].soldByOrderId, soldByOrderId)
+    assert.deepEqual(state.units.map(({ status }) => status), ['sold', 'available'])
+    assert.equal(state.prodStock, 1)
+    assert.equal(state.order.statusHistory.length, 1)
+    assert.equal(state.order.fulfillmentHistory.length, 1)
   })
 
   it('recovers an early webhook through externalReference and CAS association', async () => {

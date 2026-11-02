@@ -9,7 +9,17 @@ import {
   calculateNextReconciliationAt,
   calculateProviderFailureBackoffMs
 } from '../../src/services/paymentReconciliationWorker.service.js'
-import { REMOTE_ORDER_CLASSIFICATIONS } from '../../src/services/mercadoPagoOrderClassification.service.js'
+import {
+  REMOTE_ORDER_CLASSIFICATIONS,
+  classifyRemoteOrder
+} from '../../src/services/mercadoPagoOrderClassification.service.js'
+import {
+  RETRY_ORDER_NUMBER,
+  RETRY_PROVIDER_ORDER_ID,
+  RETRY_TOTAL_ARS,
+  normalizeRetryPayload,
+  retryableProviderPayload
+} from './mercadoPagoPaymentRetry.fixture.js'
 
 const baseNow = new Date('2026-10-10T12:00:00.000Z')
 const fiveMinutes = 5 * 60 * 1000
@@ -341,6 +351,52 @@ describe('P1B.2 autonomous reconcile-only worker (isolated)', () => {
       assert.equal(state.orders[0].reconciliationNextAt.toISOString(), new Date(baseNow.getTime() + fiveMinutes).toISOString())
     })
   }
+
+  it('keeps an active waiting_retry Order reserved after a failed child attempt', async () => {
+    const rawOrder = retryableProviderPayload()
+    const providerOrder = normalizeRetryPayload(rawOrder)
+    const order = makeOrder(10, { orderNumber: RETRY_ORDER_NUMBER })
+    const payments = {
+      [order._id]: makePayment(order, {
+        providerOrderId: RETRY_PROVIDER_ORDER_ID,
+        amountArs: RETRY_TOTAL_ARS
+      })
+    }
+    const { run, state } = makeHarness({
+      orders: [order],
+      payments,
+      reconcile: async () => {
+        const classification = classifyRemoteOrder(providerOrder, {
+          expectedProviderOrderId: RETRY_PROVIDER_ORDER_ID,
+          expectedExternalReference: RETRY_ORDER_NUMBER,
+          expectedTotalAmount: RETRY_TOTAL_ARS,
+          expectedCurrency: 'ARS'
+        })
+        assert.equal(rawOrder.transactions.payments[0].attempt_number, 1)
+        assert.equal(classification, REMOTE_ORDER_CLASSIFICATIONS.PAYABLE)
+        return {
+          outcome: 'pending',
+          remoteClassification: classification,
+          remoteStatus: providerOrder.status
+        }
+      }
+    })
+
+    const result = await run()
+
+    assert.equal(result.stillPending, 1)
+    assert.equal(state.orders[0].status, 'pending_payment')
+    assert.equal(state.payments.get(order._id).normalizedStatus, 'pending')
+    assert.equal(state.payments.get(order._id).providerStatus, 'action_required')
+    assert.equal(state.units[0].status, 'reserved')
+    assert.equal(state.cancelCalls, 0)
+    assert.equal(state.expirationCalls.length, 0)
+    assert.equal(state.releaseInventoryCalls, 0)
+    assert.equal(
+      state.orders[0].reconciliationNextAt.toISOString(),
+      new Date(baseNow.getTime() + fiveMinutes).toISOString()
+    )
+  })
 
   it('observes terminal unpaid without expiring or releasing anything', async () => {
     const { run, state } = makeHarness({

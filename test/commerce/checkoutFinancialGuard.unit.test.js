@@ -364,17 +364,28 @@ describe('CheckoutFinancialGuardService P0 (isolated unit tests)', () => {
     })
     const payment = makePayment(order, {
       normalizedStatus: 'pending',
-      providerAttemptStatus: 'succeeded'
+      providerAttemptStatus: 'succeeded',
+      providerStatus: 'action_required',
+      providerStatusDetail: 'waiting_retry'
     })
-    const { service } = makeHarness({ operations: [{ order, payment }] })
+    const { service, state } = makeHarness({ operations: [{ order, payment }] })
 
-    const result = await service.getEligibility(userId, {
+    const sameCheckout = await service.getEligibility(userId, {
       now,
       idempotencyKey: 'same-logical-checkout'
     })
+    const differentCheckout = await service.getEligibility(userId, {
+      now,
+      idempotencyKey: 'different-logical-checkout'
+    })
 
-    assert.equal(result.allowed, true)
-    assert.equal(result.blocker, null)
+    assert.equal(sameCheckout.allowed, true)
+    assert.equal(sameCheckout.blocker, null)
+    assert.equal(differentCheckout.allowed, false)
+    assert.equal(differentCheckout.blocker.code, 'CHECKOUT_PRIOR_PAYMENT_UNCERTAIN')
+    assert.equal(state.reconciliationCalls.length, 0)
+    assert.equal(order.status, 'pending_payment')
+    assert.equal(payment.normalizedStatus, 'pending')
   })
 
   it('does not let a same-key retry bypass another approved unresolved Order', async () => {

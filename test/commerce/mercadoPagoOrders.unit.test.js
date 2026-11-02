@@ -920,12 +920,14 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
       payment: {
         providerOrderId,
         providerCheckoutUrl: checkoutUrl,
-        providerStatus: 'created'
+        providerStatus: 'action_required',
+        providerStatusDetail: 'waiting_retry'
       }
     })
     const result = await service.ensureCheckoutOrderForPayment(paymentId, { now })
 
     assert.equal(result.providerOrderId, providerOrderId)
+    assert.equal(result.providerStatus, 'action_required')
     assert.equal(state.providerCalls.length, 0)
   })
 

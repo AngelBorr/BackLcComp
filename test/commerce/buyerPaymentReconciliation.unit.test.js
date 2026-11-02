@@ -14,6 +14,18 @@ import { ServiceError } from '../../src/services/service.products.js'
 import { mapServiceErrorToHttp } from '../../src/middlewares/serviceErrorMapper.js'
 import PaymentModel from '../../src/dao/models/payment.model.js'
 import { PaymentManager } from '../../src/dao/managers/payment.manager.js'
+import {
+  REMOTE_ORDER_CLASSIFICATIONS,
+  classifyRemoteOrder
+} from '../../src/services/mercadoPagoOrderClassification.service.js'
+import {
+  FAILED_PROVIDER_PAYMENT_ID,
+  RETRY_ORDER_NUMBER,
+  RETRY_PROVIDER_ORDER_ID,
+  RETRY_TOTAL_ARS,
+  normalizeRetryPayload,
+  retryableProviderPayload
+} from './mercadoPagoPaymentRetry.fixture.js'
 
 const userId = new mongoose.Types.ObjectId().toString()
 const otherUserId = new mongoose.Types.ObjectId().toString()
@@ -65,7 +77,10 @@ const createHarness = (overrides = {}) => {
   const orderManager = {
     async getByOrderNumberAndUserId(receivedOrderNumber, receivedUserId) {
       if (overrides.missingOrder) return null
-      if (receivedOrderNumber !== orderNumber || String(receivedUserId) !== String(state.order.userId)) {
+      if (
+        receivedOrderNumber !== state.order.orderNumber ||
+        String(receivedUserId) !== String(state.order.userId)
+      ) {
         return null
       }
       return clone(state.order)
@@ -102,7 +117,7 @@ const createHarness = (overrides = {}) => {
     async reconcileProviderOrder(receivedProviderOrderId, options) {
       state.providerCalls += 1
       state.providerCheckDates.push(options.now)
-      assert.equal(receivedProviderOrderId, providerOrderId)
+      assert.equal(receivedProviderOrderId, state.payment.providerOrderId)
       if (overrides.gate) await overrides.gate()
       if (overrides.reconciliationError) throw overrides.reconciliationError
       if (overrides.reconcile) return overrides.reconcile(state)
@@ -224,6 +239,50 @@ describe('Buyer payment reconciliation P1A (isolated)', () => {
     assert.equal(result.orderStatus, 'pending_payment')
     assert.equal(result.paymentStatus, 'pending')
     assert.equal(state.providerCalls, 1)
+  })
+
+  it('keeps buyer recovery pending for waiting_retry with a failed child', async () => {
+    const rawOrder = retryableProviderPayload()
+    const providerOrder = normalizeRetryPayload(rawOrder)
+    const { service, state } = createHarness({
+      order: {
+        orderNumber: RETRY_ORDER_NUMBER,
+        totals: { totalArs: RETRY_TOTAL_ARS }
+      },
+      payment: {
+        providerOrderId: RETRY_PROVIDER_ORDER_ID,
+        amountArs: RETRY_TOTAL_ARS
+      },
+      reconcile() {
+        assert.equal(rawOrder.transactions.payments[0].attempt_number, 1)
+        assert.equal(providerOrder.payments[0].providerPaymentId, FAILED_PROVIDER_PAYMENT_ID)
+        assert.equal(classifyRemoteOrder(providerOrder, {
+          expectedProviderOrderId: RETRY_PROVIDER_ORDER_ID,
+          expectedExternalReference: RETRY_ORDER_NUMBER,
+          expectedTotalAmount: RETRY_TOTAL_ARS,
+          expectedCurrency: 'ARS'
+        }), REMOTE_ORDER_CLASSIFICATIONS.PAYABLE)
+        return {
+          outcome: 'pending',
+          orderId,
+          paymentId,
+          remoteClassification: REMOTE_ORDER_CLASSIFICATIONS.PAYABLE
+        }
+      }
+    })
+
+    const result = await service.reconcileForBuyer({
+      orderNumber: RETRY_ORDER_NUMBER,
+      userId,
+      now
+    })
+
+    assert.equal(result.outcome, 'pending')
+    assert.equal(result.orderStatus, 'pending_payment')
+    assert.equal(result.paymentStatus, 'pending')
+    assert.equal(state.payment.providerPaymentId, null)
+    assert.equal(state.productUnits[0].status, 'reserved')
+    assert.equal(state.financialTransitions, 0)
   })
 
   it('keeps omitted canceled aggregates pending without worker expiration authority', async () => {

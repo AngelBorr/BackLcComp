@@ -4,6 +4,11 @@ import {
   REMOTE_ORDER_CLASSIFICATIONS as CLASSIFICATION,
   classifyRemoteOrder
 } from '../../src/services/mercadoPagoOrderClassification.service.js'
+import {
+  FAILED_PROVIDER_PAYMENT_ID,
+  normalizeRetryPayload,
+  retryableProviderPayload
+} from './mercadoPagoPaymentRetry.fixture.js'
 
 const baseOrder = (overrides = {}) => ({
   providerOrderId: 'ORD01TESTCLASSIFICATION',
@@ -58,6 +63,27 @@ describe('Mercado Pago remote Order financial classification (pure)', () => {
       assert.equal(classifyRemoteOrder(baseOrder({ status }), expected), CLASSIFICATION.PAYABLE)
     })
   }
+
+  it('keeps action_required/waiting_retry PAYABLE when attempt one failed', () => {
+    const rawOrder = retryableProviderPayload()
+    const order = normalizeRetryPayload(rawOrder)
+
+    assert.equal(rawOrder.transactions.payments[0].attempt_number, 1)
+    assert.equal(rawOrder.transactions.payments[0].reference_id, '185634649051')
+    assert.deepEqual(order.payments, [{
+      providerPaymentId: FAILED_PROVIDER_PAYMENT_ID,
+      status: 'failed',
+      statusDetail: 'rejected_by_issuer',
+      amount: '20763.6',
+      paidAmount: null
+    }])
+    assert.equal(classifyRemoteOrder(order, {
+      expectedProviderOrderId: order.providerOrderId,
+      expectedExternalReference: order.externalReference,
+      expectedTotalAmount: order.totalAmount,
+      expectedCurrency: order.currency
+    }), CLASSIFICATION.PAYABLE)
+  })
 
   it('classifies processing as PROCESSING', () => {
     assert.equal(

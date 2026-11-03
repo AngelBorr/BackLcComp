@@ -527,6 +527,74 @@ class OrderManager {
     ).lean()
   }
 
+  async closeTerminalUnpaidAttention(
+    orderId,
+    {
+      expectedAttentionReason,
+      expectedAttentionResolutionVersion,
+      expectedReservationExpiresAt,
+      expectedReconciliationNextAt,
+      expectedReconciliationLeaseOwner,
+      expectedReconciliationLeaseUntil,
+      changedAt,
+      changedBy,
+      reason
+    },
+    { session } = {}
+  ) {
+    const versionFilter = expectedAttentionResolutionVersion === 0
+      ? {
+          $or: [
+            { attentionResolutionVersion: 0 },
+            { attentionResolutionVersion: null },
+            { attentionResolutionVersion: { $exists: false } }
+          ]
+        }
+      : { attentionResolutionVersion: expectedAttentionResolutionVersion }
+
+    return OrderModel.findOneAndUpdate(
+      combineFilters(
+        {
+          _id: orderId,
+          status: 'requires_attention',
+          attentionReason: expectedAttentionReason,
+          fulfillmentStatus: 'pending',
+          reservationExpiresAt: expectedReservationExpiresAt,
+          reconciliationNextAt: expectedReconciliationNextAt,
+          reconciliationLeaseOwner: expectedReconciliationLeaseOwner,
+          reconciliationLeaseUntil: expectedReconciliationLeaseUntil
+        },
+        { reservationExpiresAt: { $lte: changedAt } },
+        versionFilter
+      ),
+      {
+        $set: {
+          status: 'expired',
+          expiredAt: changedAt,
+          fulfillmentStatus: 'cancelled',
+          reconciliationNextAt: null,
+          reconciliationLeaseOwner: null,
+          reconciliationLeaseUntil: null
+        },
+        $inc: { attentionResolutionVersion: 1 },
+        $push: {
+          statusHistory: {
+            status: 'expired',
+            changedAt,
+            reason
+          },
+          fulfillmentHistory: {
+            status: 'cancelled',
+            changedAt,
+            changedBy,
+            reason
+          }
+        }
+      },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
   async expirePendingPaymentOrder(
     orderId,
     ownerToken,

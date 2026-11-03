@@ -505,13 +505,13 @@ class MercadoPagoProvider {
 
   async searchPayments({ externalReference, status = 'approved', limit = 50, offset = 0 }) {
     const normalizedExternalReference = String(externalReference || '').trim()
-    const normalizedStatus = String(status || '').trim().toLowerCase()
+    const normalizedStatus = status == null ? null : String(status).trim().toLowerCase()
     const normalizedLimit = Number(limit)
     const normalizedOffset = Number(offset)
 
     if (
       !normalizedExternalReference ||
-      !normalizedStatus ||
+      (normalizedStatus !== null && !normalizedStatus) ||
       !Number.isSafeInteger(normalizedLimit) ||
       normalizedLimit <= 0 ||
       !Number.isSafeInteger(normalizedOffset) ||
@@ -526,10 +526,10 @@ class MercadoPagoProvider {
 
     const query = new URLSearchParams({
       external_reference: normalizedExternalReference,
-      status: normalizedStatus,
       limit: String(normalizedLimit),
       offset: String(normalizedOffset)
     })
+    if (normalizedStatus !== null) query.set('status', normalizedStatus)
 
     return this.#request(`/v1/payments/search?${query.toString()}`, {
       operation: 'search_payments'

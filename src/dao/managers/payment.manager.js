@@ -418,6 +418,82 @@ class PaymentManager {
       { new: true, session, runValidators: true }
     ).lean()
   }
+
+  async cancelAttentionWithTerminalUnpaidEvidence(
+    paymentId,
+    {
+      orderId,
+      expectedNormalizedStatus,
+      providerOrderId,
+      externalReference,
+      amountArs,
+      currency,
+      expectedProviderStatus,
+      expectedProviderStatusDetail,
+      expectedLastProviderCheckAt,
+      observedAt,
+      providerStatus,
+      providerStatusDetail,
+      cancellationContext = null
+    },
+    { session } = {}
+  ) {
+    const cancellationFilter = cancellationContext
+      ? {
+          providerCancellationIdempotencyKey:
+            cancellationContext.providerCancellationIdempotencyKey,
+          providerCancellationStatus: cancellationContext.providerCancellationStatus,
+          providerCancellationAttemptedAt:
+            cancellationContext.providerCancellationAttemptedAt,
+          providerCancellationCompletedAt:
+            cancellationContext.providerCancellationCompletedAt,
+          providerCancellationPayableStatus:
+            cancellationContext.providerCancellationPayableStatus,
+          providerCancellationPayableObservedAt:
+            cancellationContext.providerCancellationPayableObservedAt
+        }
+      : {}
+
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        orderId,
+        provider: 'mercado_pago',
+        normalizedStatus: expectedNormalizedStatus,
+        providerOrderId,
+        externalReference,
+        amountArs,
+        currency,
+        providerStatus: expectedProviderStatus,
+        providerStatusDetail: expectedProviderStatusDetail,
+        lastProviderCheckAt: expectedLastProviderCheckAt,
+        ...cancellationFilter,
+        $and: [
+          {
+            $or: [
+              { providerPaymentId: null },
+              { providerPaymentId: { $exists: false } }
+            ]
+          },
+          {
+            $or: [
+              { approvedAt: null },
+              { approvedAt: { $exists: false } }
+            ]
+          }
+        ]
+      },
+      {
+        $set: {
+          normalizedStatus: 'cancelled',
+          providerStatus,
+          providerStatusDetail,
+          lastProviderCheckAt: observedAt
+        }
+      },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
 }
 
 export { PaymentManager }

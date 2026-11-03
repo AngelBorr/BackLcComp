@@ -1506,6 +1506,23 @@ describe('MercadoPago provider metadata and Payments API transport', () => {
     assert.deepEqual(payload.results, [])
   })
 
+  it('supports exhaustive Payments search without a status filter', async () => {
+    let capturedUrl
+    const provider = makeProvider(async (url) => {
+      capturedUrl = url
+      return jsonResponse({ paging: { total: 0, offset: 0, limit: 50 }, results: [] })
+    })
+    await provider.searchPayments({
+      externalReference: 'LC-2026-000010',
+      status: null,
+      limit: 50,
+      offset: 0
+    })
+    const url = new URL(capturedUrl)
+    assert.equal(url.searchParams.get('external_reference'), 'LC-2026-000010')
+    assert.equal(url.searchParams.has('status'), false)
+  })
+
   it('reuses the provider transport for individual numeric Payment GET', async () => {
     let capturedUrl
     const provider = makeProvider(async (url) => {

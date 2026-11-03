@@ -18,6 +18,11 @@ const registerAdminOrderRoutes = (
     ['ADMIN'],
     attentionController.completeExistingReservationSale
   )
+  router.post(
+    '/:orderNumber/attention/close-terminal-unpaid',
+    ['ADMIN'],
+    attentionController.closeTerminalUnpaid
+  )
   router.patch('/:orderNumber/fulfillment', ['ADMIN'], fulfillmentController.update)
 }
 

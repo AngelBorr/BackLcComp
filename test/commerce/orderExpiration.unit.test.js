@@ -949,7 +949,7 @@ describe('P1B.3a ProductUnit release primitive', () => {
     stub(ProductUnitManager, 'findUnitsByOrderReferences', async () => units)
     stub(ProductUnitManager, 'releaseReservedUnitsForOrder', async (value) => {
       releaseInput = value
-      return { modifiedCount: 2 }
+      return { matchedCount: 2, modifiedCount: 2 }
     })
     stub(ProductModel, 'findOneAndUpdate', (filter) => ({
       lean: async () => {
@@ -971,7 +971,7 @@ describe('P1B.3a ProductUnit release primitive', () => {
     assert.deepEqual(guards, [ids.product, ids.product2].sort())
     assert.deepEqual(recalculations.map(({ productId }) => productId), guards)
     assert.equal(releaseInput.orderId, ids.order)
-    assert.deepEqual(releaseInput.unitIds, [ids.unit, ids.unit2])
+    assert.deepEqual(releaseInput.units.map((unit) => unit._id), [ids.unit, ids.unit2])
     assert.equal(releaseInput.expirationLimit.getTime(), now.getTime())
   })
 
@@ -994,12 +994,38 @@ describe('P1B.3a ProductUnit release primitive', () => {
     assert.equal(releaseCalls, 0)
   })
 
+  for (const expiration of [null, undefined, 'invalid-date']) {
+    it(`does not release a ProductUnit with invalid expiration ${String(expiration)}`, async () => {
+      let releaseCalls = 0
+      const unit = { ...baseState().units[0], reservationExpiresAt: expiration }
+      stub(OrderItemManager, 'getByOrderId', async () => ([
+        { _id: ids.item, productId: ids.product, quantity: 1 }
+      ]))
+      stub(ProductUnitManager, 'findUnitsByOrderReferences', async () => ([unit]))
+      stub(ProductUnitManager, 'releaseReservedUnitsForOrder', async () => {
+        releaseCalls += 1
+        return { matchedCount: 1, modifiedCount: 1 }
+      })
+
+      const result = await ProductUnitService.releaseOrderReservationsForExpiration(
+        { orderId: ids.order, expirationLimit: now },
+        { session }
+      )
+      assert.equal(result.valid, false)
+      assert.equal(result.reason, 'RESERVATION_INTEGRITY_CONFLICT')
+      assert.equal(releaseCalls, 0)
+    })
+  }
+
   it('rejects a partial CAS so its enclosing transaction can roll back', async () => {
     stub(OrderItemManager, 'getByOrderId', async () => ([
       { _id: ids.item, productId: ids.product, quantity: 1 }
     ]))
     stub(ProductUnitManager, 'findUnitsByOrderReferences', async () => ([baseState().units[0]]))
-    stub(ProductUnitManager, 'releaseReservedUnitsForOrder', async () => ({ modifiedCount: 0 }))
+    stub(ProductUnitManager, 'releaseReservedUnitsForOrder', async () => ({
+      matchedCount: 0,
+      modifiedCount: 0
+    }))
     stub(ProductModel, 'findOneAndUpdate', () => ({
       lean: async () => ({ _id: ids.product, inventoryMode: 'serialized' })
     }))
@@ -1028,27 +1054,35 @@ describe('P1B.3a expiration persistence fences', () => {
 
   it('releases only exact expired reservations owned by the same Order', async () => {
     let captured
-    stub(ProductUnitModel, 'updateMany', (filter, update, options) => {
-      captured = { filter, update, options }
-      return { modifiedCount: 1 }
+    stub(ProductUnitModel, 'bulkWrite', (operations, options) => {
+      captured = { operations, options }
+      return { matchedCount: 1, modifiedCount: 1 }
     })
+    const unit = baseState().units[0]
     await ProductUnitManager.releaseReservedUnitsForOrder({
-      unitIds: [ids.unit],
+      units: [unit],
       orderId: ids.order,
       expirationLimit: now
     }, { session: 'session' })
 
-    assert.deepEqual(captured.filter, {
-      _id: { $in: [ids.unit] },
+    assert.deepEqual(captured.operations[0].updateOne.filter, {
+      _id: ids.unit,
       status: 'reserved',
-      isDeleted: { $ne: true },
+      isDeleted: false,
+      productId: ids.product,
       orderId: ids.order,
+      orderItemId: ids.item,
       reservedByOrderId: ids.order,
-      reservationExpiresAt: { $lte: now }
+      reservedAt: unit.reservedAt,
+      reservationExpiresAt: unit.reservationExpiresAt,
+      soldByOrderId: null,
+      soldAt: null,
+      $expr: { $lte: ['$reservationExpiresAt', now] }
     })
-    assert.equal(captured.update.$set.status, 'available')
-    assert.equal(captured.update.$set.orderId, null)
-    assert.equal(captured.update.$set.reservedByOrderId, null)
+    assert.equal(captured.operations[0].updateOne.update.$set.status, 'available')
+    assert.equal(captured.operations[0].updateOne.update.$set.orderId, null)
+    assert.equal(captured.operations[0].updateOne.update.$set.reservedByOrderId, null)
+    assert.equal(captured.options.ordered, true)
     assert.equal(captured.options.session, 'session')
   })
 

@@ -227,30 +227,41 @@ class ProductUnitManager {
   }
 
   async releaseReservedUnitsForOrder(
-    { unitIds, orderId, expirationLimit },
+    { units, orderId, expirationLimit },
     { session } = {}
   ) {
-    return ProductUnitModel.updateMany(
-      {
-        _id: { $in: unitIds },
-        status: 'reserved',
-        isDeleted: { $ne: true },
-        orderId,
-        reservedByOrderId: orderId,
-        reservationExpiresAt: { $lte: expirationLimit }
-      },
-      {
-        $set: {
-          status: 'available',
-          orderId: null,
-          orderItemId: null,
-          reservedByOrderId: null,
-          reservedAt: null,
-          reservationExpiresAt: null
+    const operations = units.map((unit) => ({
+      updateOne: {
+        filter: {
+          _id: unit._id,
+          status: 'reserved',
+          isDeleted: false,
+          productId: unit.productId,
+          orderId,
+          orderItemId: unit.orderItemId,
+          reservedByOrderId: orderId,
+          reservedAt: unit.reservedAt,
+          reservationExpiresAt: unit.reservationExpiresAt,
+          soldByOrderId: null,
+          soldAt: null,
+          $expr: { $lte: ['$reservationExpiresAt', expirationLimit] }
+        },
+        update: {
+          $set: {
+            status: 'available',
+            orderId: null,
+            orderItemId: null,
+            reservedByOrderId: null,
+            reservedAt: null,
+            reservationExpiresAt: null
+          }
         }
-      },
-      { session }
-    )
+      }
+    }))
+
+    if (!operations.length) return { matchedCount: 0, modifiedCount: 0 }
+
+    return ProductUnitModel.bulkWrite(operations, { ordered: true, session })
   }
 
   async getAssignedByOrderId(orderId, { statuses, session } = {}) {

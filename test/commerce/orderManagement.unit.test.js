@@ -304,7 +304,10 @@ describe('Order administration queries and routes (isolated)', () => {
     }, {
       queryController: { listAdmin() {}, getAdmin() {} },
       fulfillmentController: { update() {} },
-      attentionController: { completeExistingReservationSale() {} }
+      attentionController: {
+        completeExistingReservationSale() {},
+        closeTerminalUnpaid() {}
+      }
     })
 
     assert.deepEqual(customerRoutes.map(({ method, path, policies }) => ({ method, path, policies })), [
@@ -317,6 +320,11 @@ describe('Order administration queries and routes (isolated)', () => {
       {
         method: 'post',
         path: '/:orderNumber/attention/complete-existing-reservation-sale',
+        policies: ['ADMIN']
+      },
+      {
+        method: 'post',
+        path: '/:orderNumber/attention/close-terminal-unpaid',
         policies: ['ADMIN']
       },
       { method: 'patch', path: '/:orderNumber/fulfillment', policies: ['ADMIN'] }

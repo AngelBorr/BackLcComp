@@ -538,7 +538,9 @@ class ProductUnitService {
     for (const unit of units) {
       const itemId = String(unit.orderItemId || '')
       const expected = expectedByItem.get(itemId)
-      const unitExpiration = new Date(unit.reservationExpiresAt)
+      const unitExpiration = unit.reservationExpiresAt == null
+        ? null
+        : new Date(unit.reservationExpiresAt)
 
       if (
         !expected ||
@@ -549,6 +551,7 @@ class ProductUnitService {
         String(unit.productId || '') !== expected.productId ||
         unit.soldByOrderId != null ||
         unit.soldAt != null ||
+        !unitExpiration ||
         Number.isNaN(unitExpiration.getTime()) ||
         unitExpiration.getTime() > checkedAt.getTime()
       ) {
@@ -586,14 +589,17 @@ class ProductUnitService {
     const unitIds = units.map((unit) => unit._id)
     const updateResult = await ProductUnitManager.releaseReservedUnitsForOrder(
       {
-        unitIds,
+        units,
         orderId,
         expirationLimit: checkedAt
       },
       { session }
     )
 
-    if (updateResult.modifiedCount !== expectedCount) {
+    if (
+      updateResult.matchedCount !== expectedCount ||
+      updateResult.modifiedCount !== expectedCount
+    ) {
       throw new ServiceError(
         'Las reservas cambiaron durante la liberación',
         'RESERVATION_RELEASE_CONFLICT',

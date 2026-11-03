@@ -157,8 +157,10 @@ const productUnitAdminDto = (unit) => ({
 const providerEvidenceDto = (evidence) => evidence
   ? {
       provider: evidence.provider || '',
+      evidenceSource: evidence.evidenceSource || null,
       providerOrderId: evidence.providerOrderId || null,
       providerPaymentId: evidence.providerPaymentId || null,
+      paymentsApiPaymentId: evidence.paymentsApiPaymentId || null,
       externalReference: evidence.externalReference || null,
       providerStatus: evidence.providerStatus || null,
       providerStatusDetail: evidence.providerStatusDetail || null,
@@ -166,6 +168,9 @@ const providerEvidenceDto = (evidence) => evidence
       totalAmount: evidence.totalAmount || null,
       totalPaidAmount: evidence.totalPaidAmount || null,
       currency: evidence.currency || null,
+      transactionAmountRefunded: evidence.transactionAmountRefunded ?? null,
+      refundCount: Number.isInteger(evidence.refundCount) ? evidence.refundCount : null,
+      orderMpReferenceId: evidence.orderMpReferenceId || null,
       observedAt: toIsoString(evidence.observedAt),
       remoteClassification: evidence.remoteClassification || null,
       accreditedPayment: evidence.accreditedPayment

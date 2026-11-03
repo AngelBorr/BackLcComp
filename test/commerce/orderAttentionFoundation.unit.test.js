@@ -1,3 +1,4 @@
+/* eslint-env mocha */
 import assert from 'node:assert/strict'
 import mongoose from 'mongoose'
 import OrderModel from '../../src/dao/models/order.model.js'
@@ -166,6 +167,36 @@ describe('P1C-0 Order attention foundation (isolated)', () => {
       ([fields, options]) => fields.orderId === 1 && fields.idempotencyKey === 1 && options.unique
     )
     assert.ok(uniqueIndex)
+  })
+
+  it('persists discriminated historical Payments API evidence without changing local IDs', async () => {
+    const resolution = new OrderAttentionResolutionModel(makePreparedInput({
+      providerEvidence: {
+        provider: 'mercado_pago',
+        evidenceSource: 'PAYMENTS_API_HISTORICAL_FALLBACK',
+        providerOrderId: 'ORDTST01M46H588EYB92EXVMR3QE8N6J',
+        providerPaymentId: 'PAY01M46HCBB6BXF58HCKXKYDQZY0',
+        paymentsApiPaymentId: '181512736549',
+        transactionAmountRefunded: '0',
+        refundCount: 0,
+        orderMpReferenceId: 'ORDTST01M46H588EYB92EXVMR3QE8N6J'
+      }
+    }))
+
+    await resolution.validate()
+    assert.equal(
+      resolution.providerEvidence.evidenceSource,
+      'PAYMENTS_API_HISTORICAL_FALLBACK'
+    )
+    assert.equal(resolution.providerEvidence.providerPaymentId, 'PAY01M46HCBB6BXF58HCKXKYDQZY0')
+    assert.equal(resolution.providerEvidence.paymentsApiPaymentId, '181512736549')
+    assert.notEqual(
+      resolution.providerEvidence.providerPaymentId,
+      resolution.providerEvidence.paymentsApiPaymentId
+    )
+
+    resolution.providerEvidence.evidenceSource = 'UNSAFE_SOURCE'
+    await assert.rejects(resolution.validate(), /evidenceSource/)
   })
 
   it('keeps historical Orders compatible with a safe resolution version default', async () => {

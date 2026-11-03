@@ -1,3 +1,4 @@
+/* eslint-env mocha */
 import assert from 'node:assert/strict'
 import mongoose from 'mongoose'
 import { OrderAttentionController } from '../../src/controllers/orderAttention.controller.js'
@@ -7,8 +8,10 @@ import ProductUnitManager from '../../src/dao/managers/productUnit.manager.js'
 import OrderModel from '../../src/dao/models/order.model.js'
 import PaymentModel from '../../src/dao/models/payment.model.js'
 import ProductUnitModel from '../../src/dao/models/productUnit.model.js'
+import { MercadoPagoProviderError } from '../../src/providers/mercadoPago.provider.js'
 import { OrderAttentionResolutionService } from '../../src/services/orderAttentionResolution.service.js'
 import { OrderAttentionRecoveryService } from '../../src/services/orderAttentionRecovery.service.js'
+import { MercadoPagoHistoricalPaymentEvidenceService } from '../../src/services/mercadoPagoHistoricalPaymentEvidence.service.js'
 import { CheckoutFinancialGuardService } from '../../src/services/checkoutFinancialGuard.service.js'
 
 const ids = Object.freeze({
@@ -48,6 +51,36 @@ const baseProviderOrder = (overrides = {}) => ({
     amount: '20497.40',
     paidAmount: '20497.40'
   }],
+  ...overrides
+})
+
+const baseHistoricalSearch = (overrides = {}) => ({
+  paging: { total: 2, offset: 0, limit: 50 },
+  results: [{
+    id: 181512125829,
+    status: 'rejected',
+    status_detail: 'cc_rejected_other_reason'
+  }, {
+    id: 181512736549,
+    status: 'approved',
+    status_detail: 'accredited'
+  }],
+  ...overrides
+})
+
+const baseHistoricalPayment = (overrides = {}) => ({
+  id: 181512736549,
+  status: 'approved',
+  status_detail: 'accredited',
+  external_reference: 'LC-2026-000003',
+  transaction_amount: 20497.4,
+  transaction_details: { total_paid_amount: 20497.4 },
+  currency_id: 'ARS',
+  transaction_amount_refunded: 0,
+  refunds: [],
+  point_of_interaction: {
+    references: [{ id: 'ORD-ATTENTION-001', type: 'ORDER_MP' }]
+  },
   ...overrides
 })
 
@@ -105,6 +138,8 @@ const baseState = (overrides = {}) => ({
   stockByProduct: { [ids.product]: 4 },
   counters: {
     providerGets: 0,
+    paymentSearches: 0,
+    paymentGets: 0,
     saleCalls: 0,
     stockRecalculations: 0
   },
@@ -119,6 +154,9 @@ const restoreState = (state, snapshot) => {
 const makeHarness = ({
   state: initialState = baseState(),
   providerOrder = baseProviderOrder(),
+  providerOrderError = null,
+  historicalSearch = baseHistoricalSearch(),
+  historicalPayment = baseHistoricalPayment(),
   mutateTransactionOrder,
   mutateTransactionUnits,
   mutateBeforePaymentCas,
@@ -351,9 +389,22 @@ const makeHarness = ({
   const provider = {
     async getOrder() {
       state.counters.providerGets += 1
+      if (providerOrderError) throw providerOrderError
       return clone(providerOrder)
+    },
+    async searchPayments() {
+      state.counters.paymentSearches += 1
+      return clone(historicalSearch)
+    },
+    async getPaymentById() {
+      state.counters.paymentGets += 1
+      return clone(historicalPayment)
     }
   }
+  const historicalPaymentEvidenceService = new MercadoPagoHistoricalPaymentEvidenceService({
+    provider,
+    clock: () => fixedNow
+  })
   const service = new OrderAttentionRecoveryService({
     mongooseInstance,
     orderManager,
@@ -363,6 +414,7 @@ const makeHarness = ({
     productUnitService,
     resolutionManager,
     resolutionService,
+    historicalPaymentEvidenceService,
     provider,
     clock: () => fixedNow
   })
@@ -419,6 +471,228 @@ describe('P1C-A approved sale recovery (isolated)', () => {
     assert.equal(state.resolutions[0].providerEvidence.remoteClassification, 'APPROVED')
     assert.equal(state.resolutions[0].providerEvidence.totalPaidAmount, '20497.40')
     assert.equal(state.resolutions[0].finalProductUnits[0].status, 'sold')
+    assert.equal(state.counters.paymentSearches, 0)
+    assert.equal(state.counters.paymentGets, 0)
+  })
+
+  it('uses the historical fallback only for exact get_order 404 order_not_found', async () => {
+    const harness = makeHarness({
+      providerOrderError: new MercadoPagoProviderError(
+        'Order not found',
+        'MERCADOPAGO_ORDER_REJECTED',
+        502,
+        {
+          providerOperation: 'get_order',
+          providerHttpStatus: 404,
+          providerCode: 'order_not_found'
+        }
+      )
+    })
+    const result = await harness.service.completeExistingReservationSale(harness.input)
+    const evidence = harness.state.resolutions[0].providerEvidence
+
+    assert.equal(result.orderStatus, 'paid')
+    assert.equal(result.paymentStatus, 'approved')
+    assert.equal(result.fulfillmentStatus, 'preparing')
+    assert.equal(harness.state.units[0].status, 'sold')
+    assert.equal(harness.state.payment.providerPaymentId, 'PAY-ATTENTION-001')
+    assert.equal(evidence.evidenceSource, 'PAYMENTS_API_HISTORICAL_FALLBACK')
+    assert.equal(evidence.providerPaymentId, 'PAY-ATTENTION-001')
+    assert.equal(evidence.paymentsApiPaymentId, '181512736549')
+    assert.equal(evidence.orderMpReferenceId, 'ORD-ATTENTION-001')
+    assert.equal(harness.state.counters.providerGets, 1)
+    assert.equal(harness.state.counters.paymentSearches, 1)
+    assert.equal(harness.state.counters.paymentGets, 1)
+    assert.equal(harness.state.order.attentionResolutionVersion, 1)
+    assert.equal(harness.state.counters.saleCalls, 1)
+  })
+
+  it('keeps attention and inventory untouched when historical search is empty', async () => {
+    const harness = makeHarness({
+      providerOrderError: new MercadoPagoProviderError(
+        'Order not found',
+        'MERCADOPAGO_ORDER_REJECTED',
+        502,
+        {
+          providerOperation: 'get_order',
+          providerHttpStatus: 404,
+          providerCode: 'order_not_found'
+        }
+      ),
+      historicalSearch: {
+        paging: { total: 0, offset: 0, limit: 50 },
+        results: []
+      }
+    })
+
+    await rejectsCode(
+      harness.service.completeExistingReservationSale(harness.input),
+      'ATTENTION_PROVIDER_EVIDENCE_MISMATCH'
+    )
+    assert.equal(harness.state.order.status, 'requires_attention')
+    assert.equal(harness.state.payment.normalizedStatus, 'approved')
+    assert.equal(harness.state.units[0].status, 'reserved')
+    assert.equal(harness.state.counters.saleCalls, 0)
+    assert.equal(harness.state.counters.stockRecalculations, 0)
+    assert.equal(harness.state.resolutions.length, 0)
+  })
+
+  for (const [name, metadata] of [
+    ['401', { providerHttpStatus: 401, providerCode: 'unauthorized' }],
+    ['403', { providerHttpStatus: 403, providerCode: 'forbidden' }],
+    ['409', { providerHttpStatus: 409, providerCode: 'conflict' }],
+    ['429', { providerHttpStatus: 429, providerCode: 'rate_limited' }],
+    ['500', { providerHttpStatus: 500, providerCode: 'internal_error' }],
+    ['timeout', { providerOperation: null, providerHttpStatus: null, providerCode: null }],
+    ['network error', { providerOperation: null, providerHttpStatus: null, providerCode: null }],
+    ['invalid JSON', { providerOperation: null, providerHttpStatus: null, providerCode: null }],
+    ['another 404', { providerHttpStatus: 404, providerCode: 'resource_not_found' }],
+    ['404 without code', { providerHttpStatus: 404, providerCode: null }],
+    ['wrong operation', {
+      providerHttpStatus: 404,
+      providerCode: 'order_not_found',
+      providerOperation: 'create'
+    }]
+  ]) {
+    it(`does not activate fallback for ${name}`, async () => {
+      const providerError = new MercadoPagoProviderError(
+        'Provider failure',
+        'MERCADOPAGO_ORDER_REJECTED',
+        502,
+        {
+          providerOperation: 'get_order',
+          ...metadata
+        }
+      )
+      const harness = makeHarness({ providerOrderError: providerError })
+
+      await assert.rejects(
+        harness.service.completeExistingReservationSale(harness.input),
+        (error) => error === providerError
+      )
+      assert.equal(harness.state.counters.paymentSearches, 0)
+      assert.equal(harness.state.counters.paymentGets, 0)
+      assert.equal(harness.state.resolutions.length, 0)
+      assert.equal(harness.state.order.status, 'requires_attention')
+      assert.equal(harness.state.units[0].status, 'reserved')
+    })
+  }
+
+  it('resumes persisted fallback evidence after a crash without provider calls', async () => {
+    const providerOrderError = new MercadoPagoProviderError(
+      'Order not found',
+      'MERCADOPAGO_ORDER_REJECTED',
+      502,
+      {
+        providerOperation: 'get_order',
+        providerHttpStatus: 404,
+        providerCode: 'order_not_found'
+      }
+    )
+    const completedHarness = makeHarness({ providerOrderError })
+    await completedHarness.service.completeExistingReservationSale(completedHarness.input)
+    const prepared = clone(completedHarness.state.resolutions[0])
+    const state = baseState({ resolutions: [prepared] })
+    state.resolutions[0].status = 'prepared'
+    state.resolutions[0].completedAt = null
+    state.resolutions[0].finalProductUnits = []
+    state.resolutions[0].finalResult = null
+    const resumed = makeHarness({ state })
+
+    const result = await resumed.service.completeExistingReservationSale(resumed.input)
+
+    assert.equal(result.orderStatus, 'paid')
+    assert.equal(state.counters.providerGets, 0)
+    assert.equal(state.counters.paymentSearches, 0)
+    assert.equal(state.counters.paymentGets, 0)
+    assert.equal(state.counters.saleCalls, 1)
+  })
+
+  it('keeps legacy Orders API evidence without evidenceSource retry-compatible', async () => {
+    const completedHarness = makeHarness()
+    await completedHarness.service.completeExistingReservationSale(completedHarness.input)
+    const prepared = clone(completedHarness.state.resolutions[0])
+    delete prepared.providerEvidence.evidenceSource
+    prepared.status = 'prepared'
+    prepared.completedAt = null
+    prepared.finalProductUnits = []
+    prepared.finalResult = null
+    const state = baseState({ resolutions: [prepared] })
+    const resumed = makeHarness({ state })
+
+    const result = await resumed.service.completeExistingReservationSale(resumed.input)
+
+    assert.equal(result.orderStatus, 'paid')
+    assert.equal(state.counters.providerGets, 0)
+    assert.equal(state.counters.saleCalls, 1)
+  })
+
+  it('returns completed historical fallback idempotently without repeated effects', async () => {
+    const providerOrderError = new MercadoPagoProviderError(
+      'Order not found',
+      'MERCADOPAGO_ORDER_REJECTED',
+      502,
+      {
+        providerOperation: 'get_order',
+        providerHttpStatus: 404,
+        providerCode: 'order_not_found'
+      }
+    )
+    const harness = makeHarness({ providerOrderError })
+    const first = await harness.service.completeExistingReservationSale(harness.input)
+    const retry = await harness.service.completeExistingReservationSale(harness.input)
+
+    assert.equal(retry.resolutionId, first.resolutionId)
+    assert.equal(retry.idempotent, true)
+    assert.equal(harness.state.counters.providerGets, 1)
+    assert.equal(harness.state.counters.paymentSearches, 1)
+    assert.equal(harness.state.counters.paymentGets, 1)
+    assert.equal(harness.state.counters.saleCalls, 1)
+    assert.equal(harness.state.order.attentionResolutionVersion, 1)
+    assert.equal(harness.state.order.statusHistory.length, 1)
+    assert.equal(harness.state.order.fulfillmentHistory.length, 1)
+  })
+
+  it('recovers the exact LC-2026-000003 historical fixture through the same transaction', async () => {
+    const state = baseState()
+    state.payment.providerOrderId = 'ORDTST01M46H588EYB92EXVMR3QE8N6J'
+    state.payment.providerPaymentId = 'PAY01M46HCBB6BXF58HCKXKYDQZY0'
+    state.units[0].serialNumber = 'E2E-MP-003'
+    const providerOrderError = new MercadoPagoProviderError(
+      'Order not found',
+      'MERCADOPAGO_ORDER_REJECTED',
+      502,
+      {
+        providerOperation: 'get_order',
+        providerHttpStatus: 404,
+        providerCode: 'order_not_found'
+      }
+    )
+    const harness = makeHarness({
+      state,
+      providerOrderError,
+      historicalPayment: baseHistoricalPayment({
+        point_of_interaction: {
+          references: [{
+            id: 'ORDTST01M46H588EYB92EXVMR3QE8N6J',
+            type: 'ORDER_MP'
+          }]
+        }
+      })
+    })
+
+    const result = await harness.service.completeExistingReservationSale(harness.input)
+
+    assert.equal(result.orderStatus, 'paid')
+    assert.equal(result.paymentStatus, 'approved')
+    assert.equal(result.fulfillmentStatus, 'preparing')
+    assert.equal(state.units[0].serialNumber, 'E2E-MP-003')
+    assert.equal(state.units[0].status, 'sold')
+    assert.equal(state.payment.providerPaymentId, 'PAY01M46HCBB6BXF58HCKXKYDQZY0')
+    assert.equal(
+      state.resolutions[0].providerEvidence.paymentsApiPaymentId,
+      '181512736549'
+    )
   })
 
   for (const [name, providerOverrides] of [

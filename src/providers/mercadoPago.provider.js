@@ -7,6 +7,14 @@ const DEFAULT_TIMEOUT_MS = 10000
 const MAX_LOG_TEXT_LENGTH = 500
 const MAX_LOG_DETAIL_ITEMS = 10
 
+const extractProviderErrorCode = (payload) => (
+  payload?.code ||
+  payload?.error ||
+  payload?.cause?.[0]?.code ||
+  payload?.errors?.[0]?.code ||
+  null
+)
+
 const sanitizeLogText = (value, secrets = []) => {
   if (value === undefined || value === null || value === '') return null
   if (!['string', 'number', 'boolean'].includes(typeof value)) return null
@@ -73,7 +81,7 @@ const sanitizeMercadoPagoHttpError = ({
   method,
   secrets = []
 }) => {
-  const providerCode = payload?.code || payload?.error || payload?.cause?.[0]?.code
+  const providerCode = extractProviderErrorCode(payload)
   const sanitizedProviderCode = sanitizeLogText(providerCode, secrets)
   const sanitizedMessage = sanitizeLogText(payload?.message, secrets)
   const sanitizedCause = sanitizeLogDetail(payload?.cause, secrets)
@@ -107,7 +115,13 @@ class MercadoPagoProviderError extends Error {
     message,
     code,
     status = 502,
-    { failureKind = 'unknown', retryStrategy = 'same_attempt' } = {}
+    {
+      failureKind = 'unknown',
+      retryStrategy = 'same_attempt',
+      providerHttpStatus = null,
+      providerCode = null,
+      providerOperation = null
+    } = {}
   ) {
     super(message)
     this.name = 'MercadoPagoProviderError'
@@ -115,6 +129,13 @@ class MercadoPagoProviderError extends Error {
     this.status = status
     this.failureKind = failureKind
     this.retryStrategy = retryStrategy
+    this.providerHttpStatus = Number.isInteger(providerHttpStatus)
+      ? providerHttpStatus
+      : null
+    this.providerCode = sanitizeLogText(providerCode)?.toLowerCase() || null
+    this.providerOperation = providerOperation == null
+      ? null
+      : String(providerOperation).trim().toLowerCase()
   }
 }
 
@@ -263,16 +284,22 @@ class MercadoPagoProvider {
   }
 
   #mapHttpError(status, payload, operation) {
-    const providerCode = String(
-      payload?.code || payload?.error || payload?.cause?.[0]?.code || ''
-    ).toLowerCase()
+    const providerCode = sanitizeLogText(
+      extractProviderErrorCode(payload),
+      [this.accessToken]
+    )?.toLowerCase() || ''
+    const providerMetadata = {
+      providerHttpStatus: Number(status),
+      providerCode: providerCode || null,
+      providerOperation: operation
+    }
 
     if (status === 401 || status === 403) {
       return new MercadoPagoProviderError(
         'Mercado Pago rechazó las credenciales configuradas',
         'MERCADOPAGO_AUTH_ERROR',
         502,
-        { failureKind: 'authentication' }
+        { ...providerMetadata, failureKind: 'authentication' }
       )
     }
 
@@ -281,7 +308,7 @@ class MercadoPagoProvider {
         'Mercado Pago limitó temporalmente las solicitudes',
         'MERCADOPAGO_RATE_LIMIT',
         503,
-        { failureKind: 'rate_limit' }
+        { ...providerMetadata, failureKind: 'rate_limit' }
       )
     }
 
@@ -290,7 +317,11 @@ class MercadoPagoProvider {
         'Mercado Pago no pudo confirmar la cancelacion de la order',
         'MERCADOPAGO_CANCELLATION_CONFLICT',
         502,
-        { failureKind: 'state_conflict', retryStrategy: 'same_attempt' }
+        {
+          ...providerMetadata,
+          failureKind: 'state_conflict',
+          retryStrategy: 'same_attempt'
+        }
       )
     }
 
@@ -299,7 +330,11 @@ class MercadoPagoProvider {
         'Mercado Pago rechazó la clave de idempotencia',
         'MERCADOPAGO_IDEMPOTENCY_CONFLICT',
         502,
-        { failureKind: 'idempotency_conflict', retryStrategy: 'fail_closed' }
+        {
+          ...providerMetadata,
+          failureKind: 'idempotency_conflict',
+          retryStrategy: 'fail_closed'
+        }
       )
     }
 
@@ -308,7 +343,7 @@ class MercadoPagoProvider {
         'La order de Mercado Pago está temporalmente bloqueada',
         'MERCADOPAGO_ORDER_CONFLICT',
         409,
-        { failureKind: 'resource_locked' }
+        { ...providerMetadata, failureKind: 'resource_locked' }
       )
     }
 
@@ -317,7 +352,7 @@ class MercadoPagoProvider {
         'Mercado Pago no está disponible temporalmente',
         'MERCADOPAGO_UNAVAILABLE',
         503,
-        { failureKind: 'server_error' }
+        { ...providerMetadata, failureKind: 'server_error' }
       )
     }
 
@@ -326,7 +361,11 @@ class MercadoPagoProvider {
         'Mercado Pago rechazo la cancelacion de la order',
         'MERCADOPAGO_CANCELLATION_REJECTED',
         502,
-        { failureKind: 'definitive_rejection', retryStrategy: 'fail_closed' }
+        {
+          ...providerMetadata,
+          failureKind: 'definitive_rejection',
+          retryStrategy: 'fail_closed'
+        }
       )
     }
 
@@ -334,7 +373,11 @@ class MercadoPagoProvider {
       'Mercado Pago rechazó la creación de la order',
       'MERCADOPAGO_ORDER_REJECTED',
       502,
-      { failureKind: 'definitive_rejection', retryStrategy: 'new_attempt' }
+      {
+        ...providerMetadata,
+        failureKind: 'definitive_rejection',
+        retryStrategy: 'new_attempt'
+      }
     )
   }
 
@@ -454,8 +497,70 @@ class MercadoPagoProvider {
       )
     }
 
-    const payload = await this.#request(`/v1/orders/${encodeURIComponent(normalizedId)}`)
+    const payload = await this.#request(`/v1/orders/${encodeURIComponent(normalizedId)}`, {
+      operation: 'get_order'
+    })
     return normalizeProviderOrder(payload, { includeReconciliation: true })
+  }
+
+  async searchPayments({ externalReference, status = 'approved', limit = 50, offset = 0 }) {
+    const normalizedExternalReference = String(externalReference || '').trim()
+    const normalizedStatus = String(status || '').trim().toLowerCase()
+    const normalizedLimit = Number(limit)
+    const normalizedOffset = Number(offset)
+
+    if (
+      !normalizedExternalReference ||
+      !normalizedStatus ||
+      !Number.isSafeInteger(normalizedLimit) ||
+      normalizedLimit <= 0 ||
+      !Number.isSafeInteger(normalizedOffset) ||
+      normalizedOffset < 0
+    ) {
+      throw new MercadoPagoProviderError(
+        'Parametros de busqueda de pagos invalidos',
+        'MERCADOPAGO_INVALID_RESPONSE',
+        400
+      )
+    }
+
+    const query = new URLSearchParams({
+      external_reference: normalizedExternalReference,
+      status: normalizedStatus,
+      limit: String(normalizedLimit),
+      offset: String(normalizedOffset)
+    })
+
+    return this.#request(`/v1/payments/search?${query.toString()}`, {
+      operation: 'search_payments'
+    })
+  }
+
+  async getPaymentById(paymentsApiPaymentId) {
+    let normalizedId = ''
+
+    if (typeof paymentsApiPaymentId === 'number') {
+      if (Number.isSafeInteger(paymentsApiPaymentId) && paymentsApiPaymentId > 0) {
+        normalizedId = String(paymentsApiPaymentId)
+      }
+    } else if (
+      typeof paymentsApiPaymentId === 'string' &&
+      paymentsApiPaymentId === paymentsApiPaymentId.trim()
+    ) {
+      normalizedId = paymentsApiPaymentId
+    }
+
+    if (!/^[1-9]\d*$/.test(normalizedId)) {
+      throw new MercadoPagoProviderError(
+        'ID de pago de Mercado Pago invalido',
+        'MERCADOPAGO_INVALID_RESPONSE',
+        400
+      )
+    }
+
+    return this.#request(`/v1/payments/${encodeURIComponent(normalizedId)}`, {
+      operation: 'get_payment'
+    })
   }
 
   async cancelOrder(providerOrderId, { idempotencyKey } = {}) {
@@ -488,6 +593,7 @@ export {
   MERCADOPAGO_CHECKOUT_HOST,
   MercadoPagoProvider,
   MercadoPagoProviderError,
+  extractProviderErrorCode,
   normalizeProviderPayments,
   normalizeProviderOrder
 }

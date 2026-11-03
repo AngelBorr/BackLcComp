@@ -16,8 +16,14 @@ export const ORDER_ATTENTION_RESOLUTION_ACTIONS = [
 const providerEvidenceSchema = new mongoose.Schema(
   {
     provider: { type: String, trim: true, maxlength: 50, default: '' },
+    evidenceSource: {
+      type: String,
+      enum: [null, 'ORDERS_API', 'PAYMENTS_API_HISTORICAL_FALLBACK'],
+      default: null
+    },
     providerOrderId: { type: String, trim: true, maxlength: 200, default: null },
     providerPaymentId: { type: String, trim: true, maxlength: 200, default: null },
+    paymentsApiPaymentId: { type: String, trim: true, maxlength: 200, default: null },
     externalReference: { type: String, trim: true, maxlength: 100, default: null },
     providerStatus: { type: String, trim: true, maxlength: 100, default: null },
     providerStatusDetail: { type: String, trim: true, maxlength: 200, default: null },
@@ -25,6 +31,9 @@ const providerEvidenceSchema = new mongoose.Schema(
     totalAmount: { type: String, trim: true, maxlength: 100, default: null },
     totalPaidAmount: { type: String, trim: true, maxlength: 100, default: null },
     currency: { type: String, trim: true, maxlength: 10, default: null },
+    transactionAmountRefunded: { type: String, trim: true, maxlength: 100, default: null },
+    refundCount: { type: Number, min: 0, default: null },
+    orderMpReferenceId: { type: String, trim: true, maxlength: 200, default: null },
     observedAt: { type: Date, default: null },
     remoteClassification: { type: String, trim: true, maxlength: 100, default: null },
     accreditedPayment: {

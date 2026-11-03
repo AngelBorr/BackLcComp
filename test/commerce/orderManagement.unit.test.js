@@ -1,3 +1,4 @@
+/* eslint-env mocha */
 import assert from 'node:assert/strict'
 import express from 'express'
 import request from 'supertest'
@@ -436,7 +437,26 @@ describe('Order administration queries and routes (isolated)', () => {
       requestedAt: createdAt,
       completedAt: null,
       status: 'prepared',
-      providerEvidence: null,
+      providerEvidence: {
+        provider: 'mercado_pago',
+        evidenceSource: 'PAYMENTS_API_HISTORICAL_FALLBACK',
+        providerOrderId: 'ORDTST01M46H588EYB92EXVMR3QE8N6J',
+        providerPaymentId: 'PAY01M46HCBB6BXF58HCKXKYDQZY0',
+        paymentsApiPaymentId: '181512736549',
+        externalReference: orderNumber,
+        providerStatus: 'approved',
+        providerStatusDetail: 'accredited',
+        amountArs: '150000.00',
+        totalAmount: '150000.00',
+        totalPaidAmount: '150000.00',
+        currency: 'ARS',
+        transactionAmountRefunded: '0',
+        refundCount: 0,
+        orderMpReferenceId: 'ORDTST01M46H588EYB92EXVMR3QE8N6J',
+        observedAt: approvedAt,
+        remoteClassification: 'APPROVED',
+        accreditedPayment: null
+      },
       previousState: { attentionResolutionVersion: 0 },
       previousProductUnits: [],
       finalProductUnits: [],
@@ -456,6 +476,15 @@ describe('Order administration queries and routes (isolated)', () => {
     assert.equal(result.order.attentionResolutionVersion, 0)
     assert.equal(result.payment.amountArs, '150000.00')
     assert.equal(result.payment.currency, 'ARS')
+    assert.equal(
+      result.resolutions[0].providerEvidence.evidenceSource,
+      'PAYMENTS_API_HISTORICAL_FALLBACK'
+    )
+    assert.equal(
+      result.resolutions[0].providerEvidence.paymentsApiPaymentId,
+      '181512736549'
+    )
+    assert.equal(result.resolutions[0].providerEvidence.refundCount, 0)
     assert.deepEqual(
       Object.keys(result.items[0].productUnits[0]).sort(),
       [

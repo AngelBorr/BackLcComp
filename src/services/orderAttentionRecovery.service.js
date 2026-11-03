@@ -5,7 +5,9 @@ import OrderItemManager from '../dao/managers/orderItem.manager.js'
 import PaymentManager from '../dao/managers/payment.manager.js'
 import ProductUnitManager from '../dao/managers/productUnit.manager.js'
 import OrderAttentionResolutionManager from '../dao/managers/orderAttentionResolution.manager.js'
-import MercadoPagoProvider from '../providers/mercadoPago.provider.js'
+import MercadoPagoProvider, {
+  MercadoPagoProviderError
+} from '../providers/mercadoPago.provider.js'
 import { toMinorUnits } from '../utils/commerceMoney.js'
 import { error as logError } from '../utils/logger.js'
 import OrderAttentionService, {
@@ -13,6 +15,9 @@ import OrderAttentionService, {
   inspectReservationIntegrity
 } from './orderAttention.service.js'
 import OrderAttentionResolutionService from './orderAttentionResolution.service.js'
+import MercadoPagoHistoricalPaymentEvidenceService, {
+  HISTORICAL_PAYMENT_EVIDENCE_SOURCE
+} from './mercadoPagoHistoricalPaymentEvidence.service.js'
 import ProductUnitService from './productUnit.service.js'
 import {
   REMOTE_ORDER_CLASSIFICATIONS,
@@ -27,6 +32,7 @@ const TRANSACTION_OPTIONS = Object.freeze({
 
 const ACTION = 'complete_existing_reservation_sale'
 const COMPLETION_REASON = 'ATTENTION_RESOLUTION_EXISTING_RESERVATION_SALE'
+const ORDERS_API_EVIDENCE_SOURCE = 'ORDERS_API'
 const ORDER_NUMBER_PATTERN = /^LC-\d{4}-\d{6,}$/
 
 const asText = (value) => String(value ?? '').trim()
@@ -109,6 +115,7 @@ class OrderAttentionRecoveryService {
     resolutionManager = OrderAttentionResolutionManager,
     resolutionService = OrderAttentionResolutionService,
     orderAttentionService = OrderAttentionService,
+    historicalPaymentEvidenceService = MercadoPagoHistoricalPaymentEvidenceService,
     provider = MercadoPagoProvider,
     clock = () => new Date()
   } = {}) {
@@ -121,6 +128,7 @@ class OrderAttentionRecoveryService {
     this.resolutions = resolutionManager
     this.resolutionService = resolutionService
     this.orderAttention = orderAttentionService
+    this.historicalPaymentEvidence = historicalPaymentEvidenceService
     this.provider = provider
     this.clock = clock
   }
@@ -314,6 +322,7 @@ class OrderAttentionRecoveryService {
 
     return {
       provider: 'mercado_pago',
+      evidenceSource: ORDERS_API_EVIDENCE_SOURCE,
       providerOrderId: expected.providerOrderId,
       providerPaymentId: expected.providerPaymentId,
       externalReference: expected.orderNumber,
@@ -341,24 +350,49 @@ class OrderAttentionRecoveryService {
     const observedAt = validDate(evidence?.observedAt)
     const paymentApprovedAt = validDate(previous?.paymentApprovedAt)
     const accreditedPayment = evidence?.accreditedPayment
+    const evidenceSource = evidence?.evidenceSource || ORDERS_API_EVIDENCE_SOURCE
+    const commonEvidenceValid = (
+      evidence?.provider === 'mercado_pago' &&
+      evidence?.remoteClassification === REMOTE_ORDER_CLASSIFICATIONS.APPROVED &&
+      observedAt &&
+      paymentApprovedAt &&
+      sameId(evidence.providerOrderId, payment.providerOrderId) &&
+      sameId(evidence.providerPaymentId, payment.providerPaymentId) &&
+      sameMoney(evidence.amountArs, payment.amountArs) &&
+      sameInstant(payment.approvedAt, paymentApprovedAt)
+    )
+    const ordersEvidenceValid = (
+      evidenceSource === ORDERS_API_EVIDENCE_SOURCE &&
+      asText(evidence?.providerStatus).toLowerCase() === 'processed' &&
+      asText(evidence?.providerStatusDetail).toLowerCase() === 'accredited' &&
+      evidence?.paymentsApiPaymentId == null &&
+      sameId(accreditedPayment?.providerPaymentId, payment.providerPaymentId) &&
+      asText(evidence?.externalReference).toUpperCase() ===
+        asText(order.orderNumber).toUpperCase() &&
+      asText(evidence?.currency).toUpperCase() === asText(payment.currency).toUpperCase() &&
+      sameMoney(evidence?.totalAmount, order.totals?.totalArs) &&
+      sameMoney(evidence?.totalPaidAmount, order.totals?.totalArs) &&
+      sameMoney(accreditedPayment?.amount, order.totals?.totalArs) &&
+      sameMoney(accreditedPayment?.paidAmount, order.totals?.totalArs)
+    )
+    const historicalEvidenceValid = (
+      evidenceSource === HISTORICAL_PAYMENT_EVIDENCE_SOURCE &&
+      asText(evidence?.providerStatus).toLowerCase() === 'approved' &&
+      asText(evidence?.providerStatusDetail).toLowerCase() === 'accredited' &&
+      /^[1-9]\d*$/.test(asText(evidence?.paymentsApiPaymentId)) &&
+      asText(evidence?.externalReference) === asText(order.orderNumber) &&
+      asText(evidence?.currency) === asText(payment.currency) &&
+      sameMoney(evidence?.totalAmount, order.totals?.totalArs) &&
+      sameMoney(evidence?.totalPaidAmount, order.totals?.totalArs) &&
+      sameMoney(evidence?.transactionAmountRefunded, '0') &&
+      evidence?.refundCount === 0 &&
+      asText(evidence?.orderMpReferenceId) === asText(payment.providerOrderId) &&
+      accreditedPayment == null
+    )
 
     if (
-      evidence?.provider !== 'mercado_pago' ||
-      evidence?.remoteClassification !== REMOTE_ORDER_CLASSIFICATIONS.APPROVED ||
-      asText(evidence.providerStatus).toLowerCase() !== 'processed' ||
-      asText(evidence.providerStatusDetail).toLowerCase() !== 'accredited' ||
-      !observedAt ||
-      !paymentApprovedAt ||
-      !sameId(evidence.providerOrderId, payment.providerOrderId) ||
-      !sameId(evidence.providerPaymentId, payment.providerPaymentId) ||
-      !sameId(accreditedPayment?.providerPaymentId, payment.providerPaymentId) ||
-      asText(evidence.externalReference).toUpperCase() !== asText(order.orderNumber).toUpperCase() ||
-      asText(evidence.currency).toUpperCase() !== asText(payment.currency).toUpperCase() ||
-      !sameMoney(evidence.totalAmount, order.totals?.totalArs) ||
-      !sameMoney(evidence.totalPaidAmount, order.totals?.totalArs) ||
-      !sameMoney(accreditedPayment?.amount, order.totals?.totalArs) ||
-      !sameMoney(accreditedPayment?.paidAmount, order.totals?.totalArs) ||
-      !sameInstant(payment.approvedAt, paymentApprovedAt)
+      !commonEvidenceValid ||
+      (!ordersEvidenceValid && !historicalEvidenceValid)
     ) {
       throw new ServiceError(
         'La evidencia persistida ya no corresponde al estado local',
@@ -367,7 +401,14 @@ class OrderAttentionRecoveryService {
       )
     }
 
-    return { evidence, observedAt, paymentApprovedAt }
+    return { evidence, evidenceSource, observedAt, paymentApprovedAt }
+  }
+
+  #isHistoricalFallbackError(error) {
+    return error instanceof MercadoPagoProviderError &&
+      error.providerOperation === 'get_order' &&
+      error.providerHttpStatus === 404 &&
+      error.providerCode === 'order_not_found'
   }
 
   async #prepareResolution(input, order) {
@@ -378,12 +419,26 @@ class OrderAttentionRecoveryService {
       this.resolutions.getOrderResolutionHistory(order._id)
     ])
     const local = this.#assertLocalPreflight({ order, payment, items, units, resolutions })
-    const providerOrder = await this.provider.getOrder(local.providerOrderId)
-    const observedAt = this.#now()
-    const providerEvidence = this.#providerEvidence(providerOrder, {
-      ...local,
-      orderNumber: input.orderNumber
-    }, observedAt)
+    let providerEvidence
+
+    try {
+      const providerOrder = await this.provider.getOrder(local.providerOrderId)
+      const observedAt = this.#now()
+      providerEvidence = this.#providerEvidence(providerOrder, {
+        ...local,
+        orderNumber: input.orderNumber
+      }, observedAt)
+    } catch (error) {
+      if (!this.#isHistoricalFallbackError(error)) throw error
+
+      providerEvidence = await this.historicalPaymentEvidence.getEvidence({
+        orderNumber: input.orderNumber,
+        providerOrderId: local.providerOrderId,
+        providerPaymentId: local.providerPaymentId,
+        totalArs: local.totalArs,
+        currency: local.currency
+      })
+    }
     const requestedAt = this.#now()
     const prepared = await this.resolutionService.createPreparedResolution({
       orderId: order._id,
@@ -493,7 +548,12 @@ class OrderAttentionRecoveryService {
         )
       }
 
-      const { evidence, observedAt, paymentApprovedAt } = this.#assertPersistedEvidence(
+      const {
+        evidence,
+        evidenceSource,
+        observedAt,
+        paymentApprovedAt
+      } = this.#assertPersistedEvidence(
         resolution,
         order,
         payment
@@ -526,8 +586,12 @@ class OrderAttentionRecoveryService {
           currency: evidence.currency,
           expectedLastProviderCheckAt: resolution.previousState.paymentLastProviderCheckAt,
           observedAt,
-          providerStatus: evidence.providerStatus,
-          providerStatusDetail: evidence.providerStatusDetail
+          providerStatus: evidenceSource === HISTORICAL_PAYMENT_EVIDENCE_SOURCE
+            ? payment.providerStatus
+            : evidence.providerStatus,
+          providerStatusDetail: evidenceSource === HISTORICAL_PAYMENT_EVIDENCE_SOURCE
+            ? payment.providerStatusDetail
+            : evidence.providerStatusDetail
         },
         { session }
       )

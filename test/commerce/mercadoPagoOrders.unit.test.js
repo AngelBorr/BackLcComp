@@ -1403,3 +1403,140 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.equal(state.payment.normalizedStatus, 'pending')
   })
 })
+
+describe('MercadoPago provider metadata and Payments API transport', () => {
+  it('preserves exact get_order 404 metadata from errors[0].code', async () => {
+    const provider = makeProvider(async () => jsonResponse({
+      errors: [{ code: 'order_not_found', message: 'Order not found.' }]
+    }, { status: 404 }))
+
+    await assert.rejects(
+      provider.getOrder('ORDTST01M46H588EYB92EXVMR3QE8N6J'),
+      (error) => (
+        error instanceof MercadoPagoProviderError &&
+        error.code === 'MERCADOPAGO_ORDER_REJECTED' &&
+        error.providerOperation === 'get_order' &&
+        error.providerHttpStatus === 404 &&
+        error.providerCode === 'order_not_found'
+      )
+    )
+  })
+
+  it('preserves another 404 provider code without classifying it as order_not_found', async () => {
+    const provider = makeProvider(async () => jsonResponse({
+      errors: [{ code: 'resource_not_found' }]
+    }, { status: 404 }))
+
+    await assert.rejects(
+      provider.getOrder('ORDTST01M46H588EYB92EXVMR3QE8N6J'),
+      (error) => (
+        error.providerOperation === 'get_order' &&
+        error.providerHttpStatus === 404 &&
+        error.providerCode === 'resource_not_found'
+      )
+    )
+  })
+
+  it('preserves the historical cause[0].code format', async () => {
+    const provider = makeProvider(async () => jsonResponse({
+      cause: [{ code: 'historical_error_code' }]
+    }, { status: 404 }))
+
+    await assert.rejects(
+      provider.getOrder('ORDTST01M46H588EYB92EXVMR3QE8N6J'),
+      (error) => error.providerCode === 'historical_error_code'
+    )
+  })
+
+  it('keeps a non-JSON 404 fail-closed without a provider code', async () => {
+    const provider = makeProvider(async () => textResponse('Order not found', { status: 404 }))
+
+    await assert.rejects(
+      provider.getOrder('ORDTST01M46H588EYB92EXVMR3QE8N6J'),
+      (error) => (
+        error.providerOperation === 'get_order' &&
+        error.providerHttpStatus === 404 &&
+        error.providerCode === null
+      )
+    )
+  })
+
+  for (const [status, providerPayload, expectedCode] of [
+    [401, { code: 'unauthorized' }, 'MERCADOPAGO_AUTH_ERROR'],
+    [403, { code: 'forbidden' }, 'MERCADOPAGO_AUTH_ERROR'],
+    [429, { code: 'rate_limited' }, 'MERCADOPAGO_RATE_LIMIT'],
+    [500, { code: 'internal_error' }, 'MERCADOPAGO_UNAVAILABLE']
+  ]) {
+    it(`preserves sanitized metadata for HTTP ${status}`, async () => {
+      const provider = makeProvider(async () => jsonResponse(providerPayload, { status }))
+
+      await assert.rejects(
+        provider.getOrder('ORDTST01M46H588EYB92EXVMR3QE8N6J'),
+        (error) => (
+          error.code === expectedCode &&
+          error.providerOperation === 'get_order' &&
+          error.providerHttpStatus === status &&
+          error.providerCode === providerPayload.code
+        )
+      )
+    })
+  }
+
+  it('reuses the provider transport for paginated Payments search', async () => {
+    let captured
+    const provider = makeProvider(async (url, options) => {
+      captured = { url, options }
+      return jsonResponse({ paging: { total: 0, offset: 50, limit: 50 }, results: [] })
+    })
+    const payload = await provider.searchPayments({
+      externalReference: 'LC-2026-000003',
+      status: 'approved',
+      limit: 50,
+      offset: 50
+    })
+    const url = new URL(captured.url)
+
+    assert.equal(url.pathname, '/v1/payments/search')
+    assert.equal(url.searchParams.get('external_reference'), 'LC-2026-000003')
+    assert.equal(url.searchParams.get('status'), 'approved')
+    assert.equal(url.searchParams.get('limit'), '50')
+    assert.equal(url.searchParams.get('offset'), '50')
+    assert.equal(captured.options.method, 'GET')
+    assert.equal(captured.options.headers.Authorization, 'Bearer test-access-token')
+    assert.deepEqual(payload.results, [])
+  })
+
+  it('reuses the provider transport for individual numeric Payment GET', async () => {
+    let capturedUrl
+    const provider = makeProvider(async (url) => {
+      capturedUrl = url
+      return jsonResponse({ id: 181512736549, status: 'approved' })
+    })
+    const payload = await provider.getPaymentById('181512736549')
+
+    assert.equal(capturedUrl, `${MERCADOPAGO_API_URL}/v1/payments/181512736549`)
+    assert.equal(payload.id, 181512736549)
+  })
+
+  it('rejects unsafe or non-canonical Payments API IDs before provider I/O', async () => {
+    let calls = 0
+    const provider = makeProvider(async () => {
+      calls += 1
+      return jsonResponse({})
+    })
+
+    for (const invalid of [
+      Number.MAX_SAFE_INTEGER + 1,
+      -1,
+      1.5,
+      '0181512736549',
+      ' 181512736549'
+    ]) {
+      await assert.rejects(
+        provider.getPaymentById(invalid),
+        (error) => error.code === 'MERCADOPAGO_INVALID_RESPONSE'
+      )
+    }
+    assert.equal(calls, 0)
+  })
+})

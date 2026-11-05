@@ -4,6 +4,7 @@ import OrderItemManager from '../dao/managers/orderItem.manager.js'
 import PaymentManager from '../dao/managers/payment.manager.js'
 import ProductUnitManager from '../dao/managers/productUnit.manager.js'
 import OrderAttentionResolutionManager from '../dao/managers/orderAttentionResolution.manager.js'
+import PaymentRefundManager from '../dao/managers/paymentRefund.manager.js'
 import { ORDER_STATUSES, ORDER_FULFILLMENT_STATUSES } from '../dao/models/order.model.js'
 import { PAYMENT_STATUSES } from '../dao/models/payment.model.js'
 import { ServiceError } from './service.products.js'
@@ -235,7 +236,31 @@ const resolutionDto = (resolution) => ({
     : null
 })
 
-const buildTimeline = ({ order, payment, units }) => {
+const refundAdminDto = (refund) => ({
+  refundId: idToString(refund._id),
+  type: refund.type,
+  status: refund.status,
+  origin: refund.origin,
+  requestedAmountArs: decimalToString(refund.requestedAmountArs),
+  confirmedAmountArs: decimalToString(refund.confirmedAmountArs),
+  currency: refund.currency,
+  providerRefundId: refund.providerRefundId || null,
+  providerStatus: refund.providerStatus || null,
+  providerStatusDetail: refund.providerStatusDetail || null,
+  reasonCode: refund.reasonCode || '',
+  note: refund.note || '',
+  requestedBy: idToString(refund.requestedBy),
+  requestedByRole: refund.requestedByRole || null,
+  requestedAt: toIsoString(refund.requestedAt),
+  submittedAt: toIsoString(refund.submittedAt),
+  lastProviderCheckAt: toIsoString(refund.lastProviderCheckAt),
+  completedAt: toIsoString(refund.completedAt),
+  sanitizedError: refund.sanitizedError
+    ? { code: refund.sanitizedError.code || '', message: refund.sanitizedError.message || '' }
+    : null
+})
+
+const buildTimeline = ({ order, payment, units, refunds = [] }) => {
   const events = []
   const push = (type, at, label) => {
     const normalizedAt = toIsoString(at)
@@ -271,6 +296,11 @@ const buildTimeline = ({ order, payment, units }) => {
 
   push('payment_approved', payment?.approvedAt, 'Pago acreditado')
 
+  for (const refund of refunds) {
+    push('refund_requested', refund.requestedAt, 'Reembolso total solicitado')
+    push('refund_completed', refund.completedAt, `Reembolso: ${refund.status}`)
+  }
+
   for (const unit of units) {
     push('unit_reserved', unit.reservedAt, `Serial ${unit.serialNumber} reservado`)
     push('unit_sold', unit.soldAt, `Serial ${unit.serialNumber} vendido`)
@@ -285,6 +315,7 @@ class OrderQueryService {
     orderItemManager = OrderItemManager,
     paymentManager = PaymentManager,
     productUnitManager = ProductUnitManager,
+    paymentRefundManager = PaymentRefundManager,
     attentionResolutionManager = OrderAttentionResolutionManager,
     orderAttentionService = OrderAttentionService
   } = {}) {
@@ -292,6 +323,7 @@ class OrderQueryService {
     this.orderItems = orderItemManager
     this.payments = paymentManager
     this.productUnits = productUnitManager
+    this.refunds = paymentRefundManager
     this.attentionResolutions = attentionResolutionManager
     this.orderAttention = orderAttentionService
   }
@@ -437,13 +469,14 @@ class OrderQueryService {
     const order = await this.orders.getByOrderNumber(normalizedOrderNumber)
     if (!order) throw new ServiceError('Orden no encontrada', 'ORDER_NOT_FOUND', 404)
 
-    const [items, payment, units, resolutions] = await Promise.all([
+    const [items, payment, units, resolutions, refunds] = await Promise.all([
       this.orderItems.getByOrderId(order._id),
       this.payments.getLatestByOrderId(order._id),
       order.status === 'requires_attention'
         ? this.productUnits.getRelatedByOrderId(order._id)
         : this.productUnits.getAssignedByOrderId(order._id),
-      this.attentionResolutions.getOrderResolutionHistory(order._id)
+      this.attentionResolutions.getOrderResolutionHistory(order._id),
+      this.refunds.listByOrderId(order._id)
     ])
     const unitsByOrderItem = new Map()
 
@@ -478,6 +511,8 @@ class OrderQueryService {
         fulfillmentStatus: getEffectiveFulfillmentStatus(order),
         fulfillmentHistory: fulfillmentHistoryDto(order.fulfillmentHistory),
         paidAt: toIsoString(order.paidAt),
+        refundedAt: toIsoString(order.refundedAt),
+        activeRefundId: idToString(order.activeRefundId),
         cancelledAt: toIsoString(order.cancelledAt),
         expiredAt: toIsoString(order.expiredAt),
         readyForPickupAt: toIsoString(order.readyForPickupAt),
@@ -525,7 +560,29 @@ class OrderQueryService {
         : null,
       attention,
       resolutions: resolutions.map(resolutionDto),
-      timeline: buildTimeline({ order, payment, units })
+      refunds: refunds.map(refundAdminDto),
+      refundSummary: {
+        totalRefundedArs: decimalToString(
+          refunds.find((refund) => refund.status === 'succeeded')?.confirmedAmountArs
+        ) || '0.00',
+        refundableAmountArs: order.status === 'paid' && payment?.normalizedStatus === 'approved'
+          ? decimalToString(payment.amountArs)
+          : '0.00',
+        activeRefundId: idToString(order.activeRefundId),
+        canRequestRefund: order.status === 'paid' &&
+          payment?.normalizedStatus === 'approved' &&
+          !order.activeRefundId &&
+          !refunds.some((refund) => refund.status === 'succeeded'),
+        blockers: [
+          ...(order.status !== 'paid' ? ['ORDER_NOT_PAID'] : []),
+          ...(payment?.normalizedStatus !== 'approved' ? ['PAYMENT_NOT_APPROVED'] : []),
+          ...(order.activeRefundId ? ['ACTIVE_REFUND'] : []),
+          ...(refunds.some((refund) => refund.status === 'succeeded')
+            ? ['TOTAL_REFUND_ALREADY_SUCCEEDED']
+            : [])
+        ]
+      },
+      timeline: buildTimeline({ order, payment, units, refunds })
     }
   }
 }

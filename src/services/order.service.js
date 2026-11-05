@@ -16,6 +16,7 @@ const TRANSACTION_OPTIONS = {
 export const ORDER_STATUS_TRANSITIONS = Object.freeze({
   pending_payment: new Set(['paid', 'cancelled', 'expired', 'requires_attention']),
   paid: new Set(['requires_attention']),
+  refunded: new Set(),
   cancelled: new Set(['requires_attention']),
   expired: new Set(['requires_attention']),
   requires_attention: new Set()

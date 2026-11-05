@@ -23,7 +23,7 @@ const toPublicCheckoutBlocker = (value) => {
     orderNumber: /^LC-\d{4}-\d{6,}$/.test(String(value.orderNumber || ''))
       ? String(value.orderNumber)
       : undefined,
-    orderStatus: ['pending_payment', 'paid', 'cancelled', 'expired', 'requires_attention']
+    orderStatus: ['pending_payment', 'paid', 'refunded', 'cancelled', 'expired', 'requires_attention']
       .includes(value.orderStatus)
       ? value.orderStatus
       : undefined,

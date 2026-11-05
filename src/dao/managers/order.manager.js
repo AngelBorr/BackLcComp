@@ -422,7 +422,16 @@ class OrderManager {
     if (nextStatus === 'picked_up') set.pickedUpAt = changedAt
 
     return OrderModel.findOneAndUpdate(
-      combineFilters({ _id: orderId }, expectedFilter),
+      combineFilters(
+        {
+          _id: orderId,
+          $or: [
+            { activeRefundId: null },
+            { activeRefundId: { $exists: false } }
+          ]
+        },
+        expectedFilter
+      ),
       {
         $set: set,
         $push: {
@@ -434,6 +443,72 @@ class OrderManager {
           }
         }
       },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
+  async attachActiveRefund(orderId, refundId, { session } = {}) {
+    return OrderModel.findOneAndUpdate(
+      { _id: orderId, status: 'paid', activeRefundId: null },
+      { $set: { activeRefundId: refundId } },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
+  async clearActiveRefund(orderId, refundId, { session } = {}) {
+    return OrderModel.findOneAndUpdate(
+      { _id: orderId, status: 'paid', activeRefundId: refundId },
+      { $set: { activeRefundId: null } },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
+  async finalizeTotalRefund(
+    orderId,
+    refundId,
+    { refundedAt, paidAt, expectedFulfillmentStatus },
+    { session } = {}
+  ) {
+    const cancellable = ['pending', 'preparing', 'ready_for_pickup']
+    const shouldCancelFulfillment = cancellable.includes(expectedFulfillmentStatus)
+    const update = {
+      $set: {
+        status: 'refunded',
+        refundedAt,
+        activeRefundId: null,
+        ...(shouldCancelFulfillment && { fulfillmentStatus: 'cancelled' })
+      },
+      $push: {
+        statusHistory: {
+          status: 'refunded',
+          changedAt: refundedAt,
+          reason: 'PAYMENT_REFUND_TOTAL'
+        },
+        ...(shouldCancelFulfillment && {
+          fulfillmentHistory: {
+            status: 'cancelled',
+            changedAt: refundedAt,
+            changedBy: null,
+            reason: 'PAYMENT_REFUND_TOTAL'
+          }
+        })
+      }
+    }
+
+    return OrderModel.findOneAndUpdate(
+      {
+        _id: orderId,
+        status: 'paid',
+        paidAt,
+        activeRefundId: refundId,
+        $or: [
+          { fulfillmentStatus: expectedFulfillmentStatus },
+          ...(expectedFulfillmentStatus === 'preparing'
+            ? [{ fulfillmentStatus: null }]
+            : [])
+        ]
+      },
+      update,
       { new: true, session, runValidators: true }
     ).lean()
   }

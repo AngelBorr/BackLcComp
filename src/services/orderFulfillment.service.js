@@ -45,6 +45,14 @@ class OrderFulfillmentService {
     const order = await this.orders.getByOrderNumber(normalizedOrderNumber)
     if (!order) throw new ServiceError('Orden no encontrada', 'ORDER_NOT_FOUND', 404)
 
+    if (order.activeRefundId) {
+      throw new ServiceError(
+        'La orden tiene un reembolso financiero activo',
+        'ORDER_ACTIVE_REFUND_CONFLICT',
+        409
+      )
+    }
+
     const currentStatus = getEffectiveFulfillmentStatus(order)
 
     // Repetir exactamente el estado alcanzado es seguro y no agrega historial duplicado.

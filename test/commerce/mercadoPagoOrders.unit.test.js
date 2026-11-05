@@ -745,6 +745,64 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
     assert.equal(serialized.includes(cancellationKey), false)
   })
 
+  it('submits a total refund with an empty body and preserves the provider HTTP status', async () => {
+    let captured
+    const refundKey = 'refund-123e4567-e89b-42d3-a456-426614174000'
+    const provider = makeProvider(async (url, options) => {
+      captured = { url, options }
+      return jsonResponse(providerPayload({
+        status: 'processed',
+        checkout_url: undefined,
+        status_detail: 'accredited',
+        total_paid_amount: '154500.00',
+        currency: 'ARS',
+        transactions: {
+          payments: [{
+            id: 'PAY01TESTLCOMP',
+            status: 'processed',
+            status_detail: 'accredited',
+            amount: '154500.00',
+            paid_amount: '154500.00'
+          }],
+          refunds: []
+        }
+      }), { status: 201 })
+    })
+
+    const result = await provider.refundOrder(providerOrderId, {
+      idempotencyKey: refundKey
+    })
+
+    assert.equal(captured.url, `${MERCADOPAGO_API_URL}/v1/orders/${providerOrderId}/refund`)
+    assert.equal(captured.options.method, 'POST')
+    assert.equal(captured.options.headers['X-Idempotency-Key'], refundKey)
+    assert.equal(Object.hasOwn(captured.options, 'body'), false)
+    assert.equal(result.providerHttpStatus, 201)
+    assert.deepEqual(result.order.refunds, [])
+    assert.equal(result.order.reconciliationSource.refundsPresent, true)
+    assert.equal(result.order.reconciliationSource.refundsIsArray, true)
+  })
+
+  it('classifies a refund HTTP 400 as a definitive rejection without exposing details', async () => {
+    const logged = []
+    const provider = makeProvider(
+      async () => jsonResponse({ code: 'refund_not_allowed', message: 'private detail' }, {
+        status: 400
+      }),
+      { errorLogger: (...args) => logged.push(args) }
+    )
+
+    await assert.rejects(
+      provider.refundOrder(providerOrderId, { idempotencyKey: 'refund-definitive-key-001' }),
+      (error) =>
+        error.code === 'MERCADOPAGO_REFUND_REJECTED' &&
+        error.failureKind === 'definitive_rejection' &&
+        error.providerOperation === 'refund'
+    )
+    assert.equal(logged[0][1].providerCode, 'refund_not_allowed')
+    assert.equal(JSON.stringify(logged).includes('test-access-token'), false)
+  })
+
   it('rejects invalid cancellation identifiers before provider I/O', async () => {
     let calls = 0
     const provider = makeProvider(async () => {

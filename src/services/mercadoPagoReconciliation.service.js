@@ -12,6 +12,7 @@ import {
   REMOTE_ORDER_CLASSIFICATIONS,
   classifyRemoteOrder
 } from './mercadoPagoOrderClassification.service.js'
+import PaymentRefundReconciliationService from './paymentRefundReconciliation.service.js'
 
 const TRANSACTION_OPTIONS = Object.freeze({
   readConcern: { level: 'snapshot' },
@@ -43,13 +44,15 @@ class MercadoPagoReconciliationService {
     orderManager = OrderManager,
     paymentManager = PaymentManager,
     productUnitService = ProductUnitService,
-    provider = MercadoPagoProvider
+    provider = MercadoPagoProvider,
+    refundReconciliationService = PaymentRefundReconciliationService
   } = {}) {
     this.mongoose = mongooseInstance
     this.orders = orderManager
     this.payments = paymentManager
     this.productUnits = productUnitService
     this.provider = provider
+    this.refundReconciliation = refundReconciliationService
   }
 
   async #runTransaction(operation) {
@@ -522,6 +525,20 @@ class MercadoPagoReconciliationService {
         'MERCADOPAGO_INVALID_RESPONSE',
         502
       )
+    }
+
+    const refundResult = await this.refundReconciliation.reconcileProviderOrder(
+      providerOrder,
+      { now: checkedAt }
+    )
+    if (refundResult.handled) {
+      return {
+        outcome: refundResult.outcome,
+        orderId: refundResult.refund.orderId,
+        paymentId: refundResult.refund.paymentId,
+        providerPaymentId: refundResult.refund.providerPaymentId,
+        providerRefundId: refundResult.refund.providerRefundId || null
+      }
     }
 
     try {

@@ -3,6 +3,7 @@ import mongoose from 'mongoose'
 export const ORDER_STATUSES = [
   'pending_payment',
   'paid',
+  'refunded',
   'cancelled',
   'expired',
   'requires_attention'
@@ -178,6 +179,12 @@ const orderSchema = new mongoose.Schema(
     reconciliationAttempts: { type: Number, min: 0, default: 0 },
     reconciliationFailures: { type: Number, min: 0, default: 0 },
     paidAt: { type: Date, default: null },
+    refundedAt: { type: Date, default: null },
+    activeRefundId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'payment_refunds',
+      default: null
+    },
     cancelledAt: { type: Date, default: null },
     expiredAt: { type: Date, default: null },
     readyForPickupAt: { type: Date, default: null },
@@ -226,6 +233,10 @@ orderSchema.index({
   _id: 1
 })
 orderSchema.index({ fulfillmentStatus: 1, createdAt: -1 })
+orderSchema.index(
+  { activeRefundId: 1 },
+  { partialFilterExpression: { activeRefundId: { $type: 'objectId' } } }
+)
 
 const OrderModel = mongoose.model('orders', orderSchema)
 

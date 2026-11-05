@@ -2,13 +2,15 @@ import MyOwnRouter from './router.js'
 import OrderQueryController from '../controllers/orderQuery.controller.js'
 import OrderFulfillmentController from '../controllers/orderFulfillment.controller.js'
 import OrderAttentionController from '../controllers/orderAttention.controller.js'
+import PaymentRefundController from '../controllers/paymentRefund.controller.js'
 
 const registerAdminOrderRoutes = (
   router,
   {
     queryController = OrderQueryController,
     fulfillmentController = OrderFulfillmentController,
-    attentionController = OrderAttentionController
+    attentionController = OrderAttentionController,
+    refundController = PaymentRefundController
   } = {}
 ) => {
   router.get('/', ['ADMIN'], queryController.listAdmin)
@@ -22,6 +24,12 @@ const registerAdminOrderRoutes = (
     '/:orderNumber/attention/close-terminal-unpaid',
     ['ADMIN'],
     attentionController.closeTerminalUnpaid
+  )
+  router.post('/:orderNumber/refunds', ['ADMIN'], refundController.create)
+  router.post(
+    '/:orderNumber/refunds/:refundId/reconcile',
+    ['ADMIN'],
+    refundController.reconcile
   )
   router.patch('/:orderNumber/fulfillment', ['ADMIN'], fulfillmentController.update)
 }

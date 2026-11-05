@@ -313,6 +313,43 @@ class PaymentManager {
     ).lean()
   }
 
+  async finalizeTotalRefund(
+    paymentId,
+    {
+      providerOrderId,
+      providerPaymentId,
+      approvedAt,
+      expectedAmountArs,
+      currency,
+      providerStatus,
+      providerStatusDetail,
+      checkedAt
+    },
+    { session } = {}
+  ) {
+    return PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        normalizedStatus: 'approved',
+        approvedAt,
+        provider: 'mercado_pago',
+        providerOrderId,
+        providerPaymentId,
+        amountArs: expectedAmountArs,
+        currency
+      },
+      {
+        $set: {
+          normalizedStatus: 'refunded',
+          providerStatus,
+          providerStatusDetail,
+          lastProviderCheckAt: checkedAt
+        }
+      },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
   async confirmApprovedAttentionEvidence(
     paymentId,
     {

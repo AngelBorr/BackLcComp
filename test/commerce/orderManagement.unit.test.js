@@ -103,7 +103,12 @@ const soldUnit = {
   soldAt: approvedAt
 }
 
-const makeQueryHarness = ({ order = makeOrder(), units = [soldUnit], resolutions = [] } = {}) => {
+const makeQueryHarness = ({
+  order = makeOrder(),
+  units = [soldUnit],
+  resolutions = [],
+  refunds = []
+} = {}) => {
   const state = { customerListCalls: [], adminListCalls: [], unitCalls: [] }
   const service = new OrderQueryService({
     orderManager: {
@@ -142,6 +147,9 @@ const makeQueryHarness = ({ order = makeOrder(), units = [soldUnit], resolutions
         state.unitCalls.push({ receivedOrderId, options: { includeDeleted: true } })
         return units
       }
+    },
+    paymentRefundManager: {
+      async listByOrderId() { return refunds }
     },
     attentionResolutionManager: {
       async getOrderResolutionHistory() { return resolutions }
@@ -307,7 +315,8 @@ describe('Order administration queries and routes (isolated)', () => {
       attentionController: {
         completeExistingReservationSale() {},
         closeTerminalUnpaid() {}
-      }
+      },
+      refundController: { create() {}, reconcile() {} }
     })
 
     assert.deepEqual(customerRoutes.map(({ method, path, policies }) => ({ method, path, policies })), [
@@ -325,6 +334,12 @@ describe('Order administration queries and routes (isolated)', () => {
       {
         method: 'post',
         path: '/:orderNumber/attention/close-terminal-unpaid',
+        policies: ['ADMIN']
+      },
+      { method: 'post', path: '/:orderNumber/refunds', policies: ['ADMIN'] },
+      {
+        method: 'post',
+        path: '/:orderNumber/refunds/:refundId/reconcile',
         policies: ['ADMIN']
       },
       { method: 'patch', path: '/:orderNumber/fulfillment', policies: ['ADMIN'] }
@@ -415,6 +430,49 @@ describe('Order administration queries and routes (isolated)', () => {
     for (const forbidden of ['provider-key-secret', 'private@example.com', 'checkout.example']) {
       assert.equal(serialized.includes(forbidden), false)
     }
+  })
+
+  it('exposes safe refund history without idempotency keys or provider snapshots', async () => {
+    const refund = {
+      _id: '507f1f77bcf86cd799439066',
+      orderId,
+      paymentId: payment._id,
+      type: 'total',
+      status: 'processing',
+      origin: 'admin',
+      requestedAmountArs: '150000.00',
+      confirmedAmountArs: null,
+      currency: 'ARS',
+      providerRefundId: null,
+      providerStatus: 'processed',
+      providerStatusDetail: 'accredited',
+      idempotencyKey: 'local-refund-secret',
+      providerIdempotencyKey: 'provider-refund-secret',
+      providerRequestSnapshot: { secret: 'request-snapshot-secret' },
+      providerEvidenceSnapshot: { secret: 'evidence-snapshot-secret' },
+      reasonCode: 'customer_request',
+      note: 'Solicitud',
+      requestedBy: adminUserId,
+      requestedByRole: 'ADMIN',
+      requestedAt: approvedAt,
+      submittedAt: approvedAt,
+      lastProviderCheckAt: approvedAt,
+      completedAt: null,
+      sanitizedError: null
+    }
+    const order = makeOrder({ activeRefundId: refund._id })
+    const { service } = makeQueryHarness({ order, refunds: [refund] })
+    const result = await service.getAdminOrder({ orderNumber })
+    assert.equal(result.refunds[0].status, 'processing')
+    assert.equal(result.refundSummary.canRequestRefund, false)
+    assert.deepEqual(result.refundSummary.blockers, ['ACTIVE_REFUND'])
+    const serialized = JSON.stringify(result)
+    for (const forbidden of [
+      'local-refund-secret',
+      'provider-refund-secret',
+      'request-snapshot-secret',
+      'evidence-snapshot-secret'
+    ]) assert.equal(serialized.includes(forbidden), false)
   })
 
   it('returns a fail-closed attention diagnosis, full safe units and sanitized history', async () => {
@@ -544,9 +602,13 @@ describe('Order administration queries and routes (isolated)', () => {
   }
 })
 
-const makeFulfillmentHarness = ({ initialStatus = 'preparing', updateResults } = {}) => {
+const makeFulfillmentHarness = ({
+  initialStatus = 'preparing',
+  updateResults,
+  activeRefundId = null
+} = {}) => {
   const state = {
-    order: makeOrder({ fulfillmentStatus: initialStatus, fulfillmentHistory: [] }),
+    order: makeOrder({ fulfillmentStatus: initialStatus, fulfillmentHistory: [], activeRefundId }),
     updates: []
   }
   const service = new OrderFulfillmentService({
@@ -632,6 +694,44 @@ describe('Order fulfillment workflow (isolated)', () => {
     })
     assert.equal(result.idempotent, true)
     assert.equal(state.updates.length, 0)
+  })
+
+  it('blocks fulfillment while activeRefundId fences the Order', async () => {
+    const { service, state } = makeFulfillmentHarness({
+      initialStatus: 'ready_for_pickup',
+      activeRefundId: '507f1f77bcf86cd799439099'
+    })
+    await assert.rejects(
+      service.updateByAdmin({ orderNumber, status: 'picked_up', adminUserId }),
+      (error) => error.code === 'ORDER_ACTIVE_REFUND_CONFLICT'
+    )
+    assert.equal(state.updates.length, 0)
+  })
+
+  it('keeps the activeRefundId fence inside the fulfillment CAS', async () => {
+    let capturedFilter
+    const original = OrderModel.findOneAndUpdate
+    OrderModel.findOneAndUpdate = (filter) => {
+      capturedFilter = filter
+      return { lean: async () => null }
+    }
+    try {
+      await new OrderManager().updateFulfillmentStatus(
+        orderId,
+        'ready_for_pickup',
+        {
+          nextStatus: 'picked_up',
+          changedAt: approvedAt,
+          changedBy: adminUserId,
+          reason: 'admin_update'
+        }
+      )
+    } finally {
+      OrderModel.findOneAndUpdate = original
+    }
+    const serialized = JSON.stringify(capturedFilter)
+    assert.equal(serialized.includes('activeRefundId'), true)
+    assert.equal(serialized.includes('$exists'), true)
   })
 
   it('rejects a lost CAS race so incompatible concurrent effects cannot both apply', async () => {

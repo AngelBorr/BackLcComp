@@ -180,6 +180,21 @@ const normalizeProviderPayments = (payments) => {
   }))
 }
 
+const normalizeProviderRefunds = (refunds) => {
+  if (!Array.isArray(refunds)) return []
+
+  return refunds.map((refund) => ({
+    providerRefundId: optionalString(refund?.id),
+    providerPaymentId: optionalString(refund?.transaction_id),
+    referenceId: optionalString(refund?.reference_id),
+    amount: optionalString(refund?.amount),
+    status: optionalString(refund?.status),
+    statusDetail: optionalString(refund?.status_detail),
+    createdAt: optionalString(refund?.created_date),
+    updatedAt: optionalString(refund?.last_updated_date)
+  }))
+}
+
 const reconciliationSourceFor = (payload) => {
   const source = payload && typeof payload === 'object' && !Array.isArray(payload)
     ? payload
@@ -197,7 +212,13 @@ const reconciliationSourceFor = (payload) => {
     paymentsPresent: Boolean(
       transactionSource && Object.hasOwn(transactionSource, 'payments')
     ),
-    paymentsIsArray: Array.isArray(transactionSource?.payments)
+    paymentsIsArray: Array.isArray(transactionSource?.payments),
+    ...(transactionSource && Object.hasOwn(transactionSource, 'refunds')
+      ? {
+          refundsPresent: true,
+          refundsIsArray: Array.isArray(transactionSource.refunds)
+        }
+      : {})
   }
 }
 
@@ -244,6 +265,9 @@ const normalizeProviderOrder = (
     normalized.currency = optionalString(payload.currency)
     normalized.lastUpdatedDate = optionalString(payload.last_updated_date)
     normalized.payments = normalizeProviderPayments(payload.transactions?.payments)
+    if (payload.transactions && Object.hasOwn(payload.transactions, 'refunds')) {
+      normalized.refunds = normalizeProviderRefunds(payload.transactions.refunds)
+    }
     normalized.reconciliationSource = reconciliationSourceFor(payload)
   }
 
@@ -325,6 +349,19 @@ class MercadoPagoProvider {
       )
     }
 
+    if (operation === 'refund' && status === 409 && !providerCode.includes('idempotency')) {
+      return new MercadoPagoProviderError(
+        'Mercado Pago informo un conflicto al reembolsar la order',
+        'MERCADOPAGO_REFUND_CONFLICT',
+        502,
+        {
+          ...providerMetadata,
+          failureKind: 'state_conflict',
+          retryStrategy: 'same_attempt'
+        }
+      )
+    }
+
     if (status === 409 || providerCode.includes('idempotency')) {
       return new MercadoPagoProviderError(
         'Mercado Pago rechazó la clave de idempotencia',
@@ -369,6 +406,19 @@ class MercadoPagoProvider {
       )
     }
 
+    if (operation === 'refund') {
+      return new MercadoPagoProviderError(
+        'Mercado Pago rechazo el reembolso de la order',
+        'MERCADOPAGO_REFUND_REJECTED',
+        502,
+        {
+          ...providerMetadata,
+          failureKind: 'definitive_rejection',
+          retryStrategy: 'fail_closed'
+        }
+      )
+    }
+
     return new MercadoPagoProviderError(
       'Mercado Pago rechazó la creación de la order',
       'MERCADOPAGO_ORDER_REJECTED',
@@ -381,7 +431,10 @@ class MercadoPagoProvider {
     )
   }
 
-  async #request(path, { method = 'GET', idempotencyKey, body, operation = 'read' } = {}) {
+  async #request(
+    path,
+    { method = 'GET', idempotencyKey, body, operation = 'read', includeHttpStatus = false } = {}
+  ) {
     this.#assertConfigured()
 
     if (method === 'POST') {
@@ -451,7 +504,7 @@ class MercadoPagoProvider {
 
         throw this.#mapHttpError(response.status, payload, operation)
       }
-      return payload
+      return includeHttpStatus ? { payload, httpStatus: response.status } : payload
     } catch (error) {
       if (error instanceof MercadoPagoProviderError) throw error
 
@@ -460,7 +513,7 @@ class MercadoPagoProvider {
           'Mercado Pago no respondió dentro del tiempo permitido',
           'MERCADOPAGO_TIMEOUT',
           504,
-          { failureKind: 'timeout' }
+          { failureKind: 'timeout', providerOperation: operation }
         )
       }
 
@@ -468,7 +521,7 @@ class MercadoPagoProvider {
         'No se pudo conectar con Mercado Pago',
         'MERCADOPAGO_UNAVAILABLE',
         503,
-        { failureKind: 'network_error' }
+        { failureKind: 'network_error', providerOperation: operation }
       )
     } finally {
       clearTimeout(timeout)
@@ -585,6 +638,33 @@ class MercadoPagoProvider {
 
     return normalizeProviderOrder(payload, { includeReconciliation: true })
   }
+
+  async refundOrder(providerOrderId, { idempotencyKey } = {}) {
+    const normalizedId = String(providerOrderId || '').trim()
+
+    if (!/^ORD[A-Za-z0-9]{3,197}$/.test(normalizedId)) {
+      throw new MercadoPagoProviderError(
+        'ID de order de Mercado Pago invalido',
+        'MERCADOPAGO_INVALID_RESPONSE',
+        400
+      )
+    }
+
+    const { payload, httpStatus } = await this.#request(
+      `/v1/orders/${encodeURIComponent(normalizedId)}/refund`,
+      {
+        method: 'POST',
+        idempotencyKey,
+        operation: 'refund',
+        includeHttpStatus: true
+      }
+    )
+
+    return {
+      providerHttpStatus: httpStatus,
+      order: normalizeProviderOrder(payload, { includeReconciliation: true })
+    }
+  }
 }
 
 export {
@@ -595,6 +675,7 @@ export {
   MercadoPagoProviderError,
   extractProviderErrorCode,
   normalizeProviderPayments,
+  normalizeProviderRefunds,
   normalizeProviderOrder
 }
 export default new MercadoPagoProvider()

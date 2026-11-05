@@ -92,6 +92,9 @@ class BuyerPaymentReconciliationService {
     if (order.status === 'paid' && payment.normalizedStatus === 'approved') {
       return 'paid'
     }
+    if (order.status === 'refunded' && payment.normalizedStatus === 'refunded') {
+      return 'refunded'
+    }
     if (order.status === 'requires_attention') return 'requires_attention'
     if (
       ['cancelled', 'expired'].includes(order.status) &&
@@ -120,7 +123,7 @@ class BuyerPaymentReconciliationService {
 
   #isLocallyResolved(order, payment) {
     return (
-      order.status === 'paid' ||
+      ['paid', 'refunded'].includes(order.status) ||
       order.status === 'requires_attention' ||
       (
         ['cancelled', 'expired'].includes(order.status) &&

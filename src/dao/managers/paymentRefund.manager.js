@@ -60,6 +60,51 @@ class PaymentRefundManager {
     ).lean()
   }
 
+  async recoverPreSubmissionFailure(
+    refundId,
+    {
+      expectedVersion, orderId, paymentId, idempotencyKey, requestHash,
+      providerIdempotencyKey, providerOrderId, providerPaymentId,
+      requestedAmountArs, currency
+    },
+    { session } = {}
+  ) {
+    return PaymentRefundModel.findOneAndUpdate(
+      {
+        _id: refundId,
+        version: expectedVersion,
+        orderId,
+        paymentId,
+        idempotencyKey,
+        requestHash,
+        providerIdempotencyKey,
+        providerOrderId,
+        providerPaymentId,
+        requestedAmountArs,
+        currency,
+        origin: 'admin',
+        operationScope: 'total_refund',
+        status: 'requires_attention',
+        submittedAt: null,
+        providerRefundId: null,
+        providerStatus: null,
+        providerStatusDetail: null,
+        providerEvidenceSnapshot: null,
+        attemptOwnerToken: null,
+        attemptLeaseUntil: null,
+        'sanitizedError.code': 'REFUND_PREFLIGHT_MISMATCH'
+      },
+      {
+        $set: {
+          status: 'prepared',
+          sanitizedError: null
+        },
+        $inc: { version: 1 }
+      },
+      { new: true, session, runValidators: true }
+    ).lean()
+  }
+
   async finalizeSucceeded(
     refundId,
     {

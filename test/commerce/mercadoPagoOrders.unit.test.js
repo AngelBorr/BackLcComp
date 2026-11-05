@@ -633,42 +633,70 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
       status: 'canceled',
       status_detail: 'canceled'
     }), { includeReconciliation: true })
+    const explicitRefundAggregates = normalizeProviderOrder(providerPayload({
+      status: 'refunded',
+      total_paid_amount: '154500.00',
+      total_refunded_amount: '154500.00',
+      transactions: { payments: [], refunds: [] }
+    }), { includeReconciliation: true })
 
     assert.deepEqual(explicitEmpty.reconciliationSource, {
       totalPaidAmountPresent: true,
+      totalRefundedAmountPresent: false,
       transactionsPresent: true,
       paymentsPresent: true,
-      paymentsIsArray: true
+      paymentsIsArray: true,
+      refundsPresent: false,
+      refundsIsArray: false
     })
     assert.deepEqual(missingTotal.reconciliationSource, {
       totalPaidAmountPresent: false,
+      totalRefundedAmountPresent: false,
       transactionsPresent: true,
       paymentsPresent: true,
-      paymentsIsArray: true
+      paymentsIsArray: true,
+      refundsPresent: false,
+      refundsIsArray: false
     })
     assert.equal(missingTotal.totalPaidAmount, null)
     assert.deepEqual(missingPayments.reconciliationSource, {
       totalPaidAmountPresent: true,
+      totalRefundedAmountPresent: false,
       transactionsPresent: false,
       paymentsPresent: false,
-      paymentsIsArray: false
+      paymentsIsArray: false,
+      refundsPresent: false,
+      refundsIsArray: false
     })
     assert.deepEqual(missingPayments.payments, [])
     assert.deepEqual(nonArrayPayments.reconciliationSource, {
       totalPaidAmountPresent: true,
+      totalRefundedAmountPresent: false,
       transactionsPresent: true,
       paymentsPresent: true,
-      paymentsIsArray: false
+      paymentsIsArray: false,
+      refundsPresent: false,
+      refundsIsArray: false
     })
     assert.deepEqual(nonArrayPayments.payments, [])
     assert.equal(omittedPaymentAggregates.totalPaidAmount, null)
     assert.deepEqual(omittedPaymentAggregates.payments, [])
     assert.deepEqual(omittedPaymentAggregates.reconciliationSource, {
       totalPaidAmountPresent: false,
+      totalRefundedAmountPresent: false,
       transactionsPresent: false,
       paymentsPresent: false,
-      paymentsIsArray: false
+      paymentsIsArray: false,
+      refundsPresent: false,
+      refundsIsArray: false
     })
+    assert.equal(Object.hasOwn(explicitEmpty, 'totalRefundedAmount'), false)
+    assert.equal(Object.hasOwn(explicitEmpty, 'refunds'), false)
+    assert.equal(explicitRefundAggregates.totalRefundedAmount, '154500.00')
+    assert.deepEqual(explicitRefundAggregates.refunds, [])
+    assert.equal(explicitRefundAggregates.reconciliationSource.totalRefundedAmountPresent, true)
+    assert.equal(explicitRefundAggregates.reconciliationSource.refundsPresent, true)
+    assert.equal(explicitRefundAggregates.reconciliationSource.refundsIsArray, true)
   })
 
   it('cancels through POST /v1/orders/{id}/cancel with an isolated key and no body', async () => {
@@ -712,9 +740,12 @@ describe('Mercado Pago Checkout Pro Orders API (isolated unit tests)', () => {
       payments: [],
       reconciliationSource: {
         totalPaidAmountPresent: true,
+        totalRefundedAmountPresent: false,
         transactionsPresent: true,
         paymentsPresent: true,
-        paymentsIsArray: true
+        paymentsIsArray: true,
+        refundsPresent: false,
+        refundsIsArray: false
       }
     })
   })

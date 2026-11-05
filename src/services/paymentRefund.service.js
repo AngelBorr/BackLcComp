@@ -9,6 +9,10 @@ import MercadoPagoProvider, {
 import PaymentRefundReconciliationService from './paymentRefundReconciliation.service.js'
 import { ServiceError } from './service.products.js'
 import { toMinorUnits } from '../utils/commerceMoney.js'
+import {
+  classifyRefundPreflight,
+  REFUND_PREFLIGHT_OUTCOMES
+} from './mercadoPagoRefundClassification.service.js'
 
 const TRANSACTION_OPTIONS = Object.freeze({
   readConcern: { level: 'snapshot' },
@@ -163,31 +167,108 @@ class PaymentRefundService {
   }
 
   #assertProviderPreflight(providerOrder, order, payment) {
-    const source = providerOrder.reconciliationSource
-    const paymentRows = providerOrder.payments || []
-    const refunds = providerOrder.refunds || []
-    const candidate = paymentRows[0]
-    const clean =
-      providerOrder.providerOrderId === payment.providerOrderId &&
-      text(providerOrder.externalReference).toUpperCase() === order.orderNumber &&
-      text(providerOrder.currency).toUpperCase() === payment.currency &&
-      sameMoney(providerOrder.totalAmount, payment.amountArs) &&
-      providerOrder.status === 'processed' &&
-      providerOrder.statusDetail === 'accredited' &&
-      source?.paymentsPresent && source?.paymentsIsArray && paymentRows.length === 1 &&
-      candidate?.providerPaymentId === payment.providerPaymentId &&
-      candidate?.status === 'processed' && candidate?.statusDetail === 'accredited' &&
-      sameMoney(candidate?.amount, payment.amountArs) &&
-      sameMoney(candidate?.paidAmount, payment.amountArs) &&
-      source?.refundsPresent && source?.refundsIsArray && refunds.length === 0
+    const classification = classifyRefundPreflight(providerOrder, {
+      providerOrderId: payment.providerOrderId,
+      providerPaymentId: payment.providerPaymentId,
+      externalReference: order.orderNumber,
+      amount: payment.amountArs,
+      currency: payment.currency
+    })
 
-    if (!clean) {
-      throw new ServiceError(
+    if (classification.outcome !== REFUND_PREFLIGHT_OUTCOMES.VALID) {
+      const error = new ServiceError(
         'La evidencia financiera remota no habilita un reembolso',
-        refunds.length ? 'REFUND_ALREADY_OBSERVED' : 'REFUND_PREFLIGHT_MISMATCH',
+        classification.outcome === REFUND_PREFLIGHT_OUTCOMES.REMOTE_REFUND_OBSERVED
+          ? 'REFUND_ALREADY_OBSERVED'
+          : 'REFUND_PREFLIGHT_MISMATCH',
         409
       )
+      error.refundPreflightReason = classification.reason
+      throw error
     }
+  }
+
+  #isPreSubmissionRecoveryCandidate(refund) {
+    return refund?.origin === 'admin' &&
+      refund.status === 'requires_attention' &&
+      refund.operationScope === 'total_refund' &&
+      refund.submittedAt === null &&
+      refund.providerRefundId === null &&
+      refund.providerStatus === null &&
+      refund.providerStatusDetail === null &&
+      refund.providerEvidenceSnapshot === null &&
+      refund.attemptOwnerToken === null &&
+      refund.attemptLeaseUntil === null &&
+      refund.sanitizedError?.code === 'REFUND_PREFLIGHT_MISMATCH' &&
+      (
+        refund.sanitizedError?.providerCode == null ||
+        refund.sanitizedError.providerCode === 'PROVIDER_REFUNDS_PROVENANCE_MISSING'
+      ) &&
+      Boolean(text(refund.providerIdempotencyKey))
+  }
+
+  async #recoverPreSubmissionFailure(refundId) {
+    return this.#transaction(async (session) => {
+      const refund = await this.refunds.getById(refundId, { session })
+      const order = refund && await this.orders.getById(refund.orderId, { session })
+      const payment = refund && await this.payments.getById(refund.paymentId, { session })
+
+      if (!refund || !order || !payment || !this.#isPreSubmissionRecoveryCandidate(refund)) {
+        throw new ServiceError(
+          'El reembolso no admite recuperacion pre-envio',
+          'REFUND_RECOVERY_NOT_ALLOWED',
+          409
+        )
+      }
+      this.#assertLocalEligibility(order, payment)
+      const snapshot = refund.providerRequestSnapshot
+      if (
+        String(order.activeRefundId || '') !== String(refund._id) ||
+        String(refund.orderId) !== String(order._id) ||
+        String(refund.paymentId) !== String(payment._id) ||
+        refund.providerOrderId !== payment.providerOrderId ||
+        refund.providerPaymentId !== payment.providerPaymentId ||
+        refund.currency !== payment.currency ||
+        !sameMoney(refund.requestedAmountArs, payment.amountArs) ||
+        snapshot?.method !== 'POST' ||
+        snapshot?.path !== `/v1/orders/${payment.providerOrderId}/refund` ||
+        snapshot?.providerOrderId !== payment.providerOrderId ||
+        snapshot?.externalReference !== order.orderNumber ||
+        snapshot?.currency !== payment.currency ||
+        !sameMoney(snapshot?.totalAmount, payment.amountArs)
+      ) {
+        throw new ServiceError(
+          'El contexto local no admite recuperacion pre-envio',
+          'REFUND_RECOVERY_NOT_ALLOWED',
+          409
+        )
+      }
+
+      const recovered = await this.refunds.recoverPreSubmissionFailure(
+        refund._id,
+        {
+          expectedVersion: refund.version,
+          orderId: refund.orderId,
+          paymentId: refund.paymentId,
+          idempotencyKey: refund.idempotencyKey,
+          requestHash: refund.requestHash,
+          providerIdempotencyKey: refund.providerIdempotencyKey,
+          providerOrderId: refund.providerOrderId,
+          providerPaymentId: refund.providerPaymentId,
+          requestedAmountArs: refund.requestedAmountArs,
+          currency: refund.currency
+        },
+        { session }
+      )
+      if (!recovered) {
+        throw new ServiceError(
+          'Conflicto al recuperar el reembolso',
+          'REFUND_RECOVERY_CONFLICT',
+          409
+        )
+      }
+      return { order, payment, refund: recovered, existing: true }
+    })
   }
 
   async #createPrepared(input, now) {
@@ -378,7 +459,9 @@ class PaymentRefundService {
     if (refund.status === 'succeeded' || refund.status === 'rejected') {
       return { ...refundDto(refund, { idempotent: true }), httpStatus: 200 }
     }
-    if (context.existing && refund.status !== 'prepared') {
+    const recoverablePreSubmission = context.existing &&
+      this.#isPreSubmissionRecoveryCandidate(refund)
+    if (context.existing && refund.status !== 'prepared' && !recoverablePreSubmission) {
       const result = await this.reconciliation.reconcileRefund(refund._id, { now: requestedAt })
       return { ...refundDto(result.refund, { idempotent: true }), httpStatus: result.outcome === 'processing' ? 202 : 200 }
     }
@@ -404,17 +487,28 @@ class PaymentRefundService {
         throw new ServiceError(error.message, error.code, error.status)
       }
       if (error instanceof ServiceError) {
-        await this.refunds.transition(
-          refund._id,
-          ['prepared'],
-          {
-            status: 'requires_attention',
-            lastProviderCheckAt: requestedAt,
-            sanitizedError: { code: error.code, message: error.message }
-          }
-        )
+        if (refund.status === 'prepared') {
+          await this.refunds.transition(
+            refund._id,
+            ['prepared'],
+            {
+              status: 'requires_attention',
+              lastProviderCheckAt: requestedAt,
+              sanitizedError: {
+                code: error.code,
+                message: error.message,
+                providerCode: error.refundPreflightReason || null
+              }
+            }
+          )
+        }
       }
       throw error
+    }
+
+    if (recoverablePreSubmission) {
+      context = await this.#recoverPreSubmissionFailure(refund._id)
+      refund = context.refund
     }
 
     refund = await this.#markSubmitted(refund._id, requestedAt)

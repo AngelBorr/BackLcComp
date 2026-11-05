@@ -208,17 +208,18 @@ const reconciliationSourceFor = (payload) => {
 
   return {
     totalPaidAmountPresent: Boolean(source && Object.hasOwn(source, 'total_paid_amount')),
+    totalRefundedAmountPresent: Boolean(
+      source && Object.hasOwn(source, 'total_refunded_amount')
+    ),
     transactionsPresent: Boolean(source && Object.hasOwn(source, 'transactions')),
     paymentsPresent: Boolean(
       transactionSource && Object.hasOwn(transactionSource, 'payments')
     ),
     paymentsIsArray: Array.isArray(transactionSource?.payments),
-    ...(transactionSource && Object.hasOwn(transactionSource, 'refunds')
-      ? {
-          refundsPresent: true,
-          refundsIsArray: Array.isArray(transactionSource.refunds)
-        }
-      : {})
+    refundsPresent: Boolean(
+      transactionSource && Object.hasOwn(transactionSource, 'refunds')
+    ),
+    refundsIsArray: Array.isArray(transactionSource?.refunds)
   }
 }
 
@@ -262,6 +263,9 @@ const normalizeProviderOrder = (
   if (includeReconciliation) {
     normalized.statusDetail = optionalString(payload.status_detail)
     normalized.totalPaidAmount = optionalString(payload.total_paid_amount)
+    if (Object.hasOwn(payload, 'total_refunded_amount')) {
+      normalized.totalRefundedAmount = optionalString(payload.total_refunded_amount)
+    }
     normalized.currency = optionalString(payload.currency)
     normalized.lastUpdatedDate = optionalString(payload.last_updated_date)
     normalized.payments = normalizeProviderPayments(payload.transactions?.payments)

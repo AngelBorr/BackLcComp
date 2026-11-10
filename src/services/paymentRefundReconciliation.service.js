@@ -12,24 +12,55 @@ import {
   classifyRefundEvidence,
   REFUND_RECONCILIATION_OUTCOMES
 } from './mercadoPagoRefundClassification.service.js'
+import { toMinorUnits } from '../utils/commerceMoney.js'
 
 const TRANSACTION_OPTIONS = Object.freeze({
   readConcern: { level: 'snapshot' },
   writeConcern: { w: 'majority' }
 })
 
-const safeEvidence = (providerOrder, classification) => ({
-  providerOrderId: providerOrder.providerOrderId,
-  externalReference: providerOrder.externalReference,
-  totalAmount: providerOrder.totalAmount,
-  currency: providerOrder.currency,
-  providerStatus: providerOrder.status,
-  providerStatusDetail: providerOrder.statusDetail,
-  providerRefundId: classification.refund?.providerRefundId || null,
-  providerPaymentId: classification.refund?.providerPaymentId || null,
-  refundAmount: classification.refund?.amount || null,
-  refundStatus: classification.refund?.status || null
-})
+const sameMoney = (left, right) => {
+  try {
+    return toMinorUnits(left) === toMinorUnits(right)
+  } catch {
+    return false
+  }
+}
+
+const safeEvidence = (providerOrder, classification) => {
+  const providerPayment = classification.payment || providerOrder.payments?.find(
+    (payment) => payment.providerPaymentId === classification.refund?.providerPaymentId
+  )
+
+  return {
+    providerOrderId: providerOrder.providerOrderId,
+    externalReference: providerOrder.externalReference,
+    totalAmount: providerOrder.totalAmount,
+    totalPaidAmount: providerOrder.totalPaidAmount,
+    totalPaidAmountPresent:
+      providerOrder.reconciliationSource?.totalPaidAmountPresent === true,
+    totalRefundedAmountPresent:
+      providerOrder.reconciliationSource?.totalRefundedAmountPresent === true,
+    ...(providerOrder.reconciliationSource?.totalRefundedAmountPresent === true && {
+      totalRefundedAmount: providerOrder.totalRefundedAmount
+    }),
+    currency: providerOrder.currency,
+    providerStatus: providerOrder.status,
+    providerStatusDetail: providerOrder.statusDetail,
+    providerRefundId: classification.refund?.providerRefundId || null,
+    providerPaymentId: classification.refund?.providerPaymentId || null,
+    providerPaymentStatus: providerPayment?.status || null,
+    providerPaymentStatusDetail: providerPayment?.statusDetail || null,
+    providerPaymentRefundedAmountPresent:
+      providerPayment?.refundedAmountPresent === true,
+    ...(providerPayment?.refundedAmountPresent === true && {
+      providerPaymentRefundedAmount: providerPayment.refundedAmount
+    }),
+    refundAmount: classification.refund?.amount || null,
+    refundStatus: classification.refund?.status || null,
+    refundStatusDetail: classification.refund?.statusDetail || null
+  }
+}
 
 class PaymentRefundReconciliationService {
   constructor({
@@ -113,12 +144,25 @@ class PaymentRefundReconciliationService {
       const evidence = safeEvidence(observed, classification)
 
       if (classification.outcome === REFUND_RECONCILIATION_OUTCOMES.SUCCEEDED) {
+        const adminSubmissionValid = refund.origin === 'admin' && refund.submittedAt != null
+        const providerObservedValid = refund.origin === 'provider_observed' &&
+          refund.submittedAt == null
         if (
           order.status !== 'paid' ||
+          !order.paidAt ||
           String(order.activeRefundId || '') !== String(refund._id) ||
           payment.normalizedStatus !== 'approved' ||
           !payment.approvedAt ||
-          refund.operationScope !== 'total_refund'
+          refund.operationScope !== 'total_refund' ||
+          String(refund.orderId) !== String(order._id) ||
+          String(refund.paymentId) !== String(payment._id) ||
+          refund.providerOrderId !== payment.providerOrderId ||
+          refund.providerPaymentId !== payment.providerPaymentId ||
+          refund.currency !== payment.currency ||
+          !sameMoney(refund.requestedAmountArs, payment.amountArs) ||
+          (refund.providerRefundId != null &&
+            refund.providerRefundId !== classification.refund.providerRefundId) ||
+          (!adminSubmissionValid && !providerObservedValid)
         ) {
           throw new ServiceError(
             'El contexto local cambio durante el reembolso',
@@ -156,10 +200,21 @@ class PaymentRefundReconciliationService {
           {
             expectedStatuses: ['prepared', 'submitted', 'processing', 'requires_attention'],
             expectedVersion: refund.version,
+            orderId: refund.orderId,
+            paymentId: refund.paymentId,
+            providerOrderId: refund.providerOrderId,
+            providerPaymentId: refund.providerPaymentId,
+            providerIdempotencyKey: refund.providerIdempotencyKey,
+            idempotencyKey: refund.idempotencyKey,
+            requestedAmountArs: refund.requestedAmountArs,
+            currency: refund.currency,
+            origin: refund.origin,
+            submittedAt: refund.submittedAt,
+            expectedProviderRefundId: refund.providerRefundId,
             providerRefundId: classification.refund.providerRefundId,
             confirmedAmountArs: refund.requestedAmountArs,
-            providerStatus: classification.refund.status,
-            providerStatusDetail: classification.refund.statusDetail,
+            providerStatus: observed.status,
+            providerStatusDetail: observed.statusDetail,
             providerEvidenceSnapshot: evidence,
             checkedAt,
             completedAt: checkedAt

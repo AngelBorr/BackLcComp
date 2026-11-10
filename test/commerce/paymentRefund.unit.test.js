@@ -30,25 +30,25 @@ const providerOrder = (overrides = {}) => ({
   externalReference: 'LC-2026-000100',
   totalAmount: '150000.00',
   totalPaidAmount: '150000.00',
-  totalRefundedAmount: '150000.00',
   currency: 'ARS',
   payments: [{
     providerPaymentId,
-    status: 'processed',
-    statusDetail: 'accredited',
+    status: 'refunded',
+    statusDetail: 'refunded',
     amount: '150000.00',
-    paidAmount: '150000.00'
+    paidAmount: '150000.00',
+    refundedAmountPresent: false
   }],
   refunds: [{
     providerRefundId: 'REF01REFUNDLCOMPTEST',
     providerPaymentId,
     amount: '150000.00',
     status: 'processed',
-    statusDetail: 'refunded'
+    statusDetail: 'accredited'
   }],
   reconciliationSource: {
     totalPaidAmountPresent: true,
-    totalRefundedAmountPresent: true,
+    totalRefundedAmountPresent: false,
     transactionsPresent: true,
     paymentsPresent: true,
     paymentsIsArray: true,
@@ -62,6 +62,14 @@ const cleanPreflightOrder = (overrides = {}) => ({
   ...providerOrder({
     status: 'processed',
     statusDetail: 'accredited',
+    payments: [{
+      providerPaymentId,
+      status: 'processed',
+      statusDetail: 'accredited',
+      amount: '150000.00',
+      paidAmount: '150000.00',
+      refundedAmountPresent: false
+    }],
     refunds: undefined,
     reconciliationSource: {
       totalPaidAmountPresent: true,
@@ -257,11 +265,11 @@ describe('P1C-C1 total refund domain (isolated)', () => {
   })
 
   for (const [name, mutate, reason] of [
-    ['amount mismatch', { refunds: [{ ...providerOrder().refunds[0], amount: '149999.99' }] }, 'PROVIDER_REFUND_AMOUNT_MISMATCH'],
+    ['amount mismatch', { refunds: [{ ...providerOrder().refunds[0], amount: '149999.99' }] }, 'PROVIDER_REFUND_AMOUNT_SUM_MISMATCH'],
     ['currency mismatch', { currency: 'USD' }, 'CURRENCY_MISMATCH'],
     ['external reference mismatch', { externalReference: 'LC-2026-999999' }, 'EXTERNAL_REFERENCE_MISMATCH'],
     ['payment transaction mismatch', { payments: [{ ...providerOrder().payments[0], providerPaymentId: 'PAY-OTHER' }] }, 'PROVIDER_PAYMENT_ID_MISMATCH'],
-    ['partial/multiple refunds', { refunds: [providerOrder().refunds[0], { ...providerOrder().refunds[0], providerRefundId: 'REF-2' }] }, 'PROVIDER_REFUND_CARDINALITY_MISMATCH']
+    ['partial/multiple refunds', { refunds: [providerOrder().refunds[0], { ...providerOrder().refunds[0], providerRefundId: 'REF-2' }] }, 'PROVIDER_REFUND_AMOUNT_SUM_MISMATCH']
   ]) {
     it(`fails closed for ${name}`, () => {
       const result = classifyRefundEvidence(providerOrder(mutate), expected)
@@ -269,6 +277,66 @@ describe('P1C-C1 total refund domain (isolated)', () => {
       assert.equal(result.reason, reason)
     })
   }
+
+  it('uses the distinct post-refund contract for refunded/refunded Payment evidence', () => {
+    const result = classifyRefundEvidence(providerOrder(), expected)
+    assert.equal(result.outcome, REFUND_RECONCILIATION_OUTCOMES.SUCCEEDED)
+    assert.notEqual(result.reason, 'PROVIDER_PAYMENT_NOT_ACCREDITED')
+  })
+
+  it('fails closed when the Order is refunded but its Payment remains processed/accredited', () => {
+    const result = classifyRefundEvidence(providerOrder({
+      payments: [{
+        ...providerOrder().payments[0],
+        status: 'processed',
+        statusDetail: 'accredited'
+      }]
+    }), expected)
+    assert.equal(result.outcome, REFUND_RECONCILIATION_OUTCOMES.REQUIRES_ATTENTION)
+    assert.equal(result.reason, 'PROVIDER_PAYMENT_NOT_REFUNDED')
+  })
+
+  it('accepts exact positive refund evidence when total_refunded_amount is omitted', () => {
+    const order = providerOrder()
+    assert.equal(order.reconciliationSource.totalRefundedAmountPresent, false)
+    assert.equal(Object.hasOwn(order, 'totalRefundedAmount'), false)
+    assert.equal(
+      classifyRefundEvidence(order, expected).outcome,
+      REFUND_RECONCILIATION_OUTCOMES.SUCCEEDED
+    )
+  })
+
+  it('fails closed when an explicit total_refunded_amount contradicts the refunds', () => {
+    const result = classifyRefundEvidence(providerOrder({
+      totalRefundedAmount: '149999.99',
+      reconciliationSource: {
+        ...providerOrder().reconciliationSource,
+        totalRefundedAmountPresent: true
+      }
+    }), expected)
+    assert.equal(result.outcome, REFUND_RECONCILIATION_OUTCOMES.REQUIRES_ATTENTION)
+    assert.equal(result.reason, 'TOTAL_REFUNDED_AMOUNT_INCONSISTENT')
+  })
+
+  it('validates refunded_amount only when the provider includes it', () => {
+    const exact = classifyRefundEvidence(providerOrder({
+      payments: [{
+        ...providerOrder().payments[0],
+        refundedAmountPresent: true,
+        refundedAmount: '150000.00'
+      }]
+    }), expected)
+    const contradictory = classifyRefundEvidence(providerOrder({
+      payments: [{
+        ...providerOrder().payments[0],
+        refundedAmountPresent: true,
+        refundedAmount: '1.00'
+      }]
+    }), expected)
+    assert.equal(exact.outcome, REFUND_RECONCILIATION_OUTCOMES.SUCCEEDED)
+    assert.equal(contradictory.outcome, REFUND_RECONCILIATION_OUTCOMES.REQUIRES_ATTENTION)
+    assert.equal(contradictory.reason, 'PROVIDER_PAYMENT_REFUNDED_AMOUNT_MISMATCH')
+  })
 
   it('distinguishes absent refund provenance from an explicit empty array', () => {
     const absent = classifyRefundEvidence(providerOrder({
@@ -414,25 +482,40 @@ describe('P1C-C1 total refund domain (isolated)', () => {
     assert.equal(rejected.outcome, REFUND_RECONCILIATION_OUTCOMES.REJECTED_DEFINITIVE)
   })
 
-  it('finalizes Payment, Order, fulfillment and Refund in one transaction without inventory calls', async () => {
+  it('reconciles a submitted attention Refund without another POST and converges idempotently', async () => {
     const calls = []
+    let providerGetCalls = 0
+    let providerPostCalls = 0
+    const approvedAt = new Date('2026-11-03T11:00:00.000Z')
+    const paidAt = new Date('2026-11-03T11:00:00.000Z')
+    const providerIdempotencyKey = `refund-${refundId}`
     const refund = {
       _id: refundId,
       orderId,
       paymentId,
-      status: 'processing',
+      status: 'requires_attention',
       version: 3,
       operationScope: 'total_refund',
       requestedAmountArs: '150000.00',
+      currency: 'ARS',
       providerOrderId,
-      providerPaymentId
+      providerPaymentId,
+      providerIdempotencyKey,
+      idempotencyKey: 'refund-admin-key-0001',
+      providerRefundId: null,
+      origin: 'admin',
+      submittedAt: now,
+      sanitizedError: {
+        code: 'PROVIDER_PAYMENT_NOT_ACCREDITED',
+        message: 'La evidencia remota requiere revision'
+      }
     }
     const payment = {
       _id: paymentId,
       orderId,
       provider: 'mercado_pago',
       normalizedStatus: 'approved',
-      approvedAt: now,
+      approvedAt,
       providerOrderId,
       providerPaymentId,
       amountArs: '150000.00',
@@ -442,39 +525,126 @@ describe('P1C-C1 total refund domain (isolated)', () => {
       _id: orderId,
       orderNumber: 'LC-2026-000100',
       status: 'paid',
+      paidAt,
       activeRefundId: refundId,
-      fulfillmentStatus: 'ready_for_pickup'
+      fulfillmentStatus: 'preparing',
+      statusHistory: [],
+      fulfillmentHistory: []
     }
     const service = new PaymentRefundReconciliationService({
       mongooseInstance: fakeMongoose,
       paymentRefundManager: {
         async getById() { return refund },
+        async getActiveByProviderOrderId() { return refund },
         async finalizeSucceeded(id, input) {
           calls.push(['refund', id, input])
-          return { ...refund, status: 'succeeded', providerRefundId: input.providerRefundId }
+          assert.equal(input.expectedVersion, 3)
+          assert.equal(input.providerIdempotencyKey, providerIdempotencyKey)
+          assert.equal(input.submittedAt, now)
+          assert.equal(input.expectedProviderRefundId, null)
+          Object.assign(refund, {
+            status: 'succeeded',
+            version: 4,
+            providerRefundId: input.providerRefundId,
+            confirmedAmountArs: input.confirmedAmountArs,
+            providerStatus: input.providerStatus,
+            providerStatusDetail: input.providerStatusDetail,
+            providerEvidenceSnapshot: input.providerEvidenceSnapshot,
+            lastProviderCheckAt: input.checkedAt,
+            completedAt: input.completedAt,
+            sanitizedError: null
+          })
+          return refund
         }
       },
       paymentManager: {
         async getById() { return payment },
+        async getByProviderOrderId() { return payment },
         async finalizeTotalRefund(id, input) {
           calls.push(['payment', id, input])
-          return { ...payment, normalizedStatus: 'refunded' }
+          assert.equal(input.approvedAt, approvedAt)
+          Object.assign(payment, {
+            normalizedStatus: 'refunded',
+            providerStatus: input.providerStatus,
+            providerStatusDetail: input.providerStatusDetail,
+            lastProviderCheckAt: input.checkedAt
+          })
+          return payment
         }
       },
       orderManager: {
         async getById() { return order },
         async finalizeTotalRefund(id, idRefund, input) {
           calls.push(['order', id, idRefund, input])
-          return { ...order, status: 'refunded', fulfillmentStatus: 'cancelled' }
+          assert.equal(input.paidAt, paidAt)
+          order.status = 'refunded'
+          order.refundedAt = input.refundedAt
+          order.activeRefundId = null
+          order.fulfillmentStatus = 'cancelled'
+          order.statusHistory.push({
+            status: 'refunded',
+            changedAt: input.refundedAt,
+            reason: 'PAYMENT_REFUND_TOTAL'
+          })
+          order.fulfillmentHistory.push({
+            status: 'cancelled',
+            changedAt: input.refundedAt,
+            reason: 'PAYMENT_REFUND_TOTAL'
+          })
+          return order
         }
+      },
+      provider: {
+        async getOrder() {
+          providerGetCalls += 1
+          return providerOrder()
+        },
+        async refundOrder() { providerPostCalls += 1 }
       }
     })
 
-    const result = await service.reconcileRefund(refundId, { now, providerOrder: providerOrder() })
+    const result = await service.reconcileRefund(refundId, { now })
     assert.equal(result.outcome, 'succeeded')
     assert.deepEqual(calls.map(([kind]) => kind), ['payment', 'order', 'refund'])
-    assert.equal(calls[1][3].expectedFulfillmentStatus, 'ready_for_pickup')
-    assert.equal(calls[2][2].expectedVersion, 3)
+    assert.equal(calls[1][3].expectedFulfillmentStatus, 'preparing')
+    assert.equal(providerGetCalls, 1)
+    assert.equal(providerPostCalls, 0)
+    assert.equal(refund._id, refundId)
+    assert.equal(refund.providerIdempotencyKey, providerIdempotencyKey)
+    assert.equal(refund.providerRefundId, 'REF01REFUNDLCOMPTEST')
+    assert.equal(refund.providerStatus, 'refunded')
+    assert.equal(refund.providerStatusDetail, 'refunded')
+    assert.equal(refund.status, 'succeeded')
+    assert.equal(refund.sanitizedError, null)
+    assert.equal(payment.normalizedStatus, 'refunded')
+    assert.equal(payment.approvedAt, approvedAt)
+    assert.equal(payment.providerStatus, 'refunded')
+    assert.equal(payment.providerStatusDetail, 'refunded')
+    assert.equal(order.status, 'refunded')
+    assert.equal(order.paidAt, paidAt)
+    assert.equal(order.activeRefundId, null)
+    assert.equal(order.fulfillmentStatus, 'cancelled')
+    assert.equal(order.statusHistory.length, 1)
+    assert.equal(order.fulfillmentHistory.length, 1)
+
+    const repeated = await service.reconcileRefund(refundId, {
+      now: new Date(now.getTime() + 1000)
+    })
+    assert.equal(repeated.outcome, 'succeeded')
+    assert.equal(repeated.idempotent, true)
+    assert.equal(providerGetCalls, 1)
+    assert.equal(providerPostCalls, 0)
+    assert.equal(order.statusHistory.length, 1)
+    assert.equal(order.fulfillmentHistory.length, 1)
+
+    const webhookConvergence = await service.reconcileProviderOrder(providerOrder(), {
+      now: new Date(now.getTime() + 2000)
+    })
+    assert.equal(webhookConvergence.handled, true)
+    assert.equal(webhookConvergence.outcome, 'succeeded')
+    assert.equal(webhookConvergence.idempotent, true)
+    assert.equal(order.statusHistory.length, 1)
+    assert.equal(order.fulfillmentHistory.length, 1)
   })
 
   it('records and finalizes an exact provider-observed refund without fake admin keys', async () => {

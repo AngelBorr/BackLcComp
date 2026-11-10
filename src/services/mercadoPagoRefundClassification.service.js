@@ -23,7 +23,7 @@ const cents = (value, field) => {
   }
 }
 
-const validatePaymentIdentity = (providerOrder, expected, mismatch) => {
+const validateFinancialIdentity = (providerOrder, expected, mismatch) => {
   const source = providerOrder?.reconciliationSource
   if (
     source?.totalPaidAmountPresent !== true ||
@@ -58,19 +58,33 @@ const validatePaymentIdentity = (providerOrder, expected, mismatch) => {
     return mismatch('PROVIDER_PAYMENT_ID_MISMATCH')
   }
   if (
-    text(payment.status).toLowerCase() !== 'processed' ||
-    text(payment.statusDetail).toLowerCase() !== 'accredited'
-  ) {
-    return mismatch('PROVIDER_PAYMENT_NOT_ACCREDITED')
-  }
-  if (
     cents(payment.amount, 'provider.payment.amount') !== expectedCents ||
     cents(payment.paidAmount, 'provider.payment.paidAmount') !== expectedCents
   ) {
     return mismatch('PROVIDER_PAYMENT_AMOUNT_MISMATCH')
   }
 
-  return { expectedCents }
+  return { expectedCents, payment }
+}
+
+const validatePreRefundPaymentState = (validated, mismatch) => {
+  if (
+    text(validated.payment.status).toLowerCase() !== 'processed' ||
+    text(validated.payment.statusDetail).toLowerCase() !== 'accredited'
+  ) {
+    return mismatch('PROVIDER_PAYMENT_NOT_ACCREDITED')
+  }
+  if (validated.payment.refundedAmountPresent === true) {
+    const refundedCents = cents(
+      validated.payment.refundedAmount,
+      'provider.payment.refundedAmount'
+    )
+    if (refundedCents === null || refundedCents !== 0) {
+      return mismatch('PROVIDER_PAYMENT_ALREADY_REFUNDED')
+    }
+  }
+
+  return validated
 }
 
 const classifyRefundPreflight = (providerOrder, expected) => {
@@ -78,7 +92,7 @@ const classifyRefundPreflight = (providerOrder, expected) => {
     outcome: REFUND_PREFLIGHT_OUTCOMES.REQUIRES_ATTENTION,
     reason
   })
-  const validated = validatePaymentIdentity(providerOrder, expected, mismatch)
+  const validated = validateFinancialIdentity(providerOrder, expected, mismatch)
   if (validated.outcome) return validated
 
   const source = providerOrder.reconciliationSource
@@ -93,6 +107,9 @@ const classifyRefundPreflight = (providerOrder, expected) => {
       reason: 'PROVIDER_REFUND_ALREADY_OBSERVED'
     }
   }
+
+  const paymentState = validatePreRefundPaymentState(validated, mismatch)
+  if (paymentState.outcome) return paymentState
 
   if (
     text(providerOrder.status).toLowerCase() !== 'processed' ||
@@ -135,7 +152,7 @@ const classifyRefundEvidence = (providerOrder, expected) => {
   })
   const source = providerOrder?.reconciliationSource
 
-  const validated = validatePaymentIdentity(providerOrder, expected, mismatch)
+  const validated = validateFinancialIdentity(providerOrder, expected, mismatch)
   if (validated.outcome) return validated
   if (!source?.refundsPresent || !source?.refundsIsArray) {
     return mismatch('PROVIDER_REFUNDS_PROVENANCE_MISSING')
@@ -158,56 +175,91 @@ const classifyRefundEvidence = (providerOrder, expected) => {
       reason: 'PROVIDER_REFUND_NOT_OBSERVED'
     }
   }
-  if (refunds.length !== 1) return mismatch('PROVIDER_REFUND_CARDINALITY_MISMATCH')
+  const normalizedRefunds = []
+  for (const refund of refunds) {
+    if (!/^REF/i.test(text(refund.providerRefundId))) {
+      return mismatch('PROVIDER_REFUND_ID_MISSING')
+    }
+    if (text(refund.providerPaymentId) !== text(expected.providerPaymentId)) {
+      return mismatch('PROVIDER_REFUND_PAYMENT_ID_MISMATCH')
+    }
+    const amountCents = cents(refund.amount, 'provider.refund.amount')
+    if (amountCents === null) return mismatch('PROVIDER_REFUND_AMOUNT_MISMATCH')
+    normalizedRefunds.push({ refund, amountCents })
+  }
 
-  const refund = refunds[0]
-  if (!text(refund.providerRefundId)) return mismatch('PROVIDER_REFUND_ID_MISSING')
-  if (text(refund.providerPaymentId) !== text(expected.providerPaymentId)) {
-    return mismatch('PROVIDER_REFUND_PAYMENT_ID_MISMATCH')
+  const refundStatuses = normalizedRefunds.map(({ refund }) =>
+    text(refund.status).toLowerCase()
+  )
+  if (refundStatuses.some((status) => ['pending', 'processing', 'in_process'].includes(status))) {
+    return {
+      outcome: REFUND_RECONCILIATION_OUTCOMES.PROCESSING,
+      reason: 'PROVIDER_REFUND_PROCESSING',
+      refund: normalizedRefunds.find(({ refund }) =>
+        ['pending', 'processing', 'in_process'].includes(text(refund.status).toLowerCase())
+      )?.refund
+    }
   }
-  if (cents(refund.amount, 'provider.refund.amount') !== expectedCents) {
-    return mismatch('PROVIDER_REFUND_AMOUNT_MISMATCH')
+  if (refundStatuses.every((status) => ['rejected', 'cancelled', 'failed'].includes(status))) {
+    return {
+      outcome: REFUND_RECONCILIATION_OUTCOMES.REJECTED_DEFINITIVE,
+      reason: 'PROVIDER_REFUND_REJECTED',
+      refund: normalizedRefunds[0].refund
+    }
   }
+  if (refundStatuses.some((status) => status !== 'processed')) {
+    return mismatch('PROVIDER_REFUND_STATE_INCONSISTENT')
+  }
+  if (normalizedRefunds.some(({ refund }) =>
+    text(refund.statusDetail) && text(refund.statusDetail).toLowerCase() !== 'accredited'
+  )) {
+    return mismatch('PROVIDER_REFUND_STATUS_DETAIL_INCONSISTENT')
+  }
+
+  let totalRefundCents = 0
+  for (const { amountCents } of normalizedRefunds) {
+    totalRefundCents += amountCents
+    if (!Number.isSafeInteger(totalRefundCents)) {
+      return mismatch('PROVIDER_REFUND_AMOUNT_SUM_MISMATCH')
+    }
+  }
+  if (totalRefundCents !== expectedCents) {
+    return mismatch('PROVIDER_REFUND_AMOUNT_SUM_MISMATCH')
+  }
+
+  const exactRefund = normalizedRefunds.find(({ amountCents }) => amountCents === expectedCents)
+  if (!exactRefund) return mismatch('PROVIDER_REFUND_AMOUNT_MISMATCH')
   if (
     source.totalRefundedAmountPresent === true &&
     cents(providerOrder.totalRefundedAmount, 'provider.totalRefundedAmount') !== expectedCents
   ) {
     return mismatch('TOTAL_REFUNDED_AMOUNT_INCONSISTENT')
   }
-
-  const refundStatus = text(refund.status).toLowerCase()
-  const orderStatus = text(providerOrder.status).toLowerCase()
-  const orderStatusDetail = text(providerOrder.statusDetail).toLowerCase()
-
   if (
-    ['processed', 'succeeded'].includes(refundStatus) &&
-    orderStatus === 'refunded' &&
-    orderStatusDetail === 'refunded'
+    validated.payment.refundedAmountPresent === true &&
+    cents(validated.payment.refundedAmount, 'provider.payment.refundedAmount') !== expectedCents
   ) {
-    return {
-      outcome: REFUND_RECONCILIATION_OUTCOMES.SUCCEEDED,
-      reason: 'PROVIDER_TOTAL_REFUND_CONFIRMED',
-      refund
-    }
+    return mismatch('PROVIDER_PAYMENT_REFUNDED_AMOUNT_MISMATCH')
+  }
+  if (
+    text(validated.payment.status).toLowerCase() !== 'refunded' ||
+    text(validated.payment.statusDetail).toLowerCase() !== 'refunded'
+  ) {
+    return mismatch('PROVIDER_PAYMENT_NOT_REFUNDED')
+  }
+  if (
+    text(providerOrder.status).toLowerCase() !== 'refunded' ||
+    text(providerOrder.statusDetail).toLowerCase() !== 'refunded'
+  ) {
+    return mismatch('PROVIDER_ORDER_NOT_REFUNDED')
   }
 
-  if (['rejected', 'cancelled', 'failed'].includes(refundStatus)) {
-    return {
-      outcome: REFUND_RECONCILIATION_OUTCOMES.REJECTED_DEFINITIVE,
-      reason: 'PROVIDER_REFUND_REJECTED',
-      refund
-    }
+  return {
+    outcome: REFUND_RECONCILIATION_OUTCOMES.SUCCEEDED,
+    reason: 'PROVIDER_TOTAL_REFUND_CONFIRMED',
+    refund: exactRefund.refund,
+    payment: validated.payment
   }
-
-  if (['pending', 'processing', 'in_process'].includes(refundStatus)) {
-    return {
-      outcome: REFUND_RECONCILIATION_OUTCOMES.PROCESSING,
-      reason: 'PROVIDER_REFUND_PROCESSING',
-      refund
-    }
-  }
-
-  return mismatch('PROVIDER_REFUND_STATE_INCONSISTENT')
 }
 
 export { classifyRefundEvidence, classifyRefundPreflight }

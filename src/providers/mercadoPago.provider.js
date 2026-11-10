@@ -171,13 +171,23 @@ const optionalString = (value) =>
 const normalizeProviderPayments = (payments) => {
   if (!Array.isArray(payments)) return []
 
-  return payments.map((payment) => ({
-    providerPaymentId: optionalString(payment?.id),
-    status: optionalString(payment?.status),
-    statusDetail: optionalString(payment?.status_detail),
-    amount: optionalString(payment?.amount),
-    paidAmount: optionalString(payment?.paid_amount)
-  }))
+  return payments.map((payment) => {
+    const refundedAmountPresent = Boolean(
+      payment && typeof payment === 'object' && Object.hasOwn(payment, 'refunded_amount')
+    )
+
+    return {
+      providerPaymentId: optionalString(payment?.id),
+      status: optionalString(payment?.status),
+      statusDetail: optionalString(payment?.status_detail),
+      amount: optionalString(payment?.amount),
+      paidAmount: optionalString(payment?.paid_amount),
+      refundedAmountPresent,
+      ...(refundedAmountPresent && {
+        refundedAmount: optionalString(payment.refunded_amount)
+      })
+    }
+  })
 }
 
 const normalizeProviderRefunds = (refunds) => {

@@ -645,8 +645,50 @@ describe('Mercado Pago provider reconciliation normalization (isolated)', () => 
 
     assert.equal(result.statusDetail, 'accredited')
     assert.equal(result.payments[0].providerPaymentId, 'PAY-1')
+    assert.equal(result.payments[0].refundedAmountPresent, false)
+    assert.equal(Object.hasOwn(result.payments[0], 'refundedAmount'), false)
     assert.equal(Object.hasOwn(result, 'clientToken'), false)
     assert.equal(Object.hasOwn(result.payments[0], 'paymentMethod'), false)
+  })
+
+  it('preserves real post-refund provenance without inventing aggregate values', () => {
+    const result = normalizeProviderOrder({
+      id: providerOrderId,
+      status: 'refunded',
+      status_detail: 'refunded',
+      external_reference: 'LC-2026-000011',
+      total_amount: '20896.70',
+      total_paid_amount: '20896.70',
+      currency: 'ARS',
+      transactions: {
+        payments: [{
+          id: 'PAY01M6MJ45S6WE48R5NRSDAGT7W9',
+          status: 'refunded',
+          status_detail: 'refunded',
+          amount: '20896.7',
+          paid_amount: '20896.7',
+          refunded_amount: '20896.70'
+        }],
+        refunds: [{
+          id: 'REF01M71CCAX2NVBB0X31D3EM5E22',
+          transaction_id: 'PAY01M6MJ45S6WE48R5NRSDAGT7W9',
+          status: 'processed',
+          status_detail: 'accredited',
+          amount: '20896.70',
+          reference_id: '3499715169'
+        }]
+      }
+    }, { includeReconciliation: true })
+
+    assert.equal(result.reconciliationSource.totalRefundedAmountPresent, false)
+    assert.equal(Object.hasOwn(result, 'totalRefundedAmount'), false)
+    assert.equal(result.payments[0].refundedAmountPresent, true)
+    assert.equal(result.payments[0].refundedAmount, '20896.70')
+    assert.equal(result.refunds[0].providerRefundId, 'REF01M71CCAX2NVBB0X31D3EM5E22')
+    assert.equal(
+      result.refunds[0].providerPaymentId,
+      'PAY01M6MJ45S6WE48R5NRSDAGT7W9'
+    )
   })
 })
 

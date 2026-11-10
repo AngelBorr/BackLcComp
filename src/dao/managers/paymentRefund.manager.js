@@ -108,7 +108,10 @@ class PaymentRefundManager {
   async finalizeSucceeded(
     refundId,
     {
-      expectedStatuses, expectedVersion, providerRefundId, confirmedAmountArs,
+      expectedStatuses, expectedVersion, orderId, paymentId,
+      providerOrderId, providerPaymentId, providerIdempotencyKey, idempotencyKey,
+      requestedAmountArs, currency, origin, submittedAt, expectedProviderRefundId,
+      providerRefundId, confirmedAmountArs,
       providerStatus, providerStatusDetail, providerEvidenceSnapshot,
       checkedAt, completedAt
     },
@@ -119,7 +122,18 @@ class PaymentRefundManager {
         _id: refundId,
         status: { $in: expectedStatuses },
         version: expectedVersion,
-        operationScope: 'total_refund'
+        operationScope: 'total_refund',
+        orderId,
+        paymentId,
+        providerOrderId,
+        providerPaymentId,
+        providerIdempotencyKey,
+        idempotencyKey,
+        requestedAmountArs,
+        currency,
+        origin,
+        submittedAt,
+        providerRefundId: expectedProviderRefundId
       },
       {
         $set: {

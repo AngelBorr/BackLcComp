@@ -75,7 +75,8 @@ describe('Mercado Pago remote Order financial classification (pure)', () => {
       status: 'failed',
       statusDetail: 'rejected_by_issuer',
       amount: '20763.6',
-      paidAmount: null
+      paidAmount: null,
+      refundedAmountPresent: false
     }])
     assert.equal(classifyRemoteOrder(order, {
       expectedProviderOrderId: order.providerOrderId,

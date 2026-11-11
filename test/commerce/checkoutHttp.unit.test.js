@@ -697,6 +697,18 @@ describe('POST /api/checkout HTTP orchestration (isolated unit tests)', () => {
       orderItemManager: {
         async getByOrderId(requestedOrderId) {
           return stored.items.get(String(requestedOrderId)) || []
+        },
+        async captureOriginalReservation(input) {
+          const items = stored.items.get(String(input.orderId)) || []
+          const index = items.findIndex((item) => (
+            String(item._id) === String(input.orderItemId) &&
+            item.originalReservation === undefined
+          ))
+          if (index < 0) return { modifiedCount: 0 }
+          const updated = [...items]
+          updated[index] = { ...updated[index], originalReservation: input.originalReservation }
+          stored.items.set(String(input.orderId), updated)
+          return { modifiedCount: 1 }
         }
       },
       paymentManager: {
@@ -774,8 +786,27 @@ describe('POST /api/checkout HTTP orchestration (isolated unit tests)', () => {
         }
       },
       productUnitService: {
-        async reserveAvailableUnits() {
+        async reserveAvailableUnits(input) {
           effects.reservationsCreated += 1
+          const reservedAt = new Date('2026-09-29T12:00:00.000Z')
+          return {
+            reservedCount: input.quantity,
+            reservedAt,
+            reservationExpiresAt: input.reservationExpiresAt,
+            units: [{
+              _id: '507f1f77bcf86cd799439016',
+              productId: input.productId,
+              serialNumber: 'SERIAL-CHECKOUT-HTTP-001',
+              status: 'reserved',
+              isDeleted: false,
+              orderId: input.orderId,
+              orderItemId: input.orderItemId,
+              reservedByOrderId: input.orderId,
+              soldByOrderId: null,
+              soldAt: null,
+              createdAt: reservedAt
+            }]
+          }
         }
       },
       paymentService: {

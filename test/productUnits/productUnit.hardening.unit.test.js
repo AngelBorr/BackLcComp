@@ -550,4 +550,46 @@ describe('ProductUnits transactional hardening (isolated unit tests)', () => {
 
     assert.deepEqual(release, { units: [], releasedCount: 0, productIds: [] })
   })
+
+  it('releases expired ProductUnits without altering a committed OrderItem ledger', async () => {
+    const session = createExternalSession()
+    const now = new Date('2026-11-09T18:00:00.000Z')
+    const orderItem = {
+      originalReservation: {
+        capturedAt: new Date('2026-11-09T12:00:00.000Z'),
+        units: [{ productUnitId: unitId, serial: 'SERIAL-ORIGINAL-RELEASE' }]
+      }
+    }
+    const ledgerBeforeRelease = JSON.stringify(orderItem.originalReservation)
+    const expiredUnit = {
+      _id: unitId,
+      productId,
+      status: 'reserved',
+      reservationExpiresAt: new Date('2026-11-09T17:00:00.000Z')
+    }
+
+    stub(ProductUnitManager, 'findExpiredReservations', async () => [expiredUnit])
+    stub(ProductUnitManager, 'releaseExpiredReservations', async () => ({ modifiedCount: 1 }))
+    stub(ProductModel, 'findById', () => ({
+      session() { return this },
+      lean: async () => ({ _id: productId, inventoryMode: 'serialized' })
+    }))
+    stub(ProductUnitService, 'recalculateProductStock', async () => ({ available: 1 }))
+    stub(ProductUnitManager, 'getByIds', async () => ([{
+      ...expiredUnit,
+      status: 'available',
+      orderId: null,
+      orderItemId: null,
+      reservedByOrderId: null
+    }]))
+
+    const result = await ProductUnitService.releaseExpiredReservations(
+      { now },
+      { session }
+    )
+
+    assert.equal(result.releasedCount, 1)
+    assert.equal(result.units[0].status, 'available')
+    assert.equal(JSON.stringify(orderItem.originalReservation), ledgerBeforeRelease)
+  })
 })

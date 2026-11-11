@@ -571,6 +571,281 @@ describe('Commerce domain foundation (isolated unit tests)', () => {
     assert.equal(snapshot.brand, 'Marca original')
   })
 
+  it('keeps legacy OrderItems without an original reservation valid and distinguishable', async () => {
+    const item = new OrderItemModel({
+      orderId,
+      productId,
+      productSnapshot: { name: 'Producto legacy' },
+      quantity: 1,
+      priceType: 'retail',
+      vatRate: '0.21',
+      unitPriceUsd: '121.00',
+      netUnitPriceUsd: '100.00',
+      vatAmountPerUnitUsd: '21.00',
+      lineNetUsd: '100.00',
+      lineVatUsd: '21.00',
+      totalUsd: '121.00'
+    })
+
+    await item.validate()
+    const plainItem = item.toObject()
+
+    assert.equal(item.originalReservation, undefined)
+    assert.equal(Object.hasOwn(plainItem, 'originalReservation'), false)
+  })
+
+  it('rejects null and incomplete ledgers on new writes while tolerating legacy null on read', async () => {
+    const baseItem = {
+      orderId,
+      productId,
+      productSnapshot: { name: 'Producto serializado' },
+      quantity: 1,
+      priceType: 'retail',
+      vatRate: '0.21',
+      unitPriceUsd: '121.00',
+      netUnitPriceUsd: '100.00',
+      vatAmountPerUnitUsd: '21.00',
+      lineNetUsd: '100.00',
+      lineVatUsd: '21.00',
+      totalUsd: '121.00'
+    }
+
+    await assert.rejects(
+      new OrderItemModel({ ...baseItem, originalReservation: null }).validate(),
+      /reserva original.*no puede ser null/
+    )
+    await assert.rejects(
+      new OrderItemModel({ ...baseItem, originalReservation: {} }).validate(),
+      /reserva original/
+    )
+    await assert.rejects(
+      new OrderItemModel({
+        ...baseItem,
+        originalReservation: { capturedAt: new Date(), units: [] }
+      }).validate(),
+      /reserva original/
+    )
+
+    const legacyWithNull = OrderItemModel.hydrate({
+      _id: new mongoose.Types.ObjectId(),
+      ...baseItem,
+      originalReservation: null
+    })
+
+    await legacyWithNull.validate()
+    assert.equal(legacyWithNull.isNew, false)
+    assert.equal(legacyWithNull.originalReservation, null)
+    assert.equal(legacyWithNull.toObject().originalReservation, null)
+
+    const existingWithLedger = OrderItemModel.hydrate({
+      _id: new mongoose.Types.ObjectId(),
+      ...baseItem,
+      originalReservation: {
+        capturedAt: new Date('2026-11-09T12:00:00.000Z'),
+        units: [{ productUnitId: new mongoose.Types.ObjectId(), serial: 'SERIAL-EXISTING' }]
+      }
+    })
+    existingWithLedger.originalReservation = null
+    await assert.rejects(
+      existingWithLedger.validate(),
+      /reserva original.*no puede ser null/
+    )
+  })
+
+  it('rejects query writes that explicitly set the original reservation to null', async () => {
+    let writes = 0
+    stub(OrderItemModel.collection, 'updateOne', async () => {
+      writes += 1
+      return { matchedCount: 1, modifiedCount: 1 }
+    })
+
+    await assert.rejects(
+      OrderItemModel.updateOne(
+        { _id: orderItemId },
+        { $set: { originalReservation: null } },
+        { runValidators: true }
+      ),
+      /reserva original no puede ser null en una escritura nueva/
+    )
+    assert.equal(writes, 0)
+  })
+
+  it('validates a complete original reservation ledger with ProductUnit IDs and serial snapshots', async () => {
+    const firstUnitId = new mongoose.Types.ObjectId()
+    const secondUnitId = new mongoose.Types.ObjectId()
+    const item = new OrderItemModel({
+      orderId,
+      productId,
+      productSnapshot: { name: 'Producto serializado' },
+      quantity: 2,
+      priceType: 'retail',
+      vatRate: '0.21',
+      unitPriceUsd: '121.00',
+      netUnitPriceUsd: '100.00',
+      vatAmountPerUnitUsd: '21.00',
+      lineNetUsd: '200.00',
+      lineVatUsd: '42.00',
+      totalUsd: '242.00',
+      originalReservation: {
+        capturedAt: new Date('2026-11-09T12:00:00.000Z'),
+        units: [
+          { productUnitId: firstUnitId, serial: 'SERIAL-001' },
+          { productUnitId: secondUnitId, serial: 'SERIAL-002' }
+        ]
+      }
+    })
+
+    await item.validate()
+    assert.deepEqual(
+      item.originalReservation.units.map((unit) => String(unit.productUnitId)),
+      [String(firstUnitId), String(secondUnitId)]
+    )
+  })
+
+  it('rejects original reservation ledgers with a quantity mismatch or duplicate IDs', async () => {
+    const sharedUnitId = new mongoose.Types.ObjectId()
+    const baseItem = {
+      orderId,
+      productId,
+      productSnapshot: { name: 'Producto serializado' },
+      quantity: 2,
+      priceType: 'retail',
+      vatRate: '0.21',
+      unitPriceUsd: '121.00',
+      netUnitPriceUsd: '100.00',
+      vatAmountPerUnitUsd: '21.00',
+      lineNetUsd: '200.00',
+      lineVatUsd: '42.00',
+      totalUsd: '242.00'
+    }
+
+    await assert.rejects(
+      new OrderItemModel({
+        ...baseItem,
+        originalReservation: {
+          capturedAt: new Date(),
+          units: [{ productUnitId: sharedUnitId, serial: 'SERIAL-001' }]
+        }
+      }).validate(),
+      /debe coincidir con la cantidad/
+    )
+    await assert.rejects(
+      new OrderItemModel({
+        ...baseItem,
+        originalReservation: {
+          capturedAt: new Date(),
+          units: [
+            { productUnitId: sharedUnitId, serial: 'SERIAL-001' },
+            { productUnitId: sharedUnitId, serial: 'SERIAL-001-COPY' }
+          ]
+        }
+      }).validate(),
+      /no puede contener unidades duplicadas/
+    )
+  })
+
+  it('requires an active transaction before attempting original reservation capture', async () => {
+    const manager = new OrderItemManager()
+    let writes = 0
+    stub(OrderItemModel, 'updateOne', async () => {
+      writes += 1
+      return { matchedCount: 1, modifiedCount: 1 }
+    })
+    const input = {
+      orderItemId,
+      orderId,
+      productId,
+      quantity: 1,
+      originalReservation: {
+        capturedAt: new Date('2026-11-09T12:00:00.000Z'),
+        units: [{ productUnitId: new mongoose.Types.ObjectId(), serial: 'SERIAL-FIRST' }]
+      }
+    }
+    const invalidSessions = [
+      undefined,
+      {},
+      { hasEnded: true, inTransaction: () => true },
+      { hasEnded: false, inTransaction: () => false },
+      { hasEnded: false, inTransaction: () => { throw new Error('invalid session') } }
+    ]
+
+    for (const session of invalidSessions) {
+      await assert.rejects(
+        manager.captureOriginalReservation(input, { session }),
+        (error) => error.code === 'EXTERNAL_TRANSACTION_REQUIRED' && error.status === 500
+      )
+    }
+    assert.equal(writes, 0)
+  })
+
+  it('captures the complete original reservation once and rejects every non-single CAS result', async () => {
+    const manager = new OrderItemManager()
+    const capturedAt = new Date('2026-11-09T12:00:00.000Z')
+    const firstSnapshot = {
+      capturedAt,
+      units: [{ productUnitId: new mongoose.Types.ObjectId(), serial: 'SERIAL-FIRST' }]
+    }
+    const replacementSnapshot = {
+      capturedAt: new Date('2026-11-09T12:01:00.000Z'),
+      units: [{ productUnitId: new mongoose.Types.ObjectId(), serial: 'SERIAL-REPLACEMENT' }]
+    }
+    let storedOriginalReservation
+    const calls = []
+
+    const results = [
+      { matchedCount: 1, modifiedCount: 1 },
+      { matchedCount: 0, modifiedCount: 0 },
+      { matchedCount: 2, modifiedCount: 2 }
+    ]
+    stub(OrderItemModel, 'updateOne', async (filter, update, options) => {
+      calls.push({ filter, update, options })
+      const result = results.shift()
+      if (result.modifiedCount === 1) {
+        storedOriginalReservation = update.$set.originalReservation
+      }
+      return result
+    })
+
+    const input = {
+      orderItemId,
+      orderId,
+      productId,
+      quantity: 1
+    }
+    const first = await manager.captureOriginalReservation(
+      { ...input, originalReservation: firstSnapshot },
+      { session: externalSession }
+    )
+    await assert.rejects(
+      manager.captureOriginalReservation(
+        { ...input, originalReservation: replacementSnapshot },
+        { session: externalSession }
+      ),
+      (error) => error.code === 'ORIGINAL_RESERVATION_CAPTURE_CONFLICT' && error.status === 409
+    )
+    await assert.rejects(
+      manager.captureOriginalReservation(
+        { ...input, originalReservation: replacementSnapshot },
+        { session: externalSession }
+      ),
+      (error) => error.code === 'ORIGINAL_RESERVATION_CAPTURE_CONFLICT' && error.status === 409
+    )
+
+    assert.equal(first.modifiedCount, 1)
+    assert.equal(storedOriginalReservation, firstSnapshot)
+    assert.equal(calls[0].filter._id, orderItemId)
+    assert.equal(calls[0].filter.orderId, orderId)
+    assert.equal(calls[0].filter.productId, productId)
+    assert.equal(calls[0].filter.quantity, 1)
+    assert.deepEqual(calls[0].filter.originalReservation, { $exists: false })
+    assert.deepEqual(Object.keys(calls[0].update), ['$set'])
+    assert.equal(calls[0].update.$set.originalReservation, firstSnapshot)
+    assert.deepEqual(calls[0].options, {
+      session: externalSession,
+      runValidators: true
+    })
+  })
+
   it('rejects an invalid OrderItem quantity at model level', async () => {
     const item = new OrderItemModel({
       orderId,

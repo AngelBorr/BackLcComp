@@ -3,3 +3,4 @@
 .env.test
 .env.*
 !.env.example
+.cache/mongodb-binaries/

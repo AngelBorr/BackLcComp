@@ -45,6 +45,8 @@ const makeHarness = (overrides = {}) => {
     items: new Map(),
     payments: new Map(),
     reservations: [],
+    productStocks: new Map([[productA, 100], [productB, 100]]),
+    captureCalls: [],
     pricingCalls: [],
     userCalls: [],
     orderCalls: [],
@@ -75,7 +77,8 @@ const makeHarness = (overrides = {}) => {
         orders: cloneMap(state.orders),
         items: cloneMap(state.items),
         payments: cloneMap(state.payments),
-        reservations: [...state.reservations]
+        reservations: [...state.reservations],
+        productStocks: cloneMap(state.productStocks)
       }
 
       try {
@@ -87,6 +90,7 @@ const makeHarness = (overrides = {}) => {
         state.items = snapshot.items
         state.payments = snapshot.payments
         state.reservations = snapshot.reservations
+        state.productStocks = snapshot.productStocks
         state.aborted += 1
         state.events.push('transaction:abort')
         throw error
@@ -115,6 +119,35 @@ const makeHarness = (overrides = {}) => {
     async getByOrderId(orderId, { session: usedSession } = {}) {
       state.events.push(usedSession ? 'items:transaction' : 'items:existing')
       return state.items.get(String(orderId)) || []
+    },
+    async captureOriginalReservation(input, { session: usedSession } = {}) {
+      state.events.push('ledger:capture')
+      state.captureCalls.push({ input, session: usedSession })
+
+      if (config.captureConflictProductId === String(input.productId)) {
+        return { matchedCount: 0, modifiedCount: 0 }
+      }
+
+      const orderItems = state.items.get(String(input.orderId)) || []
+      const itemIndex = orderItems.findIndex((item) => (
+        String(item._id) === String(input.orderItemId) &&
+        String(item.productId) === String(input.productId) &&
+        Number(item.quantity) === Number(input.quantity) &&
+        item.originalReservation === undefined
+      ))
+
+      if (itemIndex < 0) return { matchedCount: 0, modifiedCount: 0 }
+
+      const updatedItems = [...orderItems]
+      updatedItems[itemIndex] = {
+        ...updatedItems[itemIndex],
+        originalReservation: {
+          capturedAt: new Date(input.originalReservation.capturedAt),
+          units: input.originalReservation.units.map((unit) => ({ ...unit }))
+        }
+      }
+      state.items.set(String(input.orderId), updatedItems)
+      return { matchedCount: 1, modifiedCount: 1 }
     }
   }
   const paymentManager = {
@@ -219,17 +252,49 @@ const makeHarness = (overrides = {}) => {
   const productUnitService = {
     async reserveAvailableUnits(input, options) {
       state.events.push(`reserve:${input.productId}`)
-      state.reservations.push({ input, session: options.session })
       if (config.reservationFailureProductId === input.productId) {
         throw new ServiceError('Stock insuficiente', 'INSUFFICIENT_SERIALIZED_STOCK', 409)
       }
-      return { reservedCount: input.quantity, reservationExpiresAt: input.reservationExpiresAt }
+
+      const reservedAt = new Date(config.reservedAt || fixedNow)
+      let units = Array.from({ length: input.quantity }, (_, index) => ({
+        _id: new mongoose.Types.ObjectId(),
+        productId: input.productId,
+        serialNumber: `SERIAL-${String(state.reservations.length + 1).padStart(2, '0')}-${String(index + 1).padStart(2, '0')}`,
+        status: 'reserved',
+        isDeleted: false,
+        orderId: input.orderId,
+        orderItemId: input.orderItemId,
+        reservedByOrderId: input.orderId,
+        soldByOrderId: null,
+        soldAt: null,
+        createdAt: new Date(fixedNow.getTime() + index)
+      }))
+
+      if (typeof config.reservationUnitsTransform === 'function') {
+        units = config.reservationUnitsTransform(units, input, state)
+      }
+
+      const reservation = { input, session: options.session, units }
+      state.reservations.push(reservation)
+      state.productStocks.set(
+        input.productId,
+        state.productStocks.get(input.productId) - input.quantity
+      )
+
+      return {
+        units,
+        reservedCount: config.reservedCountOverride ?? units.length,
+        reservedAt,
+        reservationExpiresAt: input.reservationExpiresAt
+      }
     }
   }
   const paymentService = {
     async createPayment(input, options) {
       state.paymentCalls.push({ input, options })
       state.events.push('payment:create')
+      if (config.paymentError) throw config.paymentError
       const order = [...state.orders.values()].find(
         (candidate) => String(candidate._id) === String(input.orderId)
       )
@@ -537,6 +602,244 @@ describe('CheckoutService transactional orchestration (isolated unit tests)', ()
     assert.ok(state.reservations.every((reservation) => reservation.session === session))
   })
 
+  it('persists exactly the reserved ProductUnit for quantity one', async () => {
+    const { service, state, session } = makeHarness()
+    await service.createCheckout(request(), { now: fixedNow })
+
+    const item = [...state.items.values()][0][0]
+    const reservedUnit = state.reservations[0].units[0]
+
+    assert.equal(item.originalReservation.units.length, 1)
+    assert.equal(
+      String(item.originalReservation.units[0].productUnitId),
+      String(reservedUnit._id)
+    )
+    assert.equal(item.originalReservation.units[0].serial, reservedUnit.serialNumber)
+    assert.equal(item.originalReservation.capturedAt.toISOString(), fixedNow.toISOString())
+    assert.equal(state.captureCalls[0].session, session)
+  })
+
+  it('persists exactly quantity reserved units with stable createdAt and id ordering', async () => {
+    const { service, state } = makeHarness({
+      reservationUnitsTransform(units) {
+        units[0].createdAt = new Date('2026-09-29T11:59:59.000Z')
+        units[1].createdAt = new Date('2026-09-29T11:59:59.000Z')
+        units[2].createdAt = new Date('2026-09-29T11:59:58.000Z')
+        return [units[1], units[2], units[0]]
+      }
+    })
+
+    await service.createCheckout(request({
+      items: [{ productId: productA, quantity: 3 }]
+    }), { now: fixedNow })
+
+    const ledgerUnits = [...state.items.values()][0][0].originalReservation.units
+    const expectedUnits = [...state.reservations[0].units].sort((left, right) => (
+      left.createdAt.getTime() - right.createdAt.getTime() ||
+      String(left._id).localeCompare(String(right._id))
+    ))
+
+    assert.equal(ledgerUnits.length, 3)
+    assert.deepEqual(
+      ledgerUnits.map((unit) => ({ id: String(unit.productUnitId), serial: unit.serial })),
+      expectedUnits.map((unit) => ({ id: String(unit._id), serial: unit.serialNumber }))
+    )
+    assert.equal(new Set(ledgerUnits.map((unit) => String(unit.productUnitId))).size, 3)
+  })
+
+  it('keeps multiple OrderItem ledgers isolated without ProductUnit crossover', async () => {
+    const { service, state } = makeHarness()
+    await service.createCheckout(request({
+      items: [
+        { productId: productA, quantity: 2 },
+        { productId: productB, quantity: 1 }
+      ]
+    }), { now: fixedNow })
+
+    const items = [...state.items.values()][0]
+    const ledgerIds = items.map((item) => (
+      item.originalReservation.units.map((unit) => String(unit.productUnitId))
+    ))
+
+    assert.equal(items.length, 2)
+    assert.equal(ledgerIds[0].length, 2)
+    assert.equal(ledgerIds[1].length, 1)
+    assert.equal(ledgerIds[0].some((id) => ledgerIds[1].includes(id)), false)
+    assert.equal(state.captureCalls.length, 2)
+  })
+
+  it('rejects a duplicate ProductUnit within one ledger and rolls back', async () => {
+    const { service, state } = makeHarness({
+      reservationUnitsTransform(units) {
+        units[1]._id = units[0]._id
+        return units
+      }
+    })
+
+    await assert.rejects(
+      service.createCheckout(request({
+        items: [{ productId: productA, quantity: 2 }]
+      }), { now: fixedNow }),
+      (error) => error.code === 'ORIGINAL_RESERVATION_INTEGRITY_CONFLICT'
+    )
+    assert.equal(state.aborted, 1)
+    assert.equal(state.orders.size, 0)
+    assert.equal(state.items.size, 0)
+    assert.equal(state.payments.size, 0)
+  })
+
+  it('rejects a ProductUnit repeated across OrderItem ledgers', async () => {
+    const { service, state } = makeHarness({
+      reservationUnitsTransform(units, input, currentState) {
+        if (input.productId === productB) units[0]._id = currentState.reservations[0].units[0]._id
+        return units
+      }
+    })
+
+    await assert.rejects(
+      service.createCheckout(request({
+        items: [
+          { productId: productA, quantity: 1 },
+          { productId: productB, quantity: 1 }
+        ]
+      }), { now: fixedNow }),
+      (error) => error.code === 'ORIGINAL_RESERVATION_INTEGRITY_CONFLICT'
+    )
+    assert.equal(state.aborted, 1)
+    assert.equal(state.items.size, 0)
+  })
+
+  it('rejects a ledger whose unit count differs from OrderItem quantity', async () => {
+    const { service, state } = makeHarness({
+      reservationUnitsTransform(units) {
+        return units.slice(0, 1)
+      }
+    })
+
+    await assert.rejects(
+      service.createCheckout(request({
+        items: [{ productId: productA, quantity: 2 }]
+      }), { now: fixedNow }),
+      (error) => error.code === 'ORIGINAL_RESERVATION_INTEGRITY_CONFLICT'
+    )
+    assert.equal(state.aborted, 1)
+    assert.equal(state.items.size, 0)
+  })
+
+  it('rejects a reserved unit that belongs to another product', async () => {
+    const { service, state } = makeHarness({
+      reservationUnitsTransform(units) {
+        units[0].productId = productB
+        return units
+      }
+    })
+
+    await assert.rejects(
+      service.createCheckout(request(), { now: fixedNow }),
+      (error) => error.code === 'ORIGINAL_RESERVATION_INTEGRITY_CONFLICT'
+    )
+    assert.equal(state.aborted, 1)
+  })
+
+  for (const referenceField of ['orderId', 'orderItemId', 'reservedByOrderId']) {
+    it(`rejects a reserved unit with a mismatched ${referenceField}`, async () => {
+      const { service, state } = makeHarness({
+        reservationUnitsTransform(units) {
+          units[0][referenceField] = new mongoose.Types.ObjectId()
+          return units
+        }
+      })
+
+      await assert.rejects(
+        service.createCheckout(request(), { now: fixedNow }),
+        (error) => error.code === 'ORIGINAL_RESERVATION_INTEGRITY_CONFLICT'
+      )
+      assert.equal(state.aborted, 1)
+      assert.equal(state.payments.size, 0)
+    })
+  }
+
+  it('rejects a unit that is no longer reserved', async () => {
+    const { service, state } = makeHarness({
+      reservationUnitsTransform(units) {
+        units[0].status = 'available'
+        return units
+      }
+    })
+
+    await assert.rejects(
+      service.createCheckout(request(), { now: fixedNow }),
+      (error) => error.code === 'ORIGINAL_RESERVATION_INTEGRITY_CONFLICT'
+    )
+    assert.equal(state.aborted, 1)
+  })
+
+  for (const mutation of [
+    { title: 'deleted', apply: (unit) => { unit.isDeleted = true } },
+    { title: 'soldByOrderId', apply: (unit) => { unit.soldByOrderId = new mongoose.Types.ObjectId() } },
+    { title: 'soldAt', apply: (unit) => { unit.soldAt = fixedNow } }
+  ]) {
+    it(`rejects a reserved unit marked ${mutation.title}`, async () => {
+      const { service, state } = makeHarness({
+        reservationUnitsTransform(units) {
+          mutation.apply(units[0])
+          return units
+        }
+      })
+
+      await assert.rejects(
+        service.createCheckout(request(), { now: fixedNow }),
+        (error) => error.code === 'ORIGINAL_RESERVATION_INTEGRITY_CONFLICT'
+      )
+      assert.equal(state.aborted, 1)
+    })
+  }
+
+  it('rolls back Order, items, reservations, stock work and Payment on ledger CAS failure', async () => {
+    const { service, state } = makeHarness({ captureConflictProductId: productA })
+
+    await assert.rejects(
+      service.createCheckout(request(), { now: fixedNow }),
+      (error) => error.code === 'ORIGINAL_RESERVATION_CAPTURE_CONFLICT'
+    )
+    assert.equal(state.aborted, 1)
+    assert.equal(state.orders.size, 0)
+    assert.equal(state.items.size, 0)
+    assert.equal(state.reservations.length, 0)
+    assert.equal(state.payments.size, 0)
+    assert.equal(state.paymentCalls.length, 0)
+  })
+
+  it('rolls back Order, items, ledgers, reservations, stock and Payment when Payment creation fails', async () => {
+    const paymentError = new ServiceError(
+      'Fallo simulado al crear Payment',
+      'PAYMENT_CREATE_FAILED',
+      500
+    )
+    const { service, state } = makeHarness({ paymentError })
+    const initialStocks = new Map(state.productStocks)
+
+    await assert.rejects(
+      service.createCheckout(request({
+        items: [
+          { productId: productA, quantity: 2 },
+          { productId: productB, quantity: 1 }
+        ]
+      }), { now: fixedNow }),
+      (error) => error === paymentError
+    )
+
+    assert.equal(state.events.filter((event) => event === 'ledger:capture').length, 2)
+    assert.equal(state.events.at(-1), 'transaction:abort')
+    assert.equal(state.aborted, 1)
+    assert.equal(state.orders.size, 0)
+    assert.equal(state.items.size, 0)
+    assert.equal(state.reservations.length, 0)
+    assert.deepEqual(state.productStocks, initialStocks)
+    assert.equal(state.payments.size, 0)
+    assert.equal(state.paymentCalls.length, 1)
+  })
+
   it('shares exactly one reservation expiration across Order and all units', async () => {
     const { service, state } = makeHarness()
     const result = await service.createCheckout(request({
@@ -638,8 +941,29 @@ describe('CheckoutService transactional orchestration (isolated unit tests)', ()
   it('does not reserve again on an idempotent retry', async () => {
     const { service, state } = makeHarness()
     await service.createCheckout(request(), { now: fixedNow })
+    const originalLedger = JSON.stringify([...state.items.values()][0][0].originalReservation)
     await service.createCheckout(request(), { now: fixedNow })
     assert.equal(state.reservations.length, 1)
+    assert.equal(state.captureCalls.length, 1)
+    assert.equal(
+      JSON.stringify([...state.items.values()][0][0].originalReservation),
+      originalLedger
+    )
+  })
+
+  it('does not expose the original reservation ledger in the checkout response', async () => {
+    const { service, state } = makeHarness()
+    const result = await service.createCheckout(request(), { now: fixedNow })
+    const storedItem = [...state.items.values()][0][0]
+    const serialized = JSON.stringify(result)
+
+    assert.ok(storedItem.originalReservation)
+    assert.equal(serialized.includes('originalReservation'), false)
+    assert.equal(serialized.includes(storedItem.originalReservation.units[0].serial), false)
+    assert.equal(
+      serialized.includes(String(storedItem.originalReservation.units[0].productUnitId)),
+      false
+    )
   })
 
   it('does not create another Payment on an idempotent retry', async () => {

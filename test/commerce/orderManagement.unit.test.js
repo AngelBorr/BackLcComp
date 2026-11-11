@@ -105,6 +105,7 @@ const soldUnit = {
 
 const makeQueryHarness = ({
   order = makeOrder(),
+  orderItems = [item],
   units = [soldUnit],
   resolutions = [],
   refunds = []
@@ -131,7 +132,7 @@ const makeQueryHarness = ({
       }
     },
     orderItemManager: {
-      async getByOrderId() { return [item] }
+      async getByOrderId() { return orderItems }
     },
     paymentManager: {
       async getLatestByOrderId() { return payment }
@@ -280,6 +281,28 @@ describe('Order customer queries (isolated)', () => {
       'ORD-ALLOWED-ADMIN',
       'PAY-ALLOWED-ADMIN'
     ]) assert.equal(serialized.includes(forbidden), false)
+  })
+
+  it('does not expose the internal original reservation ledger to buyer read-models', async () => {
+    const originalUnitId = '507f1f77bcf86cd799439077'
+    const { service } = makeQueryHarness({
+      orderItems: [{
+        ...item,
+        originalReservation: {
+          capturedAt: createdAt,
+          units: [{ productUnitId: originalUnitId, serial: 'SERIAL-INTERNAL-LEDGER' }]
+        }
+      }],
+      units: []
+    })
+
+    const detail = await service.getCustomerOrder({ orderNumber, userId })
+    const list = await service.listCustomerOrders({ userId })
+    const serialized = JSON.stringify({ detail, list })
+
+    assert.equal(serialized.includes('originalReservation'), false)
+    assert.equal(serialized.includes(originalUnitId), false)
+    assert.equal(serialized.includes('SERIAL-INTERNAL-LEDGER'), false)
   })
 
   for (const [orderStatus, expected] of [

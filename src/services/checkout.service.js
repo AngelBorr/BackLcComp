@@ -32,6 +32,8 @@ const dateToIsoString = (value) => {
   return Number.isNaN(date.getTime()) ? null : date.toISOString()
 }
 
+const idEquals = (left, right) => String(left ?? '') === String(right ?? '')
+
 class CheckoutService {
   constructor({
     mongooseInstance = mongoose,
@@ -192,6 +194,86 @@ class CheckoutService {
         'CHECKOUT_IDEMPOTENCY_CONFLICT',
         409
       )
+    }
+  }
+
+  #buildOriginalReservation({ order, item, reservationResult, capturedUnitIds }) {
+    const units = reservationResult?.units
+    const expectedQuantity = Number(item.quantity)
+
+    if (
+      !Array.isArray(units) ||
+      units.length !== expectedQuantity ||
+      reservationResult?.reservedCount !== expectedQuantity
+    ) {
+      throw new ServiceError(
+        'La reserva original no coincide con la cantidad del item',
+        'ORIGINAL_RESERVATION_INTEGRITY_CONFLICT',
+        409
+      )
+    }
+
+    const capturedAt = new Date(reservationResult.reservedAt)
+
+    if (Number.isNaN(capturedAt.getTime())) {
+      throw new ServiceError(
+        'La reserva original no tiene una fecha de captura valida',
+        'ORIGINAL_RESERVATION_INTEGRITY_CONFLICT',
+        409
+      )
+    }
+
+    const normalizedUnits = units.map((unit) => {
+      const productUnitId = unit?._id
+      const serial = typeof unit?.serialNumber === 'string'
+        ? unit.serialNumber.trim()
+        : ''
+      const unitId = String(productUnitId ?? '')
+      const validUnit =
+        mongoose.Types.ObjectId.isValid(productUnitId) &&
+        serial.length > 0 &&
+        unit.status === 'reserved' &&
+        unit.isDeleted === false &&
+        idEquals(unit.productId, item.productId) &&
+        idEquals(unit.orderId, order._id) &&
+        idEquals(unit.orderItemId, item._id) &&
+        idEquals(unit.reservedByOrderId, order._id) &&
+        unit.soldByOrderId == null &&
+        unit.soldAt == null &&
+        !capturedUnitIds.has(unitId)
+
+      if (!validUnit) {
+        throw new ServiceError(
+          'Las unidades reservadas no coinciden con el item de la orden',
+          'ORIGINAL_RESERVATION_INTEGRITY_CONFLICT',
+          409
+        )
+      }
+
+      capturedUnitIds.add(unitId)
+
+      const createdAt = new Date(unit.createdAt)
+
+      return {
+        productUnitId,
+        serial,
+        createdAt: Number.isNaN(createdAt.getTime()) ? null : createdAt
+      }
+    })
+
+    normalizedUnits.sort((left, right) => {
+      const leftCreatedAt = left.createdAt?.getTime() ?? Number.MAX_SAFE_INTEGER
+      const rightCreatedAt = right.createdAt?.getTime() ?? Number.MAX_SAFE_INTEGER
+      return leftCreatedAt - rightCreatedAt ||
+        String(left.productUnitId).localeCompare(String(right.productUnitId))
+    })
+
+    return {
+      capturedAt,
+      units: normalizedUnits.map(({ productUnitId, serial }) => ({
+        productUnitId,
+        serial
+      }))
     }
   }
 
@@ -371,8 +453,10 @@ class CheckoutService {
           { session, now: reservationCreatedAt }
         )
 
+        const capturedUnitIds = new Set()
+
         for (const item of created.items) {
-          await this.productUnits.reserveAvailableUnits(
+          const reservationResult = await this.productUnits.reserveAvailableUnits(
             {
               productId: item.productId,
               quantity: item.quantity,
@@ -382,6 +466,31 @@ class CheckoutService {
             },
             { session }
           )
+
+          const originalReservation = this.#buildOriginalReservation({
+            order: created.order,
+            item,
+            reservationResult,
+            capturedUnitIds
+          })
+          const captureResult = await this.orderItems.captureOriginalReservation(
+            {
+              orderItemId: item._id,
+              orderId: created.order._id,
+              productId: item.productId,
+              quantity: item.quantity,
+              originalReservation
+            },
+            { session }
+          )
+
+          if (captureResult?.modifiedCount !== 1) {
+            throw new ServiceError(
+              'No se pudo capturar la reserva original del item',
+              'ORIGINAL_RESERVATION_CAPTURE_CONFLICT',
+              409
+            )
+          }
         }
 
         const payment = await this.paymentService.createPayment(

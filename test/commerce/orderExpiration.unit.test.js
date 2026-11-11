@@ -928,10 +928,15 @@ describe('P1B.3a ProductUnit release primitive', () => {
   })
 
   it('uses exact reservation ownership, deterministic product guards and one recalc per product', async () => {
+    const originalReservation = {
+      capturedAt: new Date('2026-10-01T10:00:00.000Z'),
+      units: [{ productUnitId: ids.unit, serial: 'SERIAL-ORIGINAL-1' }]
+    }
     const orderItems = [
-      { _id: ids.item, productId: ids.product, quantity: 1 },
+      { _id: ids.item, productId: ids.product, quantity: 1, originalReservation },
       { _id: ids.item2, productId: ids.product2, quantity: 1 }
     ]
+    const ledgerBeforeRelease = JSON.stringify(originalReservation)
     const units = [
       { ...baseState().units[0] },
       {
@@ -973,6 +978,7 @@ describe('P1B.3a ProductUnit release primitive', () => {
     assert.equal(releaseInput.orderId, ids.order)
     assert.deepEqual(releaseInput.units.map((unit) => unit._id), [ids.unit, ids.unit2])
     assert.equal(releaseInput.expirationLimit.getTime(), now.getTime())
+    assert.equal(JSON.stringify(orderItems[0].originalReservation), ledgerBeforeRelease)
   })
 
   it('returns an integrity failure before writing when a unit is missing', async () => {

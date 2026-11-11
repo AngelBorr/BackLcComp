@@ -15,8 +15,7 @@ const productUnitSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
-      uppercase: true,
-      index: true
+      uppercase: true
     },
 
     status: {
@@ -121,6 +120,7 @@ const productUnitSchema = new mongoose.Schema(
 productUnitSchema.index(
   { serialNumber: 1 },
   {
+    name: 'uniq_active_serial_number',
     unique: true,
     partialFilterExpression: { isDeleted: false }
   }

@@ -12,7 +12,8 @@
     "dev:server": "node --watch ./src/app.js",
     "dev:windows": "start \"Tailwind\" npm run dev:css && start \"Server\" npm run dev:server",
     "build:css": "tailwindcss -i ./src/public/css/input.css -o ./src/public/output.css --minify",
-    "test": "dotenv -e .env.test -- mocha --timeout 10000 --require test/mochaHooks.js \"test/**/*.test.js\""
+    "test": "dotenv -e .env.test -- mocha --timeout 10000 --require test/mochaHooks.js \"test/**/*.test.js\"",
+    "test:integration:mongo": "node ./test/integration/runMongoIntegration.js"
   },
   "author": "angel borrego",
   "license": "ISC",
@@ -44,6 +45,7 @@
     "chai": "^6.2.1",
     "dotenv-cli": "^11.0.0",
     "mocha": "^11.7.5",
+    "mongodb-memory-server-core": "11.3.0",
     "standard": "^17.1.2",
     "supertest": "^7.1.4",
     "typescript": "^4.9.5"

@@ -1298,12 +1298,17 @@ describe('ProductUnit internal reserved-to-sold gate (isolated)', () => {
   })
 
   it('requires approved Mercado Pago Payment and sells the exact expected units', async () => {
+    const originalReservation = {
+      capturedAt: new Date('2026-09-29T12:00:00.000Z'),
+      units: [{ productUnitId: unitId, serial: 'SERIAL-ORIGINAL-SOLD' }]
+    }
+    const ledgerBeforeSale = JSON.stringify(originalReservation)
     stub(PaymentManager, 'getById', async () => ({
       _id: paymentId, orderId, provider: 'mercado_pago', normalizedStatus: 'approved'
     }))
     stub(OrderManager, 'getById', async () => ({ _id: orderId, status: 'pending_payment' }))
     stub(OrderItemManager, 'getByOrderId', async () => ([{
-      _id: orderItemId, orderId, productId, quantity: 1
+      _id: orderItemId, orderId, productId, quantity: 1, originalReservation
     }]))
     stub(ProductUnitManager, 'findReservedUnitsByOrder', async () => ([{
       _id: unitId, productId, orderId, orderItemId,
@@ -1317,6 +1322,7 @@ describe('ProductUnit internal reserved-to-sold gate (isolated)', () => {
     )
     assert.equal(result.soldCount, 1)
     assert.deepEqual(result.soldAt, now)
+    assert.equal(JSON.stringify(originalReservation), ledgerBeforeSale)
   })
 
   it('rejects reserved-to-sold when Payment is not approved', async () => {

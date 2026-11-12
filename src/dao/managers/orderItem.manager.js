@@ -38,7 +38,15 @@ class OrderItemManager {
   }
 
   async getByOrderId(orderId, { session } = {}) {
-    const query = OrderItemModel.find({ orderId }).sort({ createdAt: 1 }).lean()
+    const query = OrderItemModel.find({ orderId }).sort({ createdAt: 1, _id: 1 }).lean()
+    if (session) query.session(session)
+    return query
+  }
+
+  async getByIds(orderItemIds, { session } = {}) {
+    const query = OrderItemModel.find({
+      _id: { $in: orderItemIds }
+    }).lean()
     if (session) query.session(session)
     return query
   }

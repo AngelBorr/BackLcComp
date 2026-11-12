@@ -353,6 +353,16 @@ class ProductUnitManager {
 
     return query
   }
+
+  async getByIdsIncludingDeleted(unitIds, { session } = {}) {
+    const query = ProductUnitModel.find({
+      _id: { $in: unitIds }
+    }).lean()
+
+    if (session) query.session(session)
+
+    return query
+  }
 }
 
 export default new ProductUnitManager()

@@ -146,6 +146,38 @@ class ProductUnitManager {
     return query
   }
 
+  async findAvailableRepairCandidates(
+    { productId, excludeIds = [], limit },
+    { session } = {}
+  ) {
+    const explicitNull = () => ({ $exists: true, $eq: null })
+    const filter = {
+      productId,
+      status: 'available',
+      isDeleted: false,
+      serialNumber: { $type: 'string', $regex: /\S/ },
+      orderId: explicitNull(),
+      orderItemId: explicitNull(),
+      reservedByOrderId: explicitNull(),
+      reservedAt: explicitNull(),
+      reservationExpiresAt: explicitNull(),
+      soldByOrderId: explicitNull(),
+      soldAt: explicitNull(),
+      createdAt: { $type: 'date' }
+    }
+
+    if (excludeIds.length) filter._id = { $nin: excludeIds }
+
+    const query = ProductUnitModel.find(filter)
+      .sort({ createdAt: 1, _id: 1 })
+      .limit(limit)
+      .lean()
+
+    if (session) query.session(session)
+
+    return query
+  }
+
   async reserveAvailableUnits(
     { unitIds, orderId, orderItemId, reservedAt, reservationExpiresAt },
     { session } = {}

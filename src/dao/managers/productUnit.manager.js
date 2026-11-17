@@ -1,5 +1,37 @@
 import ProductUnitModel from '../models/productUnit.model.js'
 
+const inventoryRepairManagerError = (message, code, status) => {
+  const error = new Error(message)
+  error.name = 'ProductUnitManagerError'
+  error.code = code
+  error.status = status
+  error.statusCode = status
+  return error
+}
+
+const assertActiveInventoryRepairTransaction = (session) => {
+  let isActive = false
+
+  try {
+    isActive = Boolean(
+      session &&
+      !session.hasEnded &&
+      typeof session.inTransaction === 'function' &&
+      session.inTransaction()
+    )
+  } catch {
+    isActive = false
+  }
+
+  if (!isActive) {
+    throw inventoryRepairManagerError(
+      'La reparacion de inventario requiere una transaccion activa',
+      'INVENTORY_REPAIR_TRANSACTION_REQUIRED',
+      500
+    )
+  }
+}
+
 class ProductUnitManager {
   async create(data, { session } = {}) {
     const unit = new ProductUnitModel(data)
@@ -176,6 +208,104 @@ class ProductUnitManager {
     if (session) query.session(session)
 
     return query
+  }
+
+  async markExactAvailableUnitsSoldForRepair(
+    {
+      unitIds,
+      orderId,
+      orderItemId,
+      productId,
+      repairAt,
+      reservationExpiresAt
+    },
+    { session } = {}
+  ) {
+    assertActiveInventoryRepairTransaction(session)
+    const explicitNull = () => ({ $exists: true, $eq: null })
+
+    return ProductUnitModel.updateMany(
+      {
+        _id: { $in: unitIds },
+        productId,
+        status: 'available',
+        isDeleted: false,
+        orderId: explicitNull(),
+        orderItemId: explicitNull(),
+        reservedByOrderId: explicitNull(),
+        reservedAt: explicitNull(),
+        reservationExpiresAt: explicitNull(),
+        soldByOrderId: explicitNull(),
+        soldAt: explicitNull()
+      },
+      {
+        $set: {
+          status: 'sold',
+          orderId,
+          orderItemId,
+          reservedByOrderId: orderId,
+          reservedAt: repairAt,
+          reservationExpiresAt,
+          soldByOrderId: orderId,
+          soldAt: repairAt
+        }
+      },
+      { session }
+    )
+  }
+
+  async markExactReservedUnitsSoldForRepair(
+    { units, orderId, orderItemId, productId, repairAt },
+    { session } = {}
+  ) {
+    assertActiveInventoryRepairTransaction(session)
+    const explicitNull = () => ({ $exists: true, $eq: null })
+    const operations = units.map((unit) => ({
+      updateOne: {
+        filter: {
+          _id: unit.productUnitId,
+          productId,
+          status: 'reserved',
+          isDeleted: false,
+          orderId,
+          orderItemId,
+          reservedByOrderId: orderId,
+          reservedAt: unit.reservedAt,
+          reservationExpiresAt: unit.reservationExpiresAt,
+          soldByOrderId: explicitNull(),
+          soldAt: explicitNull()
+        },
+        update: {
+          $set: {
+            status: 'sold',
+            soldByOrderId: orderId,
+            soldAt: repairAt
+          }
+        }
+      }
+    }))
+
+    if (!operations.length) return { matchedCount: 0, modifiedCount: 0 }
+
+    return ProductUnitModel.bulkWrite(operations, { ordered: true, session })
+  }
+
+  async getSoldUnitsForOrderItem(
+    { orderId, orderItemId, productId },
+    { session } = {}
+  ) {
+    assertActiveInventoryRepairTransaction(session)
+    return ProductUnitModel.find({
+      orderId,
+      orderItemId,
+      productId,
+      status: 'sold',
+      isDeleted: false,
+      soldByOrderId: orderId
+    })
+      .sort({ _id: 1 })
+      .session(session)
+      .lean()
   }
 
   async reserveAvailableUnits(

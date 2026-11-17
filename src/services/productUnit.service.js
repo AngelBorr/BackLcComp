@@ -12,6 +12,23 @@ const TRANSACTION_OPTIONS = {
   readConcern: { level: 'snapshot' },
   writeConcern: { w: 'majority' }
 }
+const EXACT_OBJECT_ID_PATTERN = /^[a-f0-9]{24}$/i
+
+const normalizeExactObjectId = (value) => {
+  if (typeof value === 'string') {
+    const id = value.trim()
+    return EXACT_OBJECT_ID_PATTERN.test(id) ? id.toLowerCase() : null
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+
+  try {
+    if (typeof value.toHexString !== 'function') return null
+    const id = value.toHexString().trim()
+    return EXACT_OBJECT_ID_PATTERN.test(id) ? id.toLowerCase() : null
+  } catch {
+    return null
+  }
+}
 
 class ProductUnitService {
   #assertActiveExternalSession(session) {
@@ -74,6 +91,52 @@ class ProductUnitService {
       409,
       { inventoryMode: getEffectiveInventoryMode(existingProduct) }
     )
+  }
+
+  async acquireInventoryRepairGuards(productIds, { session } = {}) {
+    if (!session) {
+      throw new ServiceError(
+        'La reparacion de inventario requiere una transaccion activa',
+        'INVENTORY_REPAIR_TRANSACTION_REQUIRED',
+        500
+      )
+    }
+
+    this.#assertActiveExternalSession(session)
+
+    if (!Array.isArray(productIds)) {
+      throw new ServiceError(
+        'Los productos de la reparacion son invalidos',
+        'INVALID_INVENTORY_REPAIR_GUARD_INPUT',
+        400
+      )
+    }
+
+    const normalizedProductIds = []
+    const seen = new Set()
+
+    for (const productId of productIds) {
+      const normalized = normalizeExactObjectId(productId)
+      if (!normalized) {
+        throw new ServiceError(
+          'La reparacion contiene un producto invalido',
+          'INVALID_INVENTORY_REPAIR_GUARD_INPUT',
+          400
+        )
+      }
+
+      if (seen.has(normalized)) continue
+      seen.add(normalized)
+      normalizedProductIds.push(normalized)
+    }
+
+    normalizedProductIds.sort()
+
+    for (const productId of normalizedProductIds) {
+      await this.#acquireProductInventoryGuard(productId, ['serialized'], session)
+    }
+
+    return normalizedProductIds
   }
 
   #isDuplicateKeyError(error) {

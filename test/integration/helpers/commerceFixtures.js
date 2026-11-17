@@ -199,6 +199,87 @@ export const createBareOrderWithItem = async (
   return { order, item }
 }
 
+export const createBareOrderItem = async (
+  {
+    order,
+    product,
+    quantity = 1,
+    orderItemId = new mongoose.Types.ObjectId()
+  },
+  { session } = {}
+) => {
+  const item = new OrderItemModel({
+    _id: orderItemId,
+    orderId: order._id,
+    productId: product._id,
+    productSnapshot: {
+      name: product.prodName,
+      brand: product.prodMarca,
+      category: product.prodCategoria
+    },
+    quantity,
+    priceType: 'retail',
+    currency: 'USD',
+    vatRate: '0.21',
+    unitPriceUsd: '100.00',
+    netUnitPriceUsd: '82.64',
+    vatAmountPerUnitUsd: '17.36',
+    lineNetUsd: String(82.64 * quantity),
+    lineVatUsd: String(17.36 * quantity),
+    totalUsd: String(100 * quantity)
+  })
+  return item.save({ session })
+}
+
+export const captureSyntheticOriginalReservation = async (
+  { item, units, capturedAt = new Date('2026-11-10T15:30:00.000Z') },
+  { session } = {}
+) => {
+  item.originalReservation = {
+    capturedAt,
+    units: units.map((unit) => ({
+      productUnitId: unit._id,
+      serial: unit.serialNumber
+    }))
+  }
+  return item.save({ session })
+}
+
+export const markSyntheticOrderRequiresInventoryAttention = async (
+  { order, attentionReason = 'RESERVATION_QUANTITY_MISMATCH' },
+  { session } = {}
+) => {
+  order.status = 'requires_attention'
+  order.attentionReason = attentionReason
+  return order.save({ session })
+}
+
+export const createSyntheticApprovedPayment = async (
+  {
+    order,
+    approvedAt = new Date('2026-11-10T16:00:00.000Z'),
+    paymentOverrides = {}
+  },
+  { session } = {}
+) => {
+  const token = uniqueToken('payment')
+  const payment = new PaymentModel({
+    orderId: order._id,
+    provider: 'mercado_pago',
+    providerOrderId: `ORDER-${token}`,
+    providerPaymentId: `PAY-${token}`,
+    externalReference: order.orderNumber,
+    normalizedStatus: 'approved',
+    providerStatus: 'processed',
+    providerStatusDetail: 'accredited',
+    amountArs: order.totals.totalArs.toString(),
+    currency: 'ARS',
+    approvedAt,
+    ...paymentOverrides
+  })
+  return payment.save({ session })
+}
+
 export const buildOriginalReservation = (reservationResult) => ({
   capturedAt: new Date(reservationResult.reservedAt),
   units: reservationResult.units.map((unit) => ({

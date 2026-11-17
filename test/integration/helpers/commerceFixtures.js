@@ -120,11 +120,15 @@ export const createSyntheticCommerceContext = async ({ unitCount = 1 } = {}) => 
   return { buyer, product, units }
 }
 
-export const createCheckoutService = ({ paymentService = PaymentService } = {}) =>
+export const createCheckoutService = ({
+  paymentService = PaymentService,
+  productUnitService = ProductUnitService
+} = {}) =>
   new CheckoutService({
     exchangeRateService,
     checkoutFinancialGuardService: financialGuard,
-    paymentService
+    paymentService,
+    productUnitService
   })
 
 export const createCheckoutInput = (context, { quantity = 1 } = {}) => ({

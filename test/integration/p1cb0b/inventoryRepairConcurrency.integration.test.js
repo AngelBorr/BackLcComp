@@ -554,7 +554,133 @@ describe('P1C-B0B F2D-B real Mongo inventory repair concurrency', function () {
     await assertStock(context.product._id, 1)
   })
 
-  it('keeps repair ownership when checkout loses and documents current checkout error wrapping', async function () {
+  it('retries the complete checkout and reserves U2 after repair commits U1', async function () {
+    const repairBuyer = await fixtures.createSyntheticBuyer()
+    const inventory = await fixtures.createSerializedInventory({ buyerId: repairBuyer._id, unitCount: 2 })
+    const repairCase = await createApprovedCase({
+      buyer: repairBuyer,
+      product: inventory.product,
+      ledgerUnits: [inventory.units[0]]
+    })
+    const repairLedger = fixtures.canonicalLedger(repairCase.item.originalReservation)
+    const checkoutBuyer = await fixtures.createSyntheticBuyer()
+    const repairSession = await harness.startSession()
+    repairSession.startTransaction(fixtures.transactionOptions)
+    const preparedRepair = await prepareRepair({
+      orderId: repairCase.order._id,
+      paymentId: repairCase.payment._id,
+      session: repairSession,
+      repairAt: repairAtA
+    })
+    const snapshotReady = deferred()
+    const releaseCheckout = deferred()
+    let wrapperCalls = 0
+    let callbackAttempts = 0
+    let rawMongoError
+    const observedUnitIds = []
+    const reservationInputs = []
+    const originalManagerReserve = fixtures.ProductUnitManager.reserveAvailableUnits
+
+    const checkoutProductUnitService = {
+      async reserveAvailableUnits (input, { session }) {
+        wrapperCalls += 1
+        reservationInputs.push({ ...input })
+        const observed = await fixtures.ProductUnitManager.findAvailableUnits(
+          input.productId,
+          input.quantity,
+          { session }
+        )
+        observedUnitIds.push(observed.map((unit) => asId(unit._id)))
+
+        if (wrapperCalls === 1) {
+          assert.deepEqual(observedUnitIds[0], [asId(inventory.units[0]._id)])
+          snapshotReady.resolve()
+          await releaseCheckout.promise
+        }
+
+        return fixtures.ProductUnitService.reserveAvailableUnits(input, { session })
+      }
+    }
+
+    fixtures.ProductUnitManager.reserveAvailableUnits = async function (...args) {
+      try {
+        return await originalManagerReserve.apply(fixtures.ProductUnitManager, args)
+      } catch (error) {
+        rawMongoError = error
+        throw error
+      }
+    }
+
+    const checkoutService = fixtures.createCheckoutService({
+      productUnitService: checkoutProductUnitService
+    })
+    const baseFinancialGuard = checkoutService.financialGuard
+    checkoutService.financialGuard = {
+      async assertCanCreateCheckout (requestedUserId, options) {
+        if (options?.session) callbackAttempts += 1
+        return baseFinancialGuard.assertCanCreateCheckout(requestedUserId, options)
+      },
+      async assertCanContinueCheckout (...args) {
+        return baseFinancialGuard.assertCanContinueCheckout(...args)
+      }
+    }
+    const checkoutInput = fixtures.createCheckoutInput({
+      buyer: checkoutBuyer,
+      product: inventory.product
+    })
+    const checkoutParticipant = checkoutService.createCheckout(checkoutInput)
+    let checkoutResult
+
+    try {
+      await observeOrFail(snapshotReady, checkoutParticipant, 'checkout')
+      await writerService.writeRepair(preparedRepair.input, { session: repairSession })
+      await repairSession.commitTransaction()
+      releaseCheckout.resolve()
+      checkoutResult = await checkoutParticipant
+    } finally {
+      fixtures.ProductUnitManager.reserveAvailableUnits = originalManagerReserve
+      releaseCheckout.reject(new Error('test cleanup'))
+      snapshotReady.reject(new Error('test cleanup'))
+      await checkoutParticipant.catch(() => {})
+      await abortAndEnd(repairSession)
+    }
+
+    assert.equal(callbackAttempts, 2)
+    assert.equal(wrapperCalls, 2)
+    assertTransient(rawMongoError)
+    assert.deepEqual(observedUnitIds, [
+      [asId(inventory.units[0]._id)],
+      [asId(inventory.units[1]._id)]
+    ])
+    assert.notEqual(asId(reservationInputs[0].orderId), asId(reservationInputs[1].orderId))
+    assert.notEqual(asId(reservationInputs[0].orderItemId), asId(reservationInputs[1].orderItemId))
+
+    const checkoutOrders = await fixtures.OrderModel.find({ userId: checkoutBuyer._id }).lean()
+    assert.equal(checkoutOrders.length, 1)
+    const [u1, u2, checkoutItems, checkoutPayments, repairItem, abortedOrder, abortedItem] = await Promise.all([
+      fixtures.ProductUnitModel.findById(inventory.units[0]._id).lean(),
+      fixtures.ProductUnitModel.findById(inventory.units[1]._id).lean(),
+      fixtures.OrderItemModel.find({ orderId: checkoutOrders[0]._id }).lean(),
+      fixtures.PaymentModel.find({ orderId: checkoutOrders[0]._id }).lean(),
+      fixtures.OrderItemModel.findById(repairCase.item._id).lean(),
+      fixtures.OrderModel.findById(reservationInputs[0].orderId).lean(),
+      fixtures.OrderItemModel.findById(reservationInputs[0].orderItemId).lean()
+    ])
+    assertSoldOwnership(u1, repairCase, repairAtA)
+    assert.equal(checkoutItems.length, 1)
+    assert.equal(checkoutPayments.length, 1)
+    assertReservedOwnership(u2, checkoutResult, checkoutItems[0])
+    assert.deepEqual(
+      checkoutItems[0].originalReservation.units.map((entry) => asId(entry.productUnitId)),
+      [asId(inventory.units[1]._id)]
+    )
+    assert.deepEqual(fixtures.canonicalLedger(repairItem.originalReservation), repairLedger)
+    assert.equal(abortedOrder, null)
+    assert.equal(abortedItem, null)
+    await assertStock(inventory.product._id, 0)
+  })
+
+  it('retries the complete checkout and returns OUT_OF_STOCK when repair consumes the only unit', async function () {
     const repairBuyer = await fixtures.createSyntheticBuyer()
     const inventory = await fixtures.createSerializedInventory({ buyerId: repairBuyer._id, unitCount: 1 })
     const repairCase = await createApprovedCase({
@@ -574,12 +700,15 @@ describe('P1C-B0B F2D-B real Mongo inventory repair concurrency', function () {
     const snapshotReady = deferred()
     const releaseCheckout = deferred()
     let wrapperCalls = 0
+    let callbackAttempts = 0
     let rawMongoError
+    let firstAttemptInput
     const originalManagerReserve = fixtures.ProductUnitManager.reserveAvailableUnits
 
     const checkoutProductUnitService = {
       async reserveAvailableUnits (input, { session }) {
         wrapperCalls += 1
+        firstAttemptInput = { ...input }
         const observed = await fixtures.ProductUnitManager.findAvailableUnits(
           input.productId,
           input.quantity,
@@ -604,11 +733,19 @@ describe('P1C-B0B F2D-B real Mongo inventory repair concurrency', function () {
     const checkoutService = fixtures.createCheckoutService({
       productUnitService: checkoutProductUnitService
     })
-    const checkoutInput = fixtures.createCheckoutInput({
-      buyer: checkoutBuyer,
-      product: inventory.product
-    })
-    const checkoutParticipant = checkoutService.createCheckout(checkoutInput)
+    const baseFinancialGuard = checkoutService.financialGuard
+    checkoutService.financialGuard = {
+      async assertCanCreateCheckout (requestedUserId, options) {
+        if (options?.session) callbackAttempts += 1
+        return baseFinancialGuard.assertCanCreateCheckout(requestedUserId, options)
+      },
+      async assertCanContinueCheckout (...args) {
+        return baseFinancialGuard.assertCanContinueCheckout(...args)
+      }
+    }
+    const checkoutParticipant = checkoutService.createCheckout(
+      fixtures.createCheckoutInput({ buyer: checkoutBuyer, product: inventory.product })
+    )
     let checkoutError
 
     try {
@@ -618,7 +755,7 @@ describe('P1C-B0B F2D-B real Mongo inventory repair concurrency', function () {
       releaseCheckout.resolve()
       try {
         await checkoutParticipant
-        assert.fail('checkout unexpectedly committed stale availability')
+        assert.fail('checkout unexpectedly succeeded without replacement stock')
       } catch (error) {
         checkoutError = error
       }
@@ -630,26 +767,26 @@ describe('P1C-B0B F2D-B real Mongo inventory repair concurrency', function () {
       await abortAndEnd(repairSession)
     }
 
+    assert.equal(callbackAttempts, 2)
     assert.equal(wrapperCalls, 1)
     assertTransient(rawMongoError)
-    assert.notEqual(checkoutError, rawMongoError)
-    assert.equal(checkoutError.code, 'RESERVE_PRODUCT_UNITS_FAILED')
-    assert.equal(checkoutError.status, 500)
-    assert.equal(checkoutError.details.cause, rawMongoError.message)
-    assert.equal(checkoutError.errorLabels, undefined)
-    assert.equal(checkoutError.hasErrorLabel, undefined)
-    assert.notEqual(checkoutError.code, rawMongoError.code)
+    assert.equal(checkoutError.code, 'OUT_OF_STOCK')
+    assert.notEqual(checkoutError.code, 'RESERVE_PRODUCT_UNITS_FAILED')
 
-    const [unit, checkoutOrders, checkoutItems, checkoutPayments] = await Promise.all([
+    const [unit, checkoutOrders, checkoutItems, checkoutPayments, abortedOrder, abortedItem] = await Promise.all([
       fixtures.ProductUnitModel.findById(inventory.units[0]._id).lean(),
       fixtures.OrderModel.find({ userId: checkoutBuyer._id }).lean(),
       fixtures.OrderItemModel.find({}).populate({ path: 'orderId', match: { userId: checkoutBuyer._id } }).lean(),
-      fixtures.PaymentModel.find({}).populate({ path: 'orderId', match: { userId: checkoutBuyer._id } }).lean()
+      fixtures.PaymentModel.find({}).populate({ path: 'orderId', match: { userId: checkoutBuyer._id } }).lean(),
+      fixtures.OrderModel.findById(firstAttemptInput.orderId).lean(),
+      fixtures.OrderItemModel.findById(firstAttemptInput.orderItemId).lean()
     ])
     assertSoldOwnership(unit, repairCase, repairAtA)
     assert.equal(checkoutOrders.length, 0)
     assert.equal(checkoutItems.filter((item) => item.orderId).length, 0)
     assert.equal(checkoutPayments.filter((payment) => payment.orderId).length, 0)
+    assert.equal(abortedOrder, null)
+    assert.equal(abortedItem, null)
     await assertStock(inventory.product._id, 0)
   })
 

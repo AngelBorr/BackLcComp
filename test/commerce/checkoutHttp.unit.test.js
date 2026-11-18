@@ -504,6 +504,40 @@ describe('POST /api/checkout HTTP orchestration (isolated unit tests)', () => {
     assert.equal(Object.hasOwn(response.body, 'stack'), false)
   })
 
+  it('does not expose exhausted Mongo transaction diagnostics in the HTTP response', async () => {
+    const mongoFailure = new ServiceError(
+      'No se pudo completar el checkout',
+      'CHECKOUT_FAILED',
+      500,
+      { cause: 'mongodb://private-host:27017 topology detail' }
+    )
+    mongoFailure.mongoCode = 112
+    mongoFailure.errorLabels = ['TransientTransactionError']
+    const app = createControllerApp({
+      user: { id: userId, role: 'USER' },
+      service: {
+        async createCheckout () {
+          throw mongoFailure
+        }
+      }
+    })
+
+    const response = await request(app)
+      .post('/api/checkout')
+      .set('Idempotency-Key', 'checkout-exhausted-transient')
+      .send(validBody())
+    const serialized = JSON.stringify(response.body)
+
+    assert.equal(response.status, 500)
+    assert.equal(response.body.message, 'No se pudo completar el checkout')
+    assert.equal(serialized.includes('112'), false)
+    assert.equal(serialized.includes('TransientTransactionError'), false)
+    assert.equal(serialized.includes('mongodb://'), false)
+    assert.equal(serialized.includes('topology detail'), false)
+    assert.equal(Object.hasOwn(response.body, 'stack'), false)
+    assert.equal(Object.hasOwn(response.body, 'details'), false)
+  })
+
   it('propagates an expired reservation without a second provider attempt', async () => {
     const expired = new ServiceError(
       'La reserva del checkout ya expiró',

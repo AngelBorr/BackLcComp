@@ -394,6 +394,13 @@ class ProductUnitService {
 
       return reservationResult
     } catch (error) {
+      if (
+        typeof error?.hasErrorLabel === 'function' &&
+        error.hasErrorLabel('TransientTransactionError')
+      ) {
+        throw error
+      }
+
       logError('❌ ProductUnitService reserveAvailableUnits error:', error)
       if (error instanceof ServiceError) throw error
 

@@ -38,6 +38,14 @@ const makeUser = (id, role = 'USER', emailVerified = true) => ({
   emailVerified
 })
 
+const makeTransientTransactionError = (message = 'simulated transient transaction failure') => {
+  const error = new Error(message)
+  error.code = 112
+  error.errorLabels = ['TransientTransactionError']
+  error.hasErrorLabel = (label) => label === 'TransientTransactionError'
+  return error
+}
+
 const makeHarness = (overrides = {}) => {
   const state = {
     events: [],
@@ -51,6 +59,11 @@ const makeHarness = (overrides = {}) => {
     userCalls: [],
     orderCalls: [],
     paymentCalls: [],
+    createdOrders: [],
+    createdItemBatches: [],
+    createdPayments: [],
+    reservationAttempts: 0,
+    transactionErrors: [],
     bnaCalls: 0,
     conversionCalls: 0,
     sessionStarts: 0,
@@ -71,29 +84,40 @@ const makeHarness = (overrides = {}) => {
     hasEnded: false,
     inTransaction: () => true,
     async withTransaction(operation, options) {
-      state.events.push('transaction:start')
       state.transactionOptions = options
-      const snapshot = {
-        orders: cloneMap(state.orders),
-        items: cloneMap(state.items),
-        payments: cloneMap(state.payments),
-        reservations: [...state.reservations],
-        productStocks: cloneMap(state.productStocks)
-      }
+      const maxAttempts = config.transactionMaxAttempts || 1
 
-      try {
-        await operation()
-        state.committed += 1
-        state.events.push('transaction:commit')
-      } catch (error) {
-        state.orders = snapshot.orders
-        state.items = snapshot.items
-        state.payments = snapshot.payments
-        state.reservations = snapshot.reservations
-        state.productStocks = snapshot.productStocks
-        state.aborted += 1
-        state.events.push('transaction:abort')
-        throw error
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        state.events.push('transaction:start')
+        const snapshot = {
+          orders: cloneMap(state.orders),
+          items: cloneMap(state.items),
+          payments: cloneMap(state.payments),
+          reservations: [...state.reservations],
+          productStocks: cloneMap(state.productStocks)
+        }
+
+        try {
+          await operation()
+          state.committed += 1
+          state.events.push('transaction:commit')
+          return
+        } catch (error) {
+          state.orders = snapshot.orders
+          state.items = snapshot.items
+          state.payments = snapshot.payments
+          state.reservations = snapshot.reservations
+          state.productStocks = snapshot.productStocks
+          state.aborted += 1
+          state.transactionErrors.push(error)
+          state.events.push('transaction:abort')
+
+          const isTransient = (
+            typeof error?.hasErrorLabel === 'function' &&
+            error.hasErrorLabel('TransientTransactionError')
+          )
+          if (!isTransient || attempt === maxAttempts) throw error
+        }
       }
     },
     async endSession() {
@@ -244,6 +268,8 @@ const makeHarness = (overrides = {}) => {
       }
       const items = authoritativeItems.map((item) => ({ ...item, orderId: order._id }))
 
+      state.createdOrders.push(order)
+      state.createdItemBatches.push(items)
       state.orders.set(`${input.userId}:${input.checkoutIdempotencyKey}`, order)
       state.items.set(String(order._id), items)
       return { order, items }
@@ -252,6 +278,15 @@ const makeHarness = (overrides = {}) => {
   const productUnitService = {
     async reserveAvailableUnits(input, options) {
       state.events.push(`reserve:${input.productId}`)
+      state.reservationAttempts += 1
+      if (typeof config.reservationErrorFactory === 'function') {
+        const reservationError = config.reservationErrorFactory({
+          attempt: state.reservationAttempts,
+          input,
+          options
+        })
+        if (reservationError) throw reservationError
+      }
       if (config.reservationFailureProductId === input.productId) {
         throw new ServiceError('Stock insuficiente', 'INSUFFICIENT_SERIALIZED_STOCK', 409)
       }
@@ -307,6 +342,7 @@ const makeHarness = (overrides = {}) => {
         preferenceId: null,
         providerPaymentId: null
       }
+      state.createdPayments.push(payment)
       state.payments.set(String(input.orderId), payment)
       return payment
     }
@@ -358,6 +394,101 @@ describe('CheckoutService transactional orchestration (isolated unit tests)', ()
 
     assert.equal(result.order.status, 'pending_payment')
     assert.equal(state.committed, 1)
+  })
+
+  it('lets withTransaction retry the complete checkout callback after the same transient error escapes', async () => {
+    const transientError = makeTransientTransactionError()
+    const { service, state } = makeHarness({
+      transactionMaxAttempts: 2,
+      reservationErrorFactory: ({ attempt }) => attempt === 1 ? transientError : null
+    })
+
+    const result = await service.createCheckout(request(), { now: fixedNow })
+
+    assert.equal(state.aborted, 1)
+    assert.equal(state.committed, 1)
+    assert.equal(state.transactionErrors.length, 1)
+    assert.equal(state.transactionErrors[0], transientError)
+    assert.equal(state.reservationAttempts, 2)
+    assert.equal(state.orderCalls.length, 2)
+    assert.equal(state.createdOrders.length, 2)
+    assert.equal(state.createdItemBatches.length, 2)
+    assert.notEqual(
+      String(state.createdOrders[0]._id),
+      String(state.createdOrders[1]._id)
+    )
+    assert.notEqual(
+      String(state.createdItemBatches[0][0]._id),
+      String(state.createdItemBatches[1][0]._id)
+    )
+    assert.equal(
+      state.orderCalls[0].input.checkoutIdempotencyKey,
+      state.orderCalls[1].input.checkoutIdempotencyKey
+    )
+    assert.equal(
+      state.orderCalls[0].input.checkoutRequestHash,
+      state.orderCalls[1].input.checkoutRequestHash
+    )
+
+    assert.equal(state.orders.size, 1)
+    assert.equal(state.items.size, 1)
+    assert.equal(state.payments.size, 1)
+    assert.equal(state.reservations.length, 1)
+    assert.equal(state.captureCalls.length, 1)
+    assert.equal(state.paymentCalls.length, 1)
+    assert.equal(state.createdPayments.length, 1)
+
+    const committedOrder = state.createdOrders[1]
+    const committedItems = state.createdItemBatches[1]
+    const committedReservation = state.reservations[0]
+    const ledgerInput = state.captureCalls[0].input
+    const committedPayment = state.createdPayments[0]
+
+    assert.equal(String(result.order.id), String(committedOrder._id))
+    assert.equal(String(committedItems[0].orderId), String(committedOrder._id))
+    assert.equal(String(committedReservation.input.orderId), String(committedOrder._id))
+    assert.equal(String(committedReservation.input.orderItemId), String(committedItems[0]._id))
+    assert.equal(String(ledgerInput.orderId), String(committedOrder._id))
+    assert.equal(String(ledgerInput.orderItemId), String(committedItems[0]._id))
+    assert.deepEqual(
+      ledgerInput.originalReservation.units.map((unit) => String(unit.productUnitId)),
+      committedReservation.units.map((unit) => String(unit._id))
+    )
+    assert.equal(String(committedPayment.orderId), String(committedOrder._id))
+  })
+
+  it('maps an exhausted transient transaction failure to the existing public checkout error', async () => {
+    const transientError = makeTransientTransactionError('private Mongo topology detail')
+    const { service, state } = makeHarness({
+      transactionMaxAttempts: 2,
+      reservationErrorFactory: () => transientError
+    })
+    let checkoutError
+
+    try {
+      await service.createCheckout(request(), { now: fixedNow })
+      assert.fail('checkout unexpectedly succeeded after exhausted retries')
+    } catch (error) {
+      checkoutError = error
+    }
+
+    assert.notEqual(checkoutError, transientError)
+    assert.equal(checkoutError.code, 'CHECKOUT_FAILED')
+    assert.equal(checkoutError.status, 500)
+    assert.equal(checkoutError.errorLabels, undefined)
+    assert.equal(checkoutError.hasErrorLabel, undefined)
+    assert.notEqual(checkoutError.code, transientError.code)
+    assert.equal(state.transactionErrors.length, 2)
+    assert.ok(state.transactionErrors.every((error) => error === transientError))
+    assert.equal(state.reservationAttempts, 2)
+    assert.equal(state.createdOrders.length, 2)
+    assert.equal(state.createdItemBatches.length, 2)
+    assert.equal(state.orders.size, 0)
+    assert.equal(state.items.size, 0)
+    assert.equal(state.payments.size, 0)
+    assert.equal(state.reservations.length, 0)
+    assert.equal(state.captureCalls.length, 0)
+    assert.equal(state.paymentCalls.length, 0)
   })
 
   it('rejects an unverified USER before BNA and before a session', async () => {

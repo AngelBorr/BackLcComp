@@ -5,7 +5,7 @@ import ProductUnitManager from '../../src/dao/managers/productUnit.manager.js'
 import ProductModel from '../../src/dao/models/produtc.model.js'
 import ProductUnitModel from '../../src/dao/models/productUnit.model.js'
 import ProductUnitService from '../../src/services/productUnit.service.js'
-import ProductsService from '../../src/services/service.products.js'
+import ProductsService, { ServiceError } from '../../src/services/service.products.js'
 import FileService from '../../src/services/service.files.js'
 
 const productId = new mongoose.Types.ObjectId().toString()
@@ -549,6 +549,141 @@ describe('ProductUnits transactional hardening (isolated unit tests)', () => {
     )
 
     assert.deepEqual(release, { units: [], releasedCount: 0, productIds: [] })
+  })
+
+  it('preserves a transient Mongo error by identity for the caller transaction retry', async () => {
+    const session = createExternalSession()
+    const transientError = new Error('simulated write conflict')
+    transientError.code = 112
+    transientError.errorLabels = ['TransientTransactionError']
+    transientError.hasErrorLabel = (label) => label === 'TransientTransactionError'
+    let managerCalls = 0
+    let sessionStarts = 0
+
+    stub(mongoose, 'startSession', async () => {
+      sessionStarts += 1
+      throw new Error('reserveAvailableUnits must not own a session here')
+    })
+    stub(ProductModel, 'findById', () => queryResult({
+      _id: productId,
+      inventoryMode: 'serialized'
+    }))
+    stub(ProductUnitManager, 'findAvailableUnits', async () => {
+      managerCalls += 1
+      throw transientError
+    })
+
+    await assert.rejects(
+      ProductUnitService.reserveAvailableUnits(
+        { productId, quantity: 1, orderId },
+        { session }
+      ),
+      (error) => {
+        assert.equal(error, transientError)
+        assert.equal(error.code, 112)
+        assert.deepEqual(error.errorLabels, ['TransientTransactionError'])
+        assert.equal(error.hasErrorLabel('TransientTransactionError'), true)
+        return true
+      }
+    )
+
+    assert.equal(managerCalls, 1)
+    assert.equal(sessionStarts, 0)
+  })
+
+  it('does not infer retryability from an errorLabels array without hasErrorLabel', async () => {
+    const session = createExternalSession()
+    const nonRetryableError = Object.assign(new Error('array-only label'), {
+      code: 112,
+      errorLabels: ['TransientTransactionError']
+    })
+    let managerCalls = 0
+
+    stub(ProductModel, 'findById', () => queryResult({
+      _id: productId,
+      inventoryMode: 'serialized'
+    }))
+    stub(ProductUnitManager, 'findAvailableUnits', async () => {
+      managerCalls += 1
+      throw nonRetryableError
+    })
+
+    await assert.rejects(
+      ProductUnitService.reserveAvailableUnits(
+        { productId, quantity: 1, orderId },
+        { session }
+      ),
+      (error) => {
+        assert.notEqual(error, nonRetryableError)
+        assert.equal(error.code, 'RESERVE_PRODUCT_UNITS_FAILED')
+        assert.equal(error.status, 500)
+        assert.equal(error.details.cause, nonRetryableError.message)
+        return true
+      }
+    )
+
+    assert.equal(managerCalls, 1)
+  })
+
+  it('continues to propagate an existing reservation ServiceError by identity', async () => {
+    const session = createExternalSession()
+    const domainError = new ServiceError(
+      'Stock serializado insuficiente',
+      'INSUFFICIENT_SERIALIZED_STOCK',
+      409
+    )
+    let managerCalls = 0
+
+    stub(ProductModel, 'findById', () => queryResult({
+      _id: productId,
+      inventoryMode: 'serialized'
+    }))
+    stub(ProductUnitManager, 'findAvailableUnits', async () => {
+      managerCalls += 1
+      throw domainError
+    })
+
+    await assert.rejects(
+      ProductUnitService.reserveAvailableUnits(
+        { productId, quantity: 1, orderId },
+        { session }
+      ),
+      (error) => error === domainError
+    )
+
+    assert.equal(managerCalls, 1)
+  })
+
+  it('continues to wrap an unexpected non-transient reservation error', async () => {
+    const session = createExternalSession()
+    const unexpectedError = new Error('simulated non-transient Mongo failure')
+    unexpectedError.hasErrorLabel = () => false
+    let managerCalls = 0
+
+    stub(ProductModel, 'findById', () => queryResult({
+      _id: productId,
+      inventoryMode: 'serialized'
+    }))
+    stub(ProductUnitManager, 'findAvailableUnits', async () => {
+      managerCalls += 1
+      throw unexpectedError
+    })
+
+    await assert.rejects(
+      ProductUnitService.reserveAvailableUnits(
+        { productId, quantity: 1, orderId },
+        { session }
+      ),
+      (error) => {
+        assert.notEqual(error, unexpectedError)
+        assert.equal(error.code, 'RESERVE_PRODUCT_UNITS_FAILED')
+        assert.equal(error.status, 500)
+        assert.equal(error.details.cause, unexpectedError.message)
+        return true
+      }
+    )
+
+    assert.equal(managerCalls, 1)
   })
 
   it('releases expired ProductUnits without altering a committed OrderItem ledger', async () => {

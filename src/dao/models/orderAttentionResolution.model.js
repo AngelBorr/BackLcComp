@@ -161,6 +161,101 @@ const productUnitSnapshotSchema = new mongoose.Schema(
   { _id: false }
 )
 
+const inventoryRepairItemSummarySchema = new mongoose.Schema(
+  {
+    orderItemId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'order_items',
+      required: true
+    },
+    productId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'products',
+      required: true
+    },
+    alreadySoldProductUnitIds: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'product_units' }],
+      default: []
+    },
+    preservedReservedProductUnitIds: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'product_units' }],
+      default: []
+    },
+    reclaimedOriginalProductUnitIds: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'product_units' }],
+      default: []
+    },
+    replacementProductUnitIds: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'product_units' }],
+      default: []
+    }
+  },
+  { _id: false }
+)
+
+const inventoryRepairSummarySchema = new mongoose.Schema(
+  {
+    items: {
+      type: [inventoryRepairItemSummarySchema],
+      required: true,
+      validate: {
+        validator: (items) => Array.isArray(items) && items.length > 0,
+        message: 'El resumen de reparacion debe contener al menos un OrderItem'
+      }
+    },
+    alreadySoldCount: { type: Number, required: true, min: 0 },
+    preservedReservedCount: { type: Number, required: true, min: 0 },
+    reclaimedOriginalCount: { type: Number, required: true, min: 0 },
+    replacementCount: { type: Number, required: true, min: 0 },
+    soldCount: { type: Number, required: true, min: 0 }
+  },
+  { _id: false }
+)
+
+inventoryRepairSummarySchema.path('items').validate({
+  validator: function (items) {
+    if (!Array.isArray(items) || items.length === 0) return false
+
+    const orderItemIds = new Set()
+    const productUnitIds = new Set()
+    const counts = {
+      alreadySoldCount: 0,
+      preservedReservedCount: 0,
+      reclaimedOriginalCount: 0,
+      replacementCount: 0
+    }
+    const categories = [
+      ['alreadySoldProductUnitIds', 'alreadySoldCount'],
+      ['preservedReservedProductUnitIds', 'preservedReservedCount'],
+      ['reclaimedOriginalProductUnitIds', 'reclaimedOriginalCount'],
+      ['replacementProductUnitIds', 'replacementCount']
+    ]
+
+    for (const item of items) {
+      const orderItemId = String(item?.orderItemId || '')
+      if (!orderItemId || orderItemIds.has(orderItemId)) return false
+      orderItemIds.add(orderItemId)
+
+      for (const [field, countField] of categories) {
+        const ids = item?.[field]
+        if (!Array.isArray(ids)) return false
+
+        for (const value of ids) {
+          const id = String(value || '')
+          if (!id || productUnitIds.has(id)) return false
+          productUnitIds.add(id)
+          counts[countField] += 1
+        }
+      }
+    }
+
+    const soldCount = Object.values(counts).reduce((total, count) => total + count, 0)
+    return Object.entries(counts).every(([field, count]) => this[field] === count) &&
+      this.soldCount === soldCount
+  },
+  message: 'El resumen de reparacion contiene IDs superpuestos, duplicados o conteos invalidos'
+})
+
 const finalResultSchema = new mongoose.Schema(
   {
     outcome: { type: String, trim: true, maxlength: 100, default: '' },
@@ -198,11 +293,26 @@ const orderAttentionResolutionSchema = new mongoose.Schema(
       required: true,
       immutable: true
     },
+    orderNumber: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      match: /^LC-\d{4}-\d{6,}$/,
+      default: undefined,
+      immutable: true
+    },
     idempotencyKey: {
       type: String,
       required: true,
       trim: true,
       maxlength: 128,
+      immutable: true
+    },
+    requestHash: {
+      type: String,
+      trim: true,
+      match: /^[a-f0-9]{64}$/,
+      default: undefined,
       immutable: true
     },
     action: {
@@ -232,6 +342,7 @@ const orderAttentionResolutionSchema = new mongoose.Schema(
     },
     note: { type: String, trim: true, maxlength: 2000, default: '' },
     requestedAt: { type: Date, required: true, immutable: true },
+    repairAt: { type: Date, default: undefined, immutable: true },
     completedAt: { type: Date, default: null },
     status: {
       type: String,
@@ -243,6 +354,7 @@ const orderAttentionResolutionSchema = new mongoose.Schema(
     previousState: { type: stateSnapshotSchema, default: null },
     previousProductUnits: { type: [productUnitSnapshotSchema], default: [] },
     finalProductUnits: { type: [productUnitSnapshotSchema], default: [] },
+    inventoryRepairSummary: { type: inventoryRepairSummarySchema, default: undefined },
     finalResult: { type: finalResultSchema, default: null },
     sanitizedError: { type: sanitizedErrorSchema, default: null }
   },
@@ -257,6 +369,17 @@ orderAttentionResolutionSchema.index(
   { unique: true }
 )
 orderAttentionResolutionSchema.index({ orderId: 1, requestedAt: 1, _id: 1 })
+orderAttentionResolutionSchema.index(
+  { orderId: 1, action: 1 },
+  {
+    name: 'uniq_completed_reassign_inventory_per_order',
+    unique: true,
+    partialFilterExpression: {
+      status: 'completed',
+      action: 'reassign_inventory'
+    }
+  }
+)
 
 const OrderAttentionResolutionModel = mongoose.model(
   'order_attention_resolutions',

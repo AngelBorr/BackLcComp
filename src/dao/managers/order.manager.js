@@ -1,4 +1,48 @@
+import mongoose from 'mongoose'
 import OrderModel from '../models/order.model.js'
+
+const inventoryRepairOrderError = (message, code, status = 400) => {
+  const error = new Error(message)
+  error.name = 'OrderManagerError'
+  error.code = code
+  error.status = status
+  error.statusCode = status
+  return error
+}
+
+const assertActiveInventoryRepairTransaction = (session) => {
+  let isActive = false
+
+  try {
+    isActive = Boolean(
+      session &&
+      !session.hasEnded &&
+      typeof session.inTransaction === 'function' &&
+      session.inTransaction()
+    )
+  } catch {
+    isActive = false
+  }
+
+  if (!isActive) {
+    throw inventoryRepairOrderError(
+      'La transicion de reparacion requiere una transaccion activa',
+      'INVENTORY_REPAIR_TRANSACTION_REQUIRED',
+      500
+    )
+  }
+}
+
+const validDate = (value) => value instanceof Date && !Number.isNaN(value.getTime())
+
+const nullableSnapshotFilter = (field, value) => value == null
+  ? {
+      $or: [
+        { [field]: null },
+        { [field]: { $exists: false } }
+      ]
+    }
+  : { [field]: value }
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
@@ -600,6 +644,112 @@ class OrderManager {
       },
       { new: true, session, runValidators: true }
     ).lean()
+  }
+
+  async completeInventoryRepairAttention(
+    orderId,
+    {
+      expectedAttentionReason,
+      expectedAttentionResolutionVersion,
+      expectedReservationExpiresAt,
+      expectedActiveRefundId = null,
+      expectedReconciliationNextAt = null,
+      expectedReconciliationLeaseOwner = null,
+      expectedReconciliationLeaseUntil = null,
+      paymentApprovedAt,
+      actorUserId,
+      repairAt
+    },
+    { session } = {}
+  ) {
+    assertActiveInventoryRepairTransaction(session)
+
+    if (
+      !mongoose.Types.ObjectId.isValid(orderId) ||
+      !mongoose.Types.ObjectId.isValid(actorUserId) ||
+      typeof expectedAttentionReason !== 'string' ||
+      expectedAttentionReason.trim() === '' ||
+      !Number.isInteger(expectedAttentionResolutionVersion) ||
+      expectedAttentionResolutionVersion < 0 ||
+      !validDate(expectedReservationExpiresAt) ||
+      expectedActiveRefundId != null ||
+      !validDate(paymentApprovedAt) ||
+      !validDate(repairAt) ||
+      (expectedReconciliationNextAt != null && !validDate(expectedReconciliationNextAt)) ||
+      (expectedReconciliationLeaseUntil != null &&
+        !validDate(expectedReconciliationLeaseUntil)) ||
+      (expectedReconciliationLeaseOwner != null &&
+        typeof expectedReconciliationLeaseOwner !== 'string')
+    ) {
+      throw inventoryRepairOrderError(
+        'El contrato de transicion de la Order es invalido',
+        'INVALID_INVENTORY_REPAIR_ORDER_TRANSITION'
+      )
+    }
+
+    const versionFilter = expectedAttentionResolutionVersion === 0
+      ? {
+          $or: [
+            { attentionResolutionVersion: 0 },
+            { attentionResolutionVersion: null },
+            { attentionResolutionVersion: { $exists: false } }
+          ]
+        }
+      : { attentionResolutionVersion: expectedAttentionResolutionVersion }
+    const result = await OrderModel.updateOne(
+      combineFilters(
+        {
+          _id: orderId,
+          status: 'requires_attention',
+          attentionReason: expectedAttentionReason.trim(),
+          fulfillmentStatus: 'pending',
+          reservationExpiresAt: expectedReservationExpiresAt
+        },
+        nullableSnapshotFilter('activeRefundId', null),
+        nullableSnapshotFilter('reconciliationNextAt', expectedReconciliationNextAt),
+        nullableSnapshotFilter(
+          'reconciliationLeaseOwner',
+          expectedReconciliationLeaseOwner
+        ),
+        nullableSnapshotFilter(
+          'reconciliationLeaseUntil',
+          expectedReconciliationLeaseUntil
+        ),
+        versionFilter
+      ),
+      {
+        $set: {
+          status: 'paid',
+          paidAt: paymentApprovedAt,
+          fulfillmentStatus: 'preparing'
+        },
+        $inc: { attentionResolutionVersion: 1 },
+        $push: {
+          statusHistory: {
+            status: 'paid',
+            changedAt: repairAt,
+            reason: 'ATTENTION_RESOLUTION_INVENTORY_REPAIR'
+          },
+          fulfillmentHistory: {
+            status: 'preparing',
+            changedAt: repairAt,
+            changedBy: actorUserId,
+            reason: 'ATTENTION_RESOLUTION_INVENTORY_REPAIR'
+          }
+        }
+      },
+      { session, runValidators: true }
+    )
+
+    if (result?.matchedCount !== 1 || result?.modifiedCount !== 1) {
+      throw inventoryRepairOrderError(
+        'La Order cambio durante la reparacion de inventario',
+        'INVENTORY_REPAIR_ORDER_STATE_CHANGED',
+        409
+      )
+    }
+
+    return result
   }
 
   async closeTerminalUnpaidAttention(

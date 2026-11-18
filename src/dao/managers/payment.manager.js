@@ -1,4 +1,40 @@
+import mongoose from 'mongoose'
 import PaymentModel from '../models/payment.model.js'
+
+const inventoryRepairPaymentError = (message, code, status = 400) => {
+  const error = new Error(message)
+  error.name = 'PaymentManagerError'
+  error.code = code
+  error.status = status
+  error.statusCode = status
+  return error
+}
+
+const assertActiveInventoryRepairTransaction = (session) => {
+  let isActive = false
+
+  try {
+    isActive = Boolean(
+      session &&
+      !session.hasEnded &&
+      typeof session.inTransaction === 'function' &&
+      session.inTransaction()
+    )
+  } catch {
+    isActive = false
+  }
+
+  if (!isActive) {
+    throw inventoryRepairPaymentError(
+      'El fence de evidencia requiere una transaccion activa',
+      'INVENTORY_REPAIR_TRANSACTION_REQUIRED',
+      500
+    )
+  }
+}
+
+const validDate = (value) => value instanceof Date && !Number.isNaN(value.getTime())
+const nonEmptyText = (value) => typeof value === 'string' && value.trim() !== ''
 
 class PaymentManager {
   async create(data, { session } = {}) {
@@ -311,6 +347,82 @@ class PaymentManager {
       { $set: update },
       { new: true, session, runValidators: true }
     ).lean()
+  }
+
+  async fenceApprovedInventoryRepairEvidence(
+    {
+      paymentId,
+      orderId,
+      provider,
+      normalizedStatus,
+      providerOrderId,
+      providerPaymentId,
+      approvedAt,
+      externalReference,
+      amountArs,
+      currency,
+      expectedUpdatedAt,
+      repairAt
+    },
+    { session } = {}
+  ) {
+    assertActiveInventoryRepairTransaction(session)
+
+    if (
+      !mongoose.Types.ObjectId.isValid(paymentId) ||
+      !mongoose.Types.ObjectId.isValid(orderId) ||
+      provider !== 'mercado_pago' ||
+      normalizedStatus !== 'approved' ||
+      !nonEmptyText(providerOrderId) ||
+      !nonEmptyText(providerPaymentId) ||
+      !validDate(approvedAt) ||
+      !nonEmptyText(externalReference) ||
+      amountArs == null ||
+      !nonEmptyText(currency) ||
+      !validDate(expectedUpdatedAt) ||
+      !validDate(repairAt)
+    ) {
+      throw inventoryRepairPaymentError(
+        'La evidencia aprobada para el fence es invalida',
+        'INVALID_INVENTORY_REPAIR_PAYMENT_EVIDENCE'
+      )
+    }
+
+    if (repairAt.getTime() <= expectedUpdatedAt.getTime()) {
+      throw inventoryRepairPaymentError(
+        'repairAt debe ser posterior al timestamp de Payment',
+        'INVENTORY_REPAIR_PAYMENT_FENCE_TIMESTAMP_CONFLICT',
+        409
+      )
+    }
+
+    const result = await PaymentModel.updateOne(
+      {
+        _id: paymentId,
+        orderId,
+        provider,
+        normalizedStatus: 'approved',
+        providerOrderId,
+        providerPaymentId,
+        approvedAt,
+        externalReference,
+        amountArs,
+        currency,
+        updatedAt: expectedUpdatedAt
+      },
+      { $set: { updatedAt: repairAt } },
+      { session, runValidators: true, timestamps: false }
+    )
+
+    if (result?.matchedCount !== 1 || result?.modifiedCount !== 1) {
+      throw inventoryRepairPaymentError(
+        'La evidencia financiera cambio durante la reparacion',
+        'INVENTORY_REPAIR_PAYMENT_EVIDENCE_CHANGED',
+        409
+      )
+    }
+
+    return result
   }
 
   async finalizeTotalRefund(

@@ -103,6 +103,19 @@ class OrderAttentionResolutionService {
     }
   }
 
+  async createPreparedInventoryRepairResolution(input, { session } = {}) {
+    const resolution = await this.resolutions.createPreparedInventoryRepairResolution(
+      input,
+      { session }
+    )
+    return toPlainObject(resolution)
+  }
+
+  async completeInventoryRepairResolution(input, { session } = {}) {
+    await this.resolutions.completeInventoryRepairResolution(input, { session })
+    return this.resolutions.getById(input.resolutionId, { session })
+  }
+
   async completePreparedResolution(
     {
       resolutionId,

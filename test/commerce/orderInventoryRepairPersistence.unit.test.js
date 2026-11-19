@@ -187,11 +187,19 @@ describe('P1C-B0B F3-A persistence contracts (isolated)', () => {
       await assert.rejects(resolution.validate(), /conteos invalidos/)
     })
 
-    it('declares only the safe completed reassign_inventory unique index', () => {
+    it('keeps the historical compound and completed repair indexes exact', () => {
       const indexes = OrderAttentionResolutionModel.schema.indexes()
+      const historical = indexes.find(([fields, options]) => (
+        fields.orderId === 1 &&
+        fields.idempotencyKey === 1 &&
+        Object.keys(fields).length === 2 &&
+        options.unique === true
+      ))
       const completed = indexes.find(([, options]) => (
         options.name === 'uniq_completed_reassign_inventory_per_order'
       ))
+      assert.ok(historical)
+      assert.deepEqual(historical[0], { orderId: 1, idempotencyKey: 1 })
       assert.ok(completed)
       assert.deepEqual(completed[0], { orderId: 1, action: 1 })
       assert.equal(completed[1].unique, true)
@@ -199,9 +207,23 @@ describe('P1C-B0B F3-A persistence contracts (isolated)', () => {
         status: 'completed',
         action: 'reassign_inventory'
       })
-      assert.equal(indexes.some(([fields]) => (
-        Object.keys(fields).length === 1 && fields.idempotencyKey === 1
-      )), false)
+    })
+
+    it('declares the exact global idempotency partial unique index', () => {
+      const globalIdempotency = OrderAttentionResolutionModel.schema.indexes()
+        .find(([, options]) => (
+          options.name === 'uniq_attention_resolution_idempotency_key'
+        ))
+
+      assert.ok(globalIdempotency)
+      assert.deepEqual(globalIdempotency[0], { idempotencyKey: 1 })
+      assert.equal(globalIdempotency[1].unique, true)
+      assert.deepEqual(globalIdempotency[1].partialFilterExpression, {
+        idempotencyKey: {
+          $type: 'string',
+          $gt: ''
+        }
+      })
     })
 
     it('requires an active transaction for F3 create and complete writes', async () => {

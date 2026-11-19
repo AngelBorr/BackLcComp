@@ -368,6 +368,19 @@ orderAttentionResolutionSchema.index(
   { orderId: 1, idempotencyKey: 1 },
   { unique: true }
 )
+orderAttentionResolutionSchema.index(
+  { idempotencyKey: 1 },
+  {
+    name: 'uniq_attention_resolution_idempotency_key',
+    unique: true,
+    partialFilterExpression: {
+      idempotencyKey: {
+        $type: 'string',
+        $gt: ''
+      }
+    }
+  }
+)
 orderAttentionResolutionSchema.index({ orderId: 1, requestedAt: 1, _id: 1 })
 orderAttentionResolutionSchema.index(
   { orderId: 1, action: 1 },

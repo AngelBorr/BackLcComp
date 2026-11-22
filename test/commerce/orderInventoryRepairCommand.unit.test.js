@@ -452,17 +452,33 @@ describe('OrderInventoryRepairCommandService', () => {
     )
   })
 
-  it('rejects a different key when the Order/action already completed before planning', async () => {
-    const setup = makeHarness({ completedByOrder: completedResolution() })
+  it('gives completed Order/action precedence over stale Payment and resolved Order state', async () => {
+    const setup = makeHarness({
+      completedByOrder: completedResolution(),
+      orderOverrides: { status: 'paid', fulfillmentStatus: 'preparing' },
+      freshPaymentOverrides: {
+        updatedAt: new Date(dates.paymentUpdatedAt.getTime() + 1)
+      }
+    })
     await assert.rejects(
       setup.service.repairApprovedOrderInventory(request()),
-      (error) => error.code === 'ATTENTION_INVENTORY_REPAIR_ALREADY_COMPLETED'
+      (error) => (
+        error.code === 'ATTENTION_INVENTORY_REPAIR_ALREADY_COMPLETED' &&
+        error.status === 409
+      )
     )
+    assert.equal(setup.counts().paymentReads, 1)
+    assert.equal(setup.events.includes('classification'), false)
     assert.equal(setup.captured.plans.length, 0)
+    assert.equal(setup.captured.selections.length, 0)
+    assert.equal(setup.captured.prepared.length, 0)
+    assert.equal(setup.captured.fence.length, 0)
+    assert.equal(setup.captured.writes.length, 0)
+    assert.equal(setup.captured.orderCas.length, 0)
     assert.equal(setup.counts().ended, 1)
   })
 
-  it('rejects wrong attention classification before completed gate and Planner', async () => {
+  it('checks completed gate before rejecting wrong attention classification and Planner', async () => {
     const setup = makeHarness({
       attentionClassifier: () => ({ attentionCategory: 'FINANCIAL_INCONSISTENCY' })
     })
@@ -470,7 +486,10 @@ describe('OrderInventoryRepairCommandService', () => {
       setup.service.repairApprovedOrderInventory(request()),
       (error) => error.code === 'ATTENTION_INVENTORY_REPAIR_NOT_ALLOWED'
     )
-    assert.equal(setup.events.includes('completed-gate'), false)
+    assert.equal(setup.events.includes('completed-gate'), true)
+    assert(
+      setup.events.indexOf('completed-gate') < setup.events.indexOf('classification')
+    )
     assert.equal(setup.events.includes('planner'), false)
   })
 
@@ -518,10 +537,10 @@ describe('OrderInventoryRepairCommandService', () => {
     await setup.service.repairApprovedOrderInventory(request())
     assert.deepEqual(setup.events.slice(1), [
       'idempotency',
+      'completed-gate',
       'ledger-read',
       'f2a',
       'classification',
-      'completed-gate',
       'planner',
       'prepared',
       'f2b',

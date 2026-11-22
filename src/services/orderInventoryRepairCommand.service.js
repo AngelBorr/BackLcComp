@@ -380,6 +380,19 @@ class OrderInventoryRepairCommandService {
 
     const order = await this.orders.getByOrderNumber(input.orderNumber, { session })
     if (!order) throw new ServiceError('Orden no encontrada', 'ORDER_NOT_FOUND', 404)
+
+    const completed = await this.resolutions.findCompletedByOrderAndAction(
+      order._id,
+      ACTION,
+      { session }
+    )
+    if (completed) {
+      throw inventoryRepairError(
+        'La reparacion de inventario ya fue completada',
+        'ATTENTION_INVENTORY_REPAIR_ALREADY_COMPLETED'
+      )
+    }
+
     const payment = await this.payments.getLatestByOrderId(order._id, { session })
     if (!payment) throw new ServiceError('Pago no encontrado', 'PAYMENT_NOT_FOUND', 404)
 
@@ -407,18 +420,6 @@ class OrderInventoryRepairCommandService {
         'ATTENTION_INVENTORY_REPAIR_NOT_ALLOWED',
         409,
         { attentionCategory: classification.attentionCategory }
-      )
-    }
-
-    const completed = await this.resolutions.findCompletedByOrderAndAction(
-      order._id,
-      ACTION,
-      { session }
-    )
-    if (completed) {
-      throw inventoryRepairError(
-        'La reparacion de inventario ya fue completada',
-        'ATTENTION_INVENTORY_REPAIR_ALREADY_COMPLETED'
       )
     }
 

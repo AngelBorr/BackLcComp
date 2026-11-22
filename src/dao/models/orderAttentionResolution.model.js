@@ -212,9 +212,24 @@ const inventoryRepairSummarySchema = new mongoose.Schema(
   { _id: false }
 )
 
+const inventoryRepairSummaryFromValidationContext = (context) => {
+  if (context instanceof mongoose.Query) {
+    const update = context.getUpdate()
+    const summary = update?.$set?.inventoryRepairSummary
+    return summary && typeof summary === 'object' && !Array.isArray(summary)
+      ? summary
+      : null
+  }
+
+  return context
+}
+
 inventoryRepairSummarySchema.path('items').validate({
   validator: function (items) {
     if (!Array.isArray(items) || items.length === 0) return false
+
+    const summary = inventoryRepairSummaryFromValidationContext(this)
+    if (!summary) return false
 
     const orderItemIds = new Set()
     const productUnitIds = new Set()
@@ -250,8 +265,8 @@ inventoryRepairSummarySchema.path('items').validate({
     }
 
     const soldCount = Object.values(counts).reduce((total, count) => total + count, 0)
-    return Object.entries(counts).every(([field, count]) => this[field] === count) &&
-      this.soldCount === soldCount
+    return Object.entries(counts).every(([field, count]) => summary[field] === count) &&
+      summary.soldCount === soldCount
   },
   message: 'El resumen de reparacion contiene IDs superpuestos, duplicados o conteos invalidos'
 })

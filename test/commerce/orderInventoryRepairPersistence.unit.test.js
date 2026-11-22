@@ -53,6 +53,14 @@ const makeSummary = (overrides = {}) => ({
   ...overrides
 })
 
+const inventorySummaryValidator = () => (
+  OrderAttentionResolutionModel.schema
+    .path('inventoryRepairSummary.items')
+    .validators
+    .find(({ message }) => message.includes('IDs superpuestos'))
+    .validator
+)
+
 const makeHistoricalResolution = (overrides = {}) => ({
   orderId: ids.order,
   paymentId: ids.payment,
@@ -185,6 +193,34 @@ describe('P1C-B0B F3-A persistence contracts (isolated)', () => {
         inventoryRepairSummary: makeSummary({ replacementCount: 2 })
       })
       await assert.rejects(resolution.validate(), /conteos invalidos/)
+    })
+
+    it('validates a complete inventory summary from the real Mongoose Query update context', () => {
+      const summary = makeSummary()
+      const query = OrderAttentionResolutionModel.updateOne(
+        { _id: ids.resolution },
+        { $set: { inventoryRepairSummary: summary } }
+      )
+      const summaryValidator = inventorySummaryValidator()
+
+      assert.equal(query instanceof mongoose.Query, true)
+      assert.equal(summaryValidator.call(query, summary.items), true)
+    })
+
+    it('fails closed for invalid or incomplete Query update summary contexts', () => {
+      const invalidSummary = makeSummary({ replacementCount: 2 })
+      const invalidQuery = OrderAttentionResolutionModel.updateOne(
+        { _id: ids.resolution },
+        { $set: { inventoryRepairSummary: invalidSummary } }
+      )
+      const incompleteQuery = OrderAttentionResolutionModel.updateOne(
+        { _id: ids.resolution },
+        { $set: { 'inventoryRepairSummary.items': makeSummary().items } }
+      )
+      const summaryValidator = inventorySummaryValidator()
+
+      assert.equal(summaryValidator.call(invalidQuery, invalidSummary.items), false)
+      assert.equal(summaryValidator.call(incompleteQuery, makeSummary().items), false)
     })
 
     it('keeps the historical compound and completed repair indexes exact', () => {

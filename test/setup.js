@@ -1,45 +1,79 @@
 import mongoose from 'mongoose'
 import userAdminModel from '../src/dao/models/userAdmin.model.js'
+import {
+  assertAllowedTestDatabaseUri,
+  isAllowedTestDatabaseName
+} from './helpers/testDatabaseSafety.js'
 
-const isTestDb = (uri) =>
-  typeof uri === 'string' && (uri.includes('lccomp_test') || uri.toLowerCase().includes('test'))
+const createTestDatabaseLifecycle = ({
+  mongooseInstance,
+  userModel,
+  environment
+}) => {
+  let authorizedDatabaseName = null
 
-export const connectTestDB = async () => {
-  const uri = process.env.MONGO_URI
+  const connectTestDB = async () => {
+    const uri = environment.MONGO_URI
+    const expectedDatabaseName = assertAllowedTestDatabaseUri(uri)
 
-  if (!uri) {
-    throw new Error(
-      '❌ MONGO_URI no está definido. Cargá .env.test o configurá la variable de entorno.'
-    )
+    if (mongooseInstance.connection.readyState !== 1) {
+      await mongooseInstance.connect(uri)
+    }
+
+    const connectedDatabaseName = mongooseInstance.connection.name
+
+    if (
+      connectedDatabaseName !== expectedDatabaseName ||
+      !isAllowedTestDatabaseName(connectedDatabaseName)
+    ) {
+      authorizedDatabaseName = null
+      throw new Error('Connected database does not match the authorized test database')
+    }
+
+    authorizedDatabaseName = expectedDatabaseName
   }
 
-  // 🛡️ Guardia para no correr tests contra DB real
-  if (!isTestDb(uri)) {
-    throw new Error(
-      `🚨 MONGO_URI no parece ser una base de test.\nURI actual: ${uri}\n` +
-        `Asegurate de usar lccomp_test (ej: mongodb://localhost:27017/lccomp_test).`
-    )
+  const clearUsersCollection = async () => {
+    const connectedDatabaseName = mongooseInstance.connection.name
+
+    if (
+      mongooseInstance.connection.readyState !== 1 ||
+      !authorizedDatabaseName ||
+      connectedDatabaseName !== authorizedDatabaseName ||
+      !isAllowedTestDatabaseName(connectedDatabaseName)
+    ) {
+      throw new Error('Unsafe test database configuration')
+    }
+
+    await userModel.deleteMany({})
   }
 
-  // Evitar reconexiones si ya está conectado
-  if (mongoose.connection.readyState === 1) return
+  const disconnectTestDB = async () => {
+    authorizedDatabaseName = null
 
-  await mongoose.connect(uri)
+    if (mongooseInstance.connection.readyState !== 0) {
+      await mongooseInstance.disconnect()
+    }
+  }
 
-  // Log opcional (debug)
-  // eslint-disable-next-line no-console
-  console.log('🧪 Conectado a DB de test:', mongoose.connection.name)
+  return {
+    clearUsersCollection,
+    connectTestDB,
+    disconnectTestDB
+  }
 }
 
-export const clearUsersCollection = async () => {
-  // Limpia SOLO la colección users
-  await userAdminModel.deleteMany({})
-}
+const defaultLifecycle = createTestDatabaseLifecycle({
+  mongooseInstance: mongoose,
+  userModel: userAdminModel,
+  environment: process.env
+})
 
-export const disconnectTestDB = async () => {
-  if (mongoose.connection.readyState !== 0) {
-    await mongoose.disconnect()
-    // eslint-disable-next-line no-console
-    console.log('🧪 DB de test desconectada')
-  }
+const { clearUsersCollection, connectTestDB, disconnectTestDB } = defaultLifecycle
+
+export {
+  clearUsersCollection,
+  connectTestDB,
+  createTestDatabaseLifecycle,
+  disconnectTestDB
 }

@@ -42,8 +42,7 @@ const safeToString = (value) => {
       value,
       (k, v) => {
         if (typeof v === 'bigint') return v.toString()
-        if (typeof Buffer !== 'undefined' && Buffer.isBuffer(v))
-          return `[Buffer length=${v.length}]`
+        if (typeof Buffer !== 'undefined' && Buffer.isBuffer(v)) { return `[Buffer length=${v.length}]` }
         if (v instanceof Error) return { name: v.name, message: v.message, stack: v.stack }
 
         if (typeof v === 'object' && v !== null) {

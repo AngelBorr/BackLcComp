@@ -1178,8 +1178,14 @@ describe('Mercado Pago authoritative reconciliation (isolated)', () => {
 
   it('approves Payment but does not sell a unit already available', async () => {
     const units = [{
-      _id: unitId, productId, orderId: null, orderItemId: null,
-      reservedByOrderId: null, status: 'available', isDeleted: false, soldAt: null
+      _id: unitId,
+      productId,
+      orderId: null,
+      orderItemId: null,
+      reservedByOrderId: null,
+      status: 'available',
+      isDeleted: false,
+      soldAt: null
     }]
     const { service, state } = createReconciliationHarness({ units })
     await service.reconcileProviderOrder(providerOrderId, { now })
@@ -1191,8 +1197,14 @@ describe('Mercado Pago authoritative reconciliation (isolated)', () => {
   it('approves Payment but does not steal a unit reassigned to another Order', async () => {
     const otherOrderId = new mongoose.Types.ObjectId().toString()
     const units = [{
-      _id: unitId, productId, orderId: otherOrderId, orderItemId,
-      reservedByOrderId: otherOrderId, status: 'reserved', isDeleted: false, soldAt: null
+      _id: unitId,
+      productId,
+      orderId: otherOrderId,
+      orderItemId,
+      reservedByOrderId: otherOrderId,
+      status: 'reserved',
+      isDeleted: false,
+      soldAt: null
     }]
     const { service, state } = createReconciliationHarness({ units })
     await service.reconcileProviderOrder(providerOrderId, { now })
@@ -1212,8 +1224,14 @@ describe('Mercado Pago authoritative reconciliation (isolated)', () => {
   for (const statusDetail of ['refunded', 'partially_refunded']) {
     it(`does not restore stock automatically for ${statusDetail}`, async () => {
       const soldUnit = {
-        _id: unitId, productId, orderId, orderItemId, reservedByOrderId: orderId,
-        status: 'sold', isDeleted: false, soldAt: now
+        _id: unitId,
+        productId,
+        orderId,
+        orderItemId,
+        reservedByOrderId: orderId,
+        status: 'sold',
+        isDeleted: false,
+        soldAt: now
       }
       const { service, state } = createReconciliationHarness({
         payment: {
@@ -1233,8 +1251,14 @@ describe('Mercado Pago authoritative reconciliation (isolated)', () => {
 
   it('is idempotent for an already approved and paid Order', async () => {
     const soldUnit = {
-      _id: unitId, productId, orderId, orderItemId, reservedByOrderId: orderId,
-      status: 'sold', isDeleted: false, soldAt: now
+      _id: unitId,
+      productId,
+      orderId,
+      orderItemId,
+      reservedByOrderId: orderId,
+      status: 'sold',
+      isDeleted: false,
+      soldAt: now
     }
     const { service, state } = createReconciliationHarness({
       payment: {
@@ -1311,8 +1335,13 @@ describe('ProductUnit internal reserved-to-sold gate (isolated)', () => {
       _id: orderItemId, orderId, productId, quantity: 1, originalReservation
     }]))
     stub(ProductUnitManager, 'findReservedUnitsByOrder', async () => ([{
-      _id: unitId, productId, orderId, orderItemId,
-      reservedByOrderId: orderId, status: 'reserved', isDeleted: false
+      _id: unitId,
+      productId,
+      orderId,
+      orderItemId,
+      reservedByOrderId: orderId,
+      status: 'reserved',
+      isDeleted: false
     }]))
     stub(ProductUnitManager, 'markReservedUnitsSold', async () => ({ modifiedCount: 1 }))
 
@@ -1350,8 +1379,13 @@ describe('ProductUnit internal reserved-to-sold gate (isolated)', () => {
       _id: orderItemId, orderId, productId, quantity: 2
     }]))
     stub(ProductUnitManager, 'findReservedUnitsByOrder', async () => ([{
-      _id: unitId, productId, orderId, orderItemId,
-      reservedByOrderId: orderId, status: 'reserved', isDeleted: false
+      _id: unitId,
+      productId,
+      orderId,
+      orderItemId,
+      reservedByOrderId: orderId,
+      status: 'reserved',
+      isDeleted: false
     }]))
     stub(ProductUnitManager, 'markReservedUnitsSold', async () => { saleCalled = true })
 

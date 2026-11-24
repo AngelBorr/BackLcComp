@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { describe, it } from 'mocha'
 import env, { resolveCookieConfig } from '../src/config.js'
 import SessionsService from '../src/services/service.sessions.js'
 import { logoutUser } from '../src/controllers/controller.sessions.js'

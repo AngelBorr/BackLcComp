@@ -70,6 +70,7 @@ const createControllerApp = ({ user, service }) => {
   })
   app.get('/api/orders/:orderNumber/status', controller.getStatus)
   app.use((error, _req, res, _next) => {
+    assert.equal(typeof _next, 'function')
     const mapped = mapServiceErrorToHttp(error)
     res.status(mapped.status).json({ status: 'error', message: mapped.message })
   })

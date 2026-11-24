@@ -1,6 +1,6 @@
 // Initialize Chart.js with Cordes styling
-const ctx = document.getElementById('revenueChart').getContext('2d')
-new Chart(ctx, {
+const ctx = globalThis.document.getElementById('revenueChart').getContext('2d')
+;(() => new globalThis.Chart(ctx, {
   type: 'line',
   data: {
     labels: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun'],
@@ -44,7 +44,7 @@ new Chart(ctx, {
         },
         ticks: {
           color: '#6b7280',
-          callback: function (value) {
+          callback: function () {
             return ' + value.toLocaleString()'
           }
         }
@@ -56,12 +56,12 @@ new Chart(ctx, {
       }
     }
   }
-})
+}))()
 
 // Add some interactive functionality
-document.addEventListener('DOMContentLoaded', function () {
+globalThis.document.addEventListener('DOMContentLoaded', function () {
   // Sidebar navigation active state
-  const navLinks = document.querySelectorAll('nav a')
+  const navLinks = globalThis.document.querySelectorAll('nav a')
   navLinks.forEach((link) => {
     link.addEventListener('click', function (e) {
       e.preventDefault()
@@ -77,7 +77,7 @@ document.addEventListener('DOMContentLoaded', function () {
   navLinks[0].classList.remove('text-gray-300')
 
   // Notification bell animation
-  const bellIcon = document.querySelector('.fa-bell')
+  const bellIcon = globalThis.document.querySelector('.fa-bell')
   if (bellIcon) {
     setInterval(() => {
       bellIcon.classList.add('animate-pulse')
@@ -88,7 +88,7 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   // Stats cards hover effects
-  const statsCards = document.querySelectorAll('.hover\\:shadow-md')
+  const statsCards = globalThis.document.querySelectorAll('.hover\\:shadow-md')
   statsCards.forEach((card) => {
     card.addEventListener('mouseenter', function () {
       this.style.transform = 'translateY(-2px)'

@@ -156,6 +156,7 @@ const createHttpApp = ({ service, user = { id: userId, role: 'USER' } }) => {
   })
   app.post('/api/orders/:orderNumber/reconcile-payment', controller.reconcile)
   app.use((error, _req, res, _next) => {
+    assert.equal(typeof _next, 'function')
     const mapped = mapServiceErrorToHttp(error)
     res.status(mapped.status).json({ status: 'error', message: mapped.message })
   })

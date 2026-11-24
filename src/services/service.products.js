@@ -111,8 +111,7 @@ class ProductsService {
 
   #assertValidObjectId(id) {
     if (!id) throw new ServiceError('ID requerido', 'MISSING_ID', 400)
-    if (!mongoose.Types.ObjectId.isValid(id))
-      throw new ServiceError('ID inválido', 'INVALID_ID', 400)
+    if (!mongoose.Types.ObjectId.isValid(id)) { throw new ServiceError('ID inválido', 'INVALID_ID', 400) }
   }
 
   async getProducts() {
@@ -210,7 +209,7 @@ class ProductsService {
   }
 
   async createProduct(body, files = []) {
-    let uploadedFileIds = [] // rollback si falla el create
+    const uploadedFileIds = [] // rollback si falla el create
 
     try {
       logger.debug('[ProductsService] createProduct')
@@ -408,7 +407,7 @@ class ProductsService {
 
   // update products
   async updateProduct(id, body, files = []) {
-    let uploadedFileIds = [] // rollback si falla update
+    const uploadedFileIds = [] // rollback si falla update
     let oldFileIdsToDelete = [] // para limpiar imágenes anteriores si se reemplazan
 
     try {
@@ -586,7 +585,7 @@ class ProductsService {
       delete base.prodIva105
       delete base.prodIva21
 
-      let prodImgsUpdate = undefined
+      let prodImgsUpdate
 
       if (Array.isArray(files) && files.length) {
         if (files.length > 4) {

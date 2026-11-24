@@ -40,7 +40,7 @@ const paginateCandidates = (orders, limit) => {
   const pages = []
   let cursor = null
 
-  while (true) {
+  for (;;) {
     const filter = reconciliationCursorFilter(cursor)
     const page = ordered.filter((order) => matchesCursorFilter(order, filter)).slice(0, limit)
     if (!page.length) return pages

@@ -9,7 +9,7 @@ import passport from 'passport'
 import cookieParser from 'cookie-parser'
 import { connectMongo } from './config/mongoConnection.js'
 
-//Routers
+// Routers
 import UsersRouter from './routes/users.router.js'
 import SessionsRouter from './routes/sessions.router.js'
 import FilesRouter from './routes/files.router.js'
@@ -20,9 +20,6 @@ import CheckoutRouter from './routes/checkout.router.js'
 import OrdersRouter from './routes/orders.router.js'
 import AdminOrdersRouter from './routes/adminOrders.router.js'
 import CommerceRouter from './routes/commerce.router.js'
-
-// ✅ IMPORTANTE: usar el GridFSBucket del driver que trae mongoose
-const { GridFSBucket } = mongoose.mongo
 
 // Logger
 import { log } from './utils/logger.js'
@@ -35,6 +32,9 @@ import { attachLogger } from './middlewares/attachLogger.js'
 import { serviceErrorHandler } from './middlewares/serviceErrorHandler.js'
 import MessengerRouter from './routes/messenger.router.js'
 import FileAssetsRouter from './routes/fileAssets.router.js'
+
+// ✅ IMPORTANTE: usar el GridFSBucket del driver que trae mongoose
+const { GridFSBucket } = mongoose.mongo
 
 const PORT = env.port
 

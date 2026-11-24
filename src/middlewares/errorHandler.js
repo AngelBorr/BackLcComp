@@ -6,7 +6,7 @@ const isProd = process.env.NODE_ENV === 'production'
 /**
  * Middleware para rutas no encontradas (404)
  */
-export const notFoundHandler = (req, res, next) => {
+export const notFoundHandler = (req, res) => {
   return res.status(404).json({
     status: 'error',
     message: `Ruta no encontrada: ${req.method} ${req.originalUrl}`

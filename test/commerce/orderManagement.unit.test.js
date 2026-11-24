@@ -303,6 +303,7 @@ describe('Order customer queries (isolated)', () => {
     assert.equal(serialized.includes('originalReservation'), false)
     assert.equal(serialized.includes(originalUnitId), false)
     assert.equal(serialized.includes('SERIAL-INTERNAL-LEDGER'), false)
+    assert.equal(serialized.includes('canReassignInventory'), false)
   })
 
   for (const [orderStatus, expected] of [
@@ -568,6 +569,7 @@ describe('Order administration queries and routes (isolated)', () => {
     assert.equal(result.attention.attentionCategory, 'APPROVED_INVENTORY_ATTENTION')
     assert.equal(result.attention.reservationIntegrity.valid, true)
     assert.equal(result.attention.allowedActions.canCompleteExistingReservationSale, true)
+    assert.equal(result.attention.allowedActions.canReassignInventory, true)
     assert.equal(result.order.attentionResolutionVersion, 0)
     assert.equal(result.payment.amountArs, '150000.00')
     assert.equal(result.payment.currency, 'ARS')
@@ -600,6 +602,27 @@ describe('Order administration queries and routes (isolated)', () => {
     assert.equal(result.resolutions.length, 1)
     assert.equal(result.resolutions[0].status, 'prepared')
     assert.equal(JSON.stringify(result).includes('must-not-leak-resolution-key'), false)
+  })
+
+  it('hides inventory repair discoverability after a completed repair Resolution', async () => {
+    const attentionOrder = makeOrder({
+      status: 'requires_attention',
+      fulfillmentStatus: 'pending',
+      attentionReason: 'RESERVATION_EXPIRED',
+      activeRefundId: null
+    })
+    const { service } = makeQueryHarness({
+      order: attentionOrder,
+      resolutions: [{ status: 'completed', action: 'reassign_inventory' }]
+    })
+
+    const result = await service.getAdminOrder({ orderNumber })
+
+    assert.equal(result.attention.allowedActions.canReassignInventory, false)
+    assert.deepEqual(
+      result.attention.allowedActions.blockers.reassignInventory,
+      ['INVENTORY_REPAIR_ALREADY_COMPLETED']
+    )
   })
 
   for (const role of ['USER', 'PREMIUM']) {

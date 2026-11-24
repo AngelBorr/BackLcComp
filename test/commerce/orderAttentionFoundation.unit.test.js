@@ -247,7 +247,98 @@ describe('P1C-0 Order attention foundation (isolated)', () => {
     assert.equal(result.financialRisk, 'approved_money_inventory_unresolved')
     assert.equal(result.reservationIntegrity.valid, true)
     assert.equal(result.allowedActions.canCompleteExistingReservationSale, true)
+    assert.equal(result.allowedActions.canReassignInventory, true)
     assert.deepEqual(result.allowedActions.blockers.completeExistingReservationSale, [])
+    assert.deepEqual(result.allowedActions.blockers.reassignInventory, [])
+  })
+
+  for (const testCase of [
+    {
+      name: 'wrong attention reason',
+      order: { attentionReason: 'PAYMENT_PROVIDER_MISMATCH' },
+      payment: { normalizedStatus: 'requires_attention' },
+      blocker: 'ATTENTION_CATEGORY_NOT_ELIGIBLE'
+    },
+    {
+      name: 'Order status outside requires_attention',
+      order: { status: 'paid' },
+      blocker: 'ATTENTION_CATEGORY_NOT_ELIGIBLE'
+    },
+    {
+      name: 'fulfillment outside pending',
+      order: { fulfillmentStatus: 'preparing' },
+      blocker: 'FULFILLMENT_NOT_PENDING'
+    },
+    {
+      name: 'Payment not approved',
+      payment: { normalizedStatus: 'pending', providerPaymentId: null, approvedAt: null },
+      blocker: 'APPROVED_PAYMENT_EVIDENCE_INCOMPLETE'
+    },
+    {
+      name: 'approved Payment without provider payment identity',
+      payment: { providerPaymentId: null },
+      blocker: 'APPROVED_PAYMENT_EVIDENCE_INCOMPLETE'
+    },
+    {
+      name: 'approved Payment without approvedAt',
+      payment: { approvedAt: null },
+      blocker: 'APPROVED_PAYMENT_EVIDENCE_INCOMPLETE'
+    },
+    {
+      name: 'active refund',
+      order: { activeRefundId: '507f1f77bcf86cd799439077' },
+      blocker: 'ACTIVE_REFUND'
+    },
+    {
+      name: 'completed inventory repair Resolution',
+      resolutions: [{ status: 'completed', action: 'reassign_inventory' }],
+      blocker: 'INVENTORY_REPAIR_ALREADY_COMPLETED'
+    },
+    {
+      name: 'legacy Order without attention evidence',
+      order: { attentionReason: undefined, fulfillmentStatus: undefined },
+      payment: { normalizedStatus: undefined, providerPaymentId: undefined, approvedAt: undefined },
+      blocker: 'ATTENTION_CATEGORY_NOT_ELIGIBLE'
+    }
+  ]) {
+    it(`keeps inventory repair discoverability fail-closed for ${testCase.name}`, () => {
+      const result = new OrderAttentionService().buildReadModel({
+        order: makeOrder(testCase.order),
+        payment: makePayment(testCase.payment),
+        orderItems: [orderItem],
+        productUnits: [makeReservedUnit()],
+        resolutions: testCase.resolutions || []
+      })
+
+      assert.equal(result.allowedActions.canReassignInventory, false)
+      assert.ok(result.allowedActions.blockers.reassignInventory.includes(testCase.blocker))
+    })
+  }
+
+  it('keeps inventory repair as a hint when reservation integrity needs repair', () => {
+    const result = new OrderAttentionService().buildReadModel({
+      order: makeOrder(),
+      payment: makePayment(),
+      orderItems: [orderItem],
+      productUnits: [makeReservedUnit({ productId: otherOrderId })]
+    })
+
+    assert.equal(result.reservationIntegrity.valid, false)
+    assert.equal(result.allowedActions.canCompleteExistingReservationSale, false)
+    assert.equal(result.allowedActions.canReassignInventory, true)
+  })
+
+  it('does not let a completed different action hide inventory repair discoverability', () => {
+    const result = new OrderAttentionService().buildReadModel({
+      order: makeOrder(),
+      payment: makePayment(),
+      orderItems: [orderItem],
+      productUnits: [makeReservedUnit()],
+      resolutions: [{ status: 'completed', action: 'complete_existing_reservation_sale' }]
+    })
+
+    assert.equal(result.allowedActions.canCompleteExistingReservationSale, false)
+    assert.equal(result.allowedActions.canReassignInventory, true)
   })
 
   it('classifies provider mismatch as a financial inconsistency', () => {
@@ -296,7 +387,7 @@ describe('P1C-0 Order attention foundation (isolated)', () => {
     assert.equal(result.financialRisk, 'unknown_fail_closed')
   })
 
-  it('reports reference mismatch and keeps every action disabled', () => {
+  it('reports reference mismatch and keeps reservation completion disabled', () => {
     const result = new OrderAttentionService().buildReadModel({
       order: makeOrder(),
       payment: makePayment(),
@@ -308,7 +399,8 @@ describe('P1C-0 Order attention foundation (isolated)', () => {
     assert.ok(result.allowedActions.blockers.completeExistingReservationSale.includes(
       'RESERVATION_INTEGRITY_INVALID'
     ))
-    assert.equal(Object.values(result.allowedActions).includes(true), false)
+    assert.equal(result.allowedActions.canCompleteExistingReservationSale, false)
+    assert.equal(result.allowedActions.canReassignInventory, true)
   })
 
   it('blocks completion after a prior completed resolution', () => {

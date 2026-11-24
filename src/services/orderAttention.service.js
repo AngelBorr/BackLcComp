@@ -189,6 +189,40 @@ const classifyAttention = ({ order, payment }) => {
   }
 }
 
+const buildReassignInventoryEligibility = ({
+  order,
+  payment,
+  classification,
+  resolutions = []
+}) => {
+  const blockers = []
+
+  if (classification.attentionCategory !== ATTENTION_CATEGORIES.APPROVED_INVENTORY) {
+    blockers.push('ATTENTION_CATEGORY_NOT_ELIGIBLE')
+  }
+  if (!approvedPaymentEvidenceIsComplete(payment)) {
+    blockers.push('APPROVED_PAYMENT_EVIDENCE_INCOMPLETE')
+  }
+  if (asText(order?.fulfillmentStatus) !== 'pending') {
+    blockers.push('FULFILLMENT_NOT_PENDING')
+  }
+  if (order?.activeRefundId != null) {
+    blockers.push('ACTIVE_REFUND')
+  }
+  if (resolutions.some((resolution) => (
+    resolution?.status === 'completed' &&
+    resolution?.action === 'reassign_inventory'
+  ))) {
+    blockers.push('INVENTORY_REPAIR_ALREADY_COMPLETED')
+  }
+
+  return {
+    // Eligibility hint only. The transactional command remains the execution authority.
+    eligible: blockers.length === 0,
+    blockers
+  }
+}
+
 const buildAllowedActions = ({
   order,
   payment,
@@ -214,19 +248,23 @@ const buildAllowedActions = ({
     completeSaleBlockers.push('ATTENTION_ALREADY_RESOLVED')
   }
 
+  const reassignInventory = buildReassignInventoryEligibility({
+    order,
+    payment,
+    classification,
+    resolutions
+  })
   const commonBlockers = ['P1C_ACTION_NOT_IMPLEMENTED']
 
   return {
     canCompleteExistingReservationSale: completeSaleBlockers.length === 0,
     canCloseTerminalUnpaid: false,
-    canReassignInventory: false,
+    canReassignInventory: reassignInventory.eligible,
     canRefund: false,
     blockers: {
       completeExistingReservationSale: completeSaleBlockers,
       closeTerminalUnpaid: commonBlockers,
-      reassignInventory: reservationIntegrity.valid
-        ? commonBlockers
-        : [...commonBlockers, 'RESERVATION_INTEGRITY_INVALID'],
+      reassignInventory: reassignInventory.blockers,
       refund: commonBlockers
     }
   }
@@ -261,6 +299,7 @@ export {
   OrderAttentionService,
   classifyAttention,
   inspectReservationIntegrity,
+  buildReassignInventoryEligibility,
   buildAllowedActions
 }
 export default new OrderAttentionService()

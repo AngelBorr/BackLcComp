@@ -15,7 +15,9 @@ import OrderInventoryRepairReadService from './orderInventoryRepairRead.service.
 import OrderInventoryRepairPlannerService, {
   PLAN_OUTCOMES
 } from './orderInventoryRepairPlanner.service.js'
-import OrderInventoryRepairSelectorService from './orderInventoryRepairSelector.service.js'
+import OrderInventoryRepairSelectorService, {
+  OrderInventoryRepairSelectorError
+} from './orderInventoryRepairSelector.service.js'
 import OrderInventoryRepairWriterService from './orderInventoryRepairWriter.service.js'
 import { ServiceError } from './service.products.js'
 
@@ -278,6 +280,17 @@ const isDomainError = (error) => (
   (typeof error?.code === 'string' &&
     Number.isInteger(error?.status ?? error?.statusCode))
 )
+
+const normalizeSelectorDomainError = (error) => {
+  if (!(error instanceof OrderInventoryRepairSelectorError)) return null
+  if (error.code !== 'INSUFFICIENT_REPAIR_INVENTORY' || error.status !== 409) return null
+
+  return new ServiceError(
+    error.message,
+    'INSUFFICIENT_REPAIR_INVENTORY',
+    error.status
+  )
+}
 
 class OrderInventoryRepairCommandService {
   constructor({
@@ -612,7 +625,12 @@ class OrderInventoryRepairCommandService {
       }
       throw transactionError
     } catch (error) {
-      if (isDomainError(error)) throw error
+      if (error instanceof OrderInventoryRepairSelectorError) {
+        const normalizedSelectorError = normalizeSelectorDomainError(error)
+        if (normalizedSelectorError) throw normalizedSelectorError
+      } else if (isDomainError(error)) {
+        throw error
+      }
 
       logError('Order inventory repair command failed', {
         orderNumber: input?.orderNumber || null,

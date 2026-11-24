@@ -2,6 +2,9 @@ import { strict as assert } from 'node:assert'
 import { describe, it } from 'mocha'
 import { ServiceError } from '../../src/services/service.products.js'
 import {
+  OrderInventoryRepairSelectorError
+} from '../../src/services/orderInventoryRepairSelector.service.js'
+import {
   OrderInventoryRepairCommandService,
   inventoryRepairRequestHash,
   normalizeInventoryRepairCommandInput
@@ -515,8 +518,8 @@ describe('OrderInventoryRepairCommandService', () => {
     assert.equal(setup.captured.prepared.length, 0)
   })
 
-  it('propagates insufficient inventory and rolls back before fence/writer/Order CAS', async () => {
-    const selectorError = new ServiceError(
+  it('normalizes insufficient selector inventory before the HTTP boundary', async () => {
+    const selectorError = new OrderInventoryRepairSelectorError(
       'Sin inventario',
       'INSUFFICIENT_REPAIR_INVENTORY',
       409
@@ -524,12 +527,40 @@ describe('OrderInventoryRepairCommandService', () => {
     const setup = makeHarness({ selectorError })
     await assert.rejects(
       setup.service.repairApprovedOrderInventory(request()),
-      (error) => error === selectorError
+      (error) => {
+        assert.notEqual(error, selectorError)
+        assert.equal(error instanceof ServiceError, true)
+        assert.equal(error.code, 'INSUFFICIENT_REPAIR_INVENTORY')
+        assert.equal(error.status, 409)
+        assert.equal(error.message, 'Sin inventario')
+        return true
+      }
     )
     assert.equal(setup.captured.prepared.length, 1)
     assert.equal(setup.captured.fence.length, 0)
     assert.equal(setup.captured.writes.length, 0)
     assert.equal(setup.captured.orderCas.length, 0)
+    assert.equal(setup.captured.completed.length, 0)
+    assert.equal(setup.counts().ended, 1)
+  })
+
+  it('keeps an unexpected selector failure behind the safe 500 boundary', async () => {
+    const setup = makeHarness({ selectorError: new Error('unexpected selector detail') })
+    await assert.rejects(
+      setup.service.repairApprovedOrderInventory(request()),
+      (error) => {
+        assert.equal(error instanceof ServiceError, true)
+        assert.equal(error.code, 'INVENTORY_REPAIR_FAILED')
+        assert.equal(error.status, 500)
+        assert.equal(error.message.includes('unexpected selector detail'), false)
+        return true
+      }
+    )
+    assert.equal(setup.captured.fence.length, 0)
+    assert.equal(setup.captured.writes.length, 0)
+    assert.equal(setup.captured.orderCas.length, 0)
+    assert.equal(setup.captured.completed.length, 0)
+    assert.equal(setup.counts().ended, 1)
   })
 
   it('executes the integral command order and uses snapshot/majority transaction options', async () => {

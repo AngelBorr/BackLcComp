@@ -337,7 +337,8 @@ describe('Order administration queries and routes (isolated)', () => {
       fulfillmentController: { update() {} },
       attentionController: {
         completeExistingReservationSale() {},
-        closeTerminalUnpaid() {}
+        closeTerminalUnpaid() {},
+        reassignInventory() {}
       },
       refundController: { create() {}, reconcile() {} }
     })
@@ -357,6 +358,11 @@ describe('Order administration queries and routes (isolated)', () => {
       {
         method: 'post',
         path: '/:orderNumber/attention/close-terminal-unpaid',
+        policies: ['ADMIN']
+      },
+      {
+        method: 'post',
+        path: '/:orderNumber/attention/reassign-inventory',
         policies: ['ADMIN']
       },
       { method: 'post', path: '/:orderNumber/refunds', policies: ['ADMIN'] },
@@ -789,6 +795,7 @@ describe('Order fulfillment workflow (isolated)', () => {
     })
     app.patch('/api/admin/orders/:orderNumber/fulfillment', controller.update)
     app.use((error, _req, res, _next) => {
+      assert.equal(typeof _next, 'function')
       const mapped = mapServiceErrorToHttp(error)
       res.status(mapped.status).json({ status: 'error', message: mapped.message })
     })

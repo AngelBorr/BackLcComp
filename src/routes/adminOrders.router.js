@@ -25,6 +25,11 @@ const registerAdminOrderRoutes = (
     ['ADMIN'],
     attentionController.closeTerminalUnpaid
   )
+  router.post(
+    '/:orderNumber/attention/reassign-inventory',
+    ['ADMIN'],
+    attentionController.reassignInventory
+  )
   router.post('/:orderNumber/refunds', ['ADMIN'], refundController.create)
   router.post(
     '/:orderNumber/refunds/:refundId/reconcile',

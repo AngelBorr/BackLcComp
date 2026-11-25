@@ -486,6 +486,36 @@ describe('POST /api/checkout HTTP orchestration (isolated unit tests)', () => {
     assert.equal(response.body.message.includes('carrito'), false)
   })
 
+  for (const role of ['USER', 'PREMIUM']) {
+    it(`does not expose an ADMIN domain code to ${role} checkout requests`, async () => {
+      const adminOnlyError = new ServiceError(
+        'No hay inventario suficiente para reparar la orden',
+        'INSUFFICIENT_REPAIR_INVENTORY',
+        409,
+        { expected: 'must-not-leak', actual: 'must-not-leak' }
+      )
+      const app = createControllerApp({
+        user: { id: userId, role },
+        service: {
+          async createCheckout() {
+            throw adminOnlyError
+          }
+        }
+      })
+      const response = await request(app)
+        .post('/api/checkout')
+        .set('Idempotency-Key', `checkout-admin-code-${role.toLowerCase()}`)
+        .send(validBody())
+
+      assert.equal(response.status, 409)
+      assert.deepEqual(response.body, {
+        status: 'error',
+        message: adminOnlyError.message
+      })
+      assert.equal(JSON.stringify(response.body).includes('must-not-leak'), false)
+    })
+  }
+
   it('returns MP configuration errors without secrets or stacks', async () => {
     const error = new ServiceError(
       'Mercado Pago no está configurado',

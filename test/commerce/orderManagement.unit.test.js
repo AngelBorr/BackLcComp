@@ -10,6 +10,7 @@ import { OrderFulfillmentService } from '../../src/services/orderFulfillment.ser
 import { OrderService } from '../../src/services/order.service.js'
 import { OrderFulfillmentController } from '../../src/controllers/orderFulfillment.controller.js'
 import { mapServiceErrorToHttp } from '../../src/middlewares/serviceErrorMapper.js'
+import { serviceErrorHandler } from '../../src/middlewares/serviceErrorHandler.js'
 import { registerOrderQueryRoutes } from '../../src/routes/orders.router.js'
 import { registerAdminOrderRoutes } from '../../src/routes/adminOrders.router.js'
 
@@ -828,4 +829,49 @@ describe('Order fulfillment workflow (isolated)', () => {
       .send({ status: 'ready_for_pickup' })
     assert.equal(response.status, 403)
   })
+
+  for (const testCase of [
+    {
+      code: 'INVALID_FULFILLMENT_TRANSITION',
+      harness: () => makeFulfillmentHarness({ initialStatus: 'pending' }),
+      targetStatus: 'ready_for_pickup'
+    },
+    {
+      code: 'ORDER_ACTIVE_REFUND_CONFLICT',
+      harness: () => makeFulfillmentHarness({
+        initialStatus: 'ready_for_pickup',
+        activeRefundId: '507f1f77bcf86cd799439099'
+      }),
+      targetStatus: 'picked_up'
+    },
+    {
+      code: 'ORDER_FULFILLMENT_CONFLICT',
+      harness: () => makeFulfillmentHarness({
+        initialStatus: 'preparing',
+        updateResults: []
+      }),
+      targetStatus: 'ready_for_pickup'
+    }
+  ]) {
+    it(`exposes safe ADMIN fulfillment code ${testCase.code}`, async () => {
+      const { service } = testCase.harness()
+      const controller = new OrderFulfillmentController({ orderFulfillmentService: service })
+      const app = express()
+      app.use(express.json())
+      app.use((req, _res, next) => {
+        req.user = { id: adminUserId, role: 'ADMIN' }
+        next()
+      })
+      app.patch('/api/admin/orders/:orderNumber/fulfillment', controller.update)
+      app.use(serviceErrorHandler)
+
+      const response = await request(app)
+        .patch(`/api/admin/orders/${orderNumber}/fulfillment`)
+        .send({ status: testCase.targetStatus })
+
+      assert.equal(response.status, 409)
+      assert.equal(response.body.code, testCase.code)
+      assert.deepEqual(Object.keys(response.body).sort(), ['code', 'message', 'status'])
+    })
+  }
 })

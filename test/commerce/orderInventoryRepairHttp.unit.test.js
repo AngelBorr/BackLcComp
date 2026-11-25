@@ -318,12 +318,12 @@ describe('P1C-B0B F3-D admin inventory repair HTTP surface', () => {
     assert.equal(normalized.note, 'reviewed')
   })
 
-  for (const code of [
-    'IDEMPOTENCY_KEY_REUSED',
-    'ATTENTION_INVENTORY_REPAIR_ALREADY_COMPLETED',
-    'INVENTORY_REPAIR_PLAN_BLOCKED',
-    'INSUFFICIENT_REPAIR_INVENTORY',
-    'INVENTORY_REPAIR_PAYMENT_FENCE_TIMESTAMP_CONFLICT'
+  for (const { code, exposed } of [
+    { code: 'IDEMPOTENCY_KEY_REUSED', exposed: true },
+    { code: 'ATTENTION_INVENTORY_REPAIR_ALREADY_COMPLETED', exposed: true },
+    { code: 'INVENTORY_REPAIR_PLAN_BLOCKED', exposed: false },
+    { code: 'INSUFFICIENT_REPAIR_INVENTORY', exposed: true },
+    { code: 'INVENTORY_REPAIR_PAYMENT_FENCE_TIMESTAMP_CONFLICT', exposed: false }
   ]) {
     it(`preserves ${code} as an HTTP 409 domain conflict`, async () => {
       const error = new ServiceError(`Conflict ${code}`, code, 409)
@@ -337,10 +337,73 @@ describe('P1C-B0B F3-D admin inventory repair HTTP surface', () => {
         .send({})
 
       assert.equal(response.status, 409)
-      assert.deepEqual(response.body, { status: 'error', message: `Conflict ${code}` })
+      assert.deepEqual(response.body, {
+        status: 'error',
+        message: `Conflict ${code}`,
+        ...(exposed && { code })
+      })
       assert.equal(command.calls.length, 1)
     })
   }
+
+  for (const code of [
+    'ATTENTION_RESOLUTION_CAS_CONFLICT',
+    'INVENTORY_REPAIR_PAYMENT_EVIDENCE_CHANGED',
+    'INVENTORY_REPAIR_ORDER_STATE_CHANGED'
+  ]) {
+    it(`exposes safe deep-manager conflict ${code} without internal details`, async () => {
+      const error = new Error(`Conflict ${code}`)
+      error.code = code
+      error.status = 409
+      error.statusCode = 409
+      error.details = {
+        expected: 'must-not-leak',
+        actual: 'must-not-leak',
+        filter: { private: true }
+      }
+      const command = makeCommand({ error })
+      const response = await request(createApp({
+        user: { id: actorId, role: 'ADMIN' },
+        command
+      }))
+        .post(route)
+        .set('Idempotency-Key', `repair-${code.toLowerCase().replaceAll('_', '-')}`)
+        .send({})
+
+      assert.equal(response.status, 409)
+      assert.deepEqual(response.body, {
+        status: 'error',
+        message: `Conflict ${code}`,
+        code
+      })
+      assert.equal(JSON.stringify(response.body).includes('must-not-leak'), false)
+      assert.equal(command.calls.length, 1)
+    })
+  }
+
+  it('exposes an allowlisted domain code to SUPERADMIN without details', async () => {
+    const error = new ServiceError(
+      'No hay inventario suficiente para reparar la orden',
+      'INSUFFICIENT_REPAIR_INVENTORY',
+      409,
+      { serialNumbers: ['must-not-leak'] }
+    )
+    const response = await request(createApp({
+      user: { id: actorId, role: 'SUPERADMIN' },
+      command: makeCommand({ error })
+    }))
+      .post(route)
+      .set('Idempotency-Key', 'repair-superadmin-safe-code')
+      .send({})
+
+    assert.equal(response.status, 409)
+    assert.deepEqual(response.body, {
+      status: 'error',
+      message: error.message,
+      code: error.code
+    })
+    assert.equal(JSON.stringify(response.body).includes('must-not-leak'), false)
+  })
 
   it('returns a safe 500 for INVENTORY_REPAIR_FAILED without internal diagnostics', async () => {
     const error = new ServiceError(

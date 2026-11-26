@@ -484,7 +484,140 @@ describe('POST /api/checkout HTTP orchestration (isolated unit tests)', () => {
     assert.equal(response.body.message, providerConflict.message)
     assert.notEqual(response.status, 409)
     assert.equal(response.body.message.includes('carrito'), false)
+    assert.equal(Object.hasOwn(response.body, 'code'), false)
   })
+
+  const publicCheckoutErrors = [
+    {
+      code: 'MERCADOPAGO_CHECKOUT_EXPIRED',
+      message: 'La reserva del checkout ya expiro',
+      status: 409
+    },
+    {
+      code: 'CHECKOUT_IDEMPOTENCY_CONFLICT',
+      message: 'La clave de idempotencia corresponde a otro checkout',
+      status: 409
+    },
+    {
+      code: 'OUT_OF_STOCK',
+      message: 'El producto no tiene stock disponible',
+      status: 409
+    },
+    {
+      code: 'INSUFFICIENT_SERIALIZED_STOCK',
+      message: 'No hay suficientes unidades serializadas disponibles',
+      status: 409
+    },
+    {
+      code: 'RESERVATION_CONFLICT',
+      message: 'Las unidades seleccionadas dejaron de estar disponibles',
+      status: 409
+    },
+    {
+      code: 'PRODUCT_NOT_SERIALIZED',
+      message: 'El producto no utiliza inventario serializado',
+      status: 409
+    },
+    {
+      code: 'CHECKOUT_IN_PROGRESS',
+      message: 'Ya existe un checkout en curso',
+      status: 409
+    },
+    {
+      code: 'CHECKOUT_LOCK_UNAVAILABLE',
+      message: 'No se pudo adquirir el lock de checkout',
+      status: 503
+    },
+    {
+      code: 'CHECKOUT_LOCK_LOST',
+      message: 'El checkout perdio su lock',
+      status: 409
+    }
+  ]
+
+  for (const publicError of publicCheckoutErrors) {
+    it(`exposes the safe checkout code ${publicError.code} without internal details`, async () => {
+      const error = new ServiceError(
+        publicError.message,
+        publicError.code,
+        publicError.status,
+        {
+          cause: 'mongodb://private-host:27017/production',
+          providerAccessToken: 'APP_USR-private-token',
+          requested: 5,
+          available: 0
+        }
+      )
+      error.stack = 'private stack trace'
+      const app = createControllerApp({
+        user: { id: userId, role: 'USER' },
+        service: {
+          async createCheckout () {
+            throw error
+          }
+        }
+      })
+
+      const response = await request(app)
+        .post('/api/checkout')
+        .set('Idempotency-Key', `checkout-public-${publicError.code.toLowerCase()}`)
+        .send(validBody())
+      const serialized = JSON.stringify(response.body)
+
+      assert.equal(response.status, publicError.status)
+      assert.deepEqual(response.body, {
+        status: 'error',
+        message: publicError.message,
+        code: publicError.code
+      })
+      for (const forbidden of [
+        'mongodb://',
+        'production',
+        'APP_USR',
+        'private-token',
+        'requested',
+        'available',
+        'private stack trace'
+      ]) assert.equal(serialized.includes(forbidden), false)
+      assert.equal(Object.hasOwn(response.body, 'details'), false)
+      assert.equal(Object.hasOwn(response.body, 'stack'), false)
+      assert.equal(Object.hasOwn(response.body, 'cause'), false)
+    })
+  }
+
+  for (const internalCode of [
+    'ORIGINAL_RESERVATION_INTEGRITY_CONFLICT',
+    'MERCADOPAGO_IDEMPOTENCY_CONFLICT'
+  ]) {
+    it(`does not expose the internal checkout code ${internalCode}`, async () => {
+      const error = new ServiceError(
+        'No se pudo completar el checkout',
+        internalCode,
+        409,
+        { cause: 'mongodb://private-host:27017/production' }
+      )
+      const app = createControllerApp({
+        user: { id: userId, role: 'PREMIUM' },
+        service: {
+          async createCheckout () {
+            throw error
+          }
+        }
+      })
+
+      const response = await request(app)
+        .post('/api/checkout')
+        .set('Idempotency-Key', `checkout-internal-${internalCode.toLowerCase()}`)
+        .send(validBody())
+
+      assert.equal(response.status, 409)
+      assert.deepEqual(response.body, {
+        status: 'error',
+        message: error.message
+      })
+      assert.equal(JSON.stringify(response.body).includes('mongodb://'), false)
+    })
+  }
 
   for (const role of ['USER', 'PREMIUM']) {
     it(`does not expose an ADMIN domain code to ${role} checkout requests`, async () => {

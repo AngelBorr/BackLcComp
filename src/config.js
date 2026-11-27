@@ -21,6 +21,87 @@ const parsePositiveInteger = (value, fallback) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback
 }
 
+const VALID_NODE_ENVIRONMENTS = new Set(['development', 'test', 'staging', 'production'])
+const TEST_DATABASE_NAME = /^(?:test|test[_-][a-z0-9][a-z0-9_-]*|[a-z0-9][a-z0-9_-]*[_-]test)$/i
+
+const resolveNodeEnvironment = (environment = process.env) => {
+  const nodeEnvironment = String(environment.NODE_ENV || 'development').trim().toLowerCase()
+
+  if (!VALID_NODE_ENVIRONMENTS.has(nodeEnvironment)) {
+    throw new Error('NODE_ENV must be development, test, staging, or production')
+  }
+
+  return nodeEnvironment
+}
+
+const parseMongoDatabaseName = (uri) => {
+  let parsed
+
+  try {
+    parsed = new URL(uri)
+  } catch {
+    throw new Error('Production MONGO_URI must include an explicit database name')
+  }
+
+  if (!['mongodb:', 'mongodb+srv:'].includes(parsed.protocol) || !parsed.hostname) {
+    throw new Error('Production MONGO_URI must include an explicit database name')
+  }
+
+  const encodedDatabaseName = parsed.pathname.startsWith('/')
+    ? parsed.pathname.slice(1)
+    : ''
+
+  if (!encodedDatabaseName || encodedDatabaseName.includes('/')) {
+    throw new Error('Production MONGO_URI must include an explicit database name')
+  }
+
+  let databaseName
+
+  try {
+    databaseName = decodeURIComponent(encodedDatabaseName)
+  } catch {
+    throw new Error('Production MONGO_URI must include an explicit database name')
+  }
+
+  if (!databaseName || databaseName.includes('/')) {
+    throw new Error('Production MONGO_URI must include an explicit database name')
+  }
+
+  return databaseName
+}
+
+export const validateCriticalEnvironment = (environment = process.env) => {
+  const nodeEnvironment = resolveNodeEnvironment(environment)
+
+  if (nodeEnvironment !== 'production') {
+    return { nodeEnvironment, databaseName: null }
+  }
+
+  const jwtPrivateKey = typeof environment.JWT_PRIVATE_KEY === 'string'
+    ? environment.JWT_PRIVATE_KEY.trim()
+    : ''
+
+  if (!jwtPrivateKey) {
+    throw new Error('JWT_PRIVATE_KEY is required in production')
+  }
+
+  const mongoUri = typeof environment.MONGO_URI === 'string'
+    ? environment.MONGO_URI.trim()
+    : ''
+
+  if (!mongoUri) {
+    throw new Error('MONGO_URI is required in production')
+  }
+
+  const databaseName = parseMongoDatabaseName(mongoUri)
+
+  if (TEST_DATABASE_NAME.test(databaseName)) {
+    throw new Error('Production database cannot use a test database name')
+  }
+
+  return { nodeEnvironment, databaseName }
+}
+
 export const resolvePaymentReconciliationConfig = (environment = process.env) => ({
   batchSize: parsePositiveInteger(environment.PAYMENT_RECONCILIATION_BATCH_SIZE, 20),
   maxOrdersPerRun: parsePositiveInteger(environment.PAYMENT_RECONCILIATION_MAX_PER_RUN, 100),
@@ -28,7 +109,7 @@ export const resolvePaymentReconciliationConfig = (environment = process.env) =>
 })
 
 export const resolveCookieConfig = (environment = process.env) => {
-  const nodeEnvironment = String(environment.NODE_ENV || 'development').trim().toLowerCase()
+  const nodeEnvironment = resolveNodeEnvironment(environment)
   const isProduction = nodeEnvironment === 'production'
   const crossSiteHttps = ['staging', 'production'].includes(nodeEnvironment)
   const defaultSameSite = crossSiteHttps ? 'none' : 'lax'
@@ -48,6 +129,9 @@ export const resolveCookieConfig = (environment = process.env) => {
   }
 }
 
+const criticalEnvironment = validateCriticalEnvironment()
+const configuredJwtPrivateKey = String(process.env.JWT_PRIVATE_KEY || '').trim()
+
 const cookieConfig = resolveCookieConfig()
 
 export default {
@@ -64,7 +148,9 @@ export default {
   // 🗝️ KEYS
   privateKey: process.env.PRIVATE_KEY || 'devAAASecretKey10',
   jwt: {
-    privateKey: process.env.JWT_PRIVATE_KEY || 'devFallbackKey',
+    privateKey: criticalEnvironment.nodeEnvironment === 'production'
+      ? configuredJwtPrivateKey
+      : configuredJwtPrivateKey || 'devFallbackKey',
     expiresIn: process.env.JWT_EXPIRES_IN || '1h'
   },
 

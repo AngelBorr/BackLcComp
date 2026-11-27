@@ -29,6 +29,7 @@ export const resolvePaymentReconciliationConfig = (environment = process.env) =>
 
 export const resolveCookieConfig = (environment = process.env) => {
   const nodeEnvironment = String(environment.NODE_ENV || 'development').trim().toLowerCase()
+  const isProduction = nodeEnvironment === 'production'
   const crossSiteHttps = ['staging', 'production'].includes(nodeEnvironment)
   const defaultSameSite = crossSiteHttps ? 'none' : 'lax'
   const configuredDomain = String(environment.COOKIE_DOMAIN || '').trim()
@@ -37,9 +38,13 @@ export const resolveCookieConfig = (environment = process.env) => {
     name: environment.COOKIE_NAME || 'cookieToken',
     maxAge:
       Number(environment.cookie_MAX_AGE) || Number(environment.COOKIE_MAX_AGE) || 3600000,
-    sameSite: parseSameSite(environment.COOKIE_SAME_SITE, defaultSameSite),
-    secure: parseBoolean(environment.COOKIE_SECURE, crossSiteHttps),
-    ...(configuredDomain ? { domain: configuredDomain } : {})
+    sameSite: isProduction
+      ? 'none'
+      : parseSameSite(environment.COOKIE_SAME_SITE, defaultSameSite),
+    secure: isProduction
+      ? true
+      : parseBoolean(environment.COOKIE_SECURE, crossSiteHttps),
+    ...(configuredDomain && !isProduction ? { domain: configuredDomain } : {})
   }
 }
 
